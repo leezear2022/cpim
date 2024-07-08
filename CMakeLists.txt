@@ -4,7 +4,7 @@ set(CMAKE_CUDA_COMPILER /usr/local/cuda/bin/nvcc)
 
 project(cpim CUDA CXX)
 
-set(CMAKE_CUDA_STANDARD 20)
+set(CMAKE_CUDA_STANDARD 23)
 
 # 设置 CUDA 架构
 set(CMAKE_CUDA_ARCHITECTURES 60 70 80)
@@ -17,13 +17,9 @@ include_directories(include)
 add_subdirectory(xcsp3parser)
 
 add_executable(cpim samples/main.cu
-        include/xcsp3model/h_model.h
-        include/xcsp3model/h_model.h
-        include/xcsp3model/h_model.h
-        include/xcsp3model/object.h
-        include/xcsp3model/shared.h
         samples/main.cpp
-        src/h_model.cpp)
+        src/HModel.cpp
+        )
 
 set_target_properties(cpim PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON)

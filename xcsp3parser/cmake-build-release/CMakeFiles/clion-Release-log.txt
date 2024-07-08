@@ -1,0 +1,4 @@
+cmake -DCMAKE_BUILD_TYPE=Release -G "CodeBlocks - Unix Makefiles" -S /home/lee/CLionProjects/XCSP3-CPP-Parser -B /home/lee/CLionProjects/XCSP3-CPP-Parser/cmake-build-release
+-- Configuring done
+-- Generating done
+-- Build files have been written to: /home/lee/CLionProjects/XCSP3-CPP-Parser/cmake-build-release

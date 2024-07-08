@@ -1,0 +1,4 @@
+cmake -DCMAKE_BUILD_TYPE=Debug -G "CodeBlocks - Unix Makefiles" -S /home/lee/CLionProjects/XCSP3-CPP-Parser -B /home/lee/CLionProjects/XCSP3-CPP-Parser/cmake-build-debug
+-- Configuring done
+-- Generating done
+-- Build files have been written to: /home/lee/CLionProjects/XCSP3-CPP-Parser/cmake-build-debug

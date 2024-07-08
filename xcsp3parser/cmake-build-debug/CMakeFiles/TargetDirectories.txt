@@ -1,0 +1,5 @@
+/home/lee/CLionProjects/XCSP3-CPP-Parser/cmake-build-debug/CMakeFiles/xcsp3parser.dir
+/home/lee/CLionProjects/XCSP3-CPP-Parser/cmake-build-debug/CMakeFiles/xcsp3parser_dynamic.dir
+/home/lee/CLionProjects/XCSP3-CPP-Parser/cmake-build-debug/CMakeFiles/samplesXcsp3.dir
+/home/lee/CLionProjects/XCSP3-CPP-Parser/cmake-build-debug/CMakeFiles/edit_cache.dir
+/home/lee/CLionProjects/XCSP3-CPP-Parser/cmake-build-debug/CMakeFiles/rebuild_cache.dir

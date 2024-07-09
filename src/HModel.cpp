@@ -5,9 +5,11 @@
 
 #include <algorithm>
 #include <iostream>
+#include <sstream>
 #include <utility>
 
 namespace cpim ::common {
+
 
 ////////// HVar //////////
 HVar HVarNode::Make(int id, int uid, const std::string &name, int min_val,
@@ -48,7 +50,7 @@ HVarNode::HVarNode(int id, int uid, const std::string &name,
   }
 }
 
-void HVarNode::Show() {
+void HVarNode::show() {
   std::cout << id << "| " << name << ": ";
   for (size_t i = 0; i < vals.size(); ++i)
     std::cout << vals[i] << "[" << val_map[i] << "] ";
@@ -119,6 +121,21 @@ void HTabNode::GetORITuple(std::vector<int> &std_tuple,
     ori_tuple[i] = scope[i]->anti_map[std_tuple[i]];
 }
 
+// std::ostream operator<<(const std::ostream& lhs,
+// std::vector<std::vector<int>>::const_reference rhs);
+void HTabNode::show() {
+  const std::string sem = semantics ? "supports" : "conflicts";
+  std::vector<int> scope_int;
+  for (auto &v : scope) {
+    scope_int.push_back(v->id);
+  }
+  std::cout << "id: " << id << " semantics: " << sem
+            << " size: " << tuples.size() << " arity:" << scope.size()
+            << " scope = {" << scope_int << std::endl;
+  std::cout << tuples << std::endl;
+  std::cout << std::endl;
+}
+
 void HTabNode::GetTuple(int idx, std::vector<int> &src_t,
                         std::vector<int> &std_t) {
   for (int i = (scope.size() - 1); i >= 0; --i) {
@@ -150,7 +167,18 @@ HModel HModelNode::Make(std::string &name) {
   return HModel(node);
 }
 
-int HModelNode::regist(const std::string exp_name,
+void HModelNode::show() {
+  std::cout << "--------------Variables--------------" << std::endl;
+  std::cout << "size: " << vars.size() << "\tmax domain size :" << mds_
+            << std::endl;
+  for (auto v : vars) v->show();
+  std::cout << "-------------Constraints-------------" << std::endl;
+  std::cout << "size: " << tabs.size() << "\tmax arity size :" << mas_
+            << std::endl;
+  for (const auto &t : tabs) t->show();
+}
+
+int HModelNode::regist(const std::string &exp_name,
                        std::function<int(std::vector<int> &)> exp) {
   const int id = generate_expr_uid();
   if (Funcs::str_expr_map.find(exp_name) != Funcs::str_expr_map.end()) {
@@ -380,20 +408,20 @@ ExpType HModelNode::get_type(const int expr) {
   return ET_NULL;
 }
 
-void HModelNode::subscript(HTab t) {
-  for (auto v : t->scope) subscriptions[v].push_back(t);
-  neighbor(t);
+void HModelNode::subscript(const HTab &tab) {
+  for (const auto &v : tab->scope) subscriptions[v].push_back(tab);
+  neighbor(tab);
 }
 
-void HModelNode::neighbor(HTab t) {
+void HModelNode::neighbor(const HTab &tab) {
   if (neighborhoods.empty())
     neighborhoods.resize(vars.size(),
                          std::vector<std::vector<int>>(vars.size()));
 
-  for (auto x : t->scope) {
-    for (auto y : t->scope) {
+  for (const auto &x : tab->scope) {
+    for (const auto &y : tab->scope) {
       if (x != y) {
-        neighborhoods[x->id][y->id].push_back(t->id);
+        neighborhoods[x->id][y->id].push_back(tab->id);
         if (neighborhoods[x->id][y->id].size() > 1) {
           have_same_scope_ = true;
         }
@@ -406,6 +434,39 @@ void HModelNode::get_scope(std::vector<std::string> &scp_str,
                            std::vector<HVar> &scp) {
   scp.resize(scp_str.size());
   for (int i = 0; i < scp_str.size(); ++i) scp[i] = str_var_map_[scp_str[i]];
+}
+
+std::vector<HVar> HModelNode::get_scope(const std::string &scp_str) const {
+  // 使用 stringstream 和 istringstream 来解析 scope_str
+  std::istringstream iss(scp_str);
+  std::string token;
+  // scope.reserve(arity);
+  std::vector<HVar> scope;
+  while (iss >> token) {
+    if (token[0] == 'V') {
+      scope.push_back(vars[std::stoi(token.substr(1))]);
+    }
+  }
+  return scope;
+}
+void HModelNode::generate_tuples(const std::string &ts_str_, int size,
+                                 int arity,
+                                 std::vector<std::vector<int>> &tuples) {
+  std::istringstream iss(ts_str_);
+  std::string token;
+  tuples.resize(size, std::vector<int>(arity));
+
+  for (int i = 0; i < size; ++i) {
+    for (int j = 0; j < arity; ++j) {
+      if (iss >> token) {
+        if (token == "|") {
+          --j;  // Skip separator
+          continue;
+        }
+        tuples[i][j] = std::stoi(token);
+      }
+    }
+  }
 }
 
 void HModelNode::get_STD_tuple(std::vector<int> &src_tuple,
@@ -440,7 +501,8 @@ void HModelNode::result(const int op, std::vector<int> &result, const int len) {
   result.push_back(Funcs::int_expr_map[op](a));
 }
 
-int HModelNode::AddVar(int id, std::string name, std::vector<int> &v) {
+int HModelNode::AddVar(const int id, const std::string &name,
+                       std::vector<int> &v) {
   auto newId = vars.size();
   auto uid = generate_var_uid();
   HVar var = HVarNode::Make(id, uid, name, v);

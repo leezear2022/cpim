@@ -30,6 +30,30 @@ using i32 = int;
 using i16 = short;
 using i8 = char;
 
+inline std::ostream &operator<<(std::ostream &os, const std::vector<int> &vec) {
+  os << "[";
+  for (size_t i = 0; i < vec.size(); ++i) {
+    os << vec[i];
+    if (i != vec.size() - 1) {
+      os << ", ";
+    }
+  }
+  os << "]";
+  return os;
+}
+// 重载 << 运算符以输出 std::vector<std::vector<int>>
+inline std::ostream &operator<<(std::ostream &os,
+                                const std::vector<std::vector<int>> &vec) {
+  for (const auto &v : vec) {
+    os << "( ";
+    for (const auto &elem : v) {
+      os << elem << " ";
+    }
+    os << ")";
+  }
+  return os;
+}
+
 // 定义统一编号范围
 const int MAX_VALUE = INT_MAX - 4096;
 const int MAX_OPT = INT_MIN + 4096;
@@ -151,6 +175,7 @@ static func_map int_expr_map = {
     {INT_MIN + 22, ops::abs},    {INT_MIN + 23, ops::add},
     {INT_MIN + 24, ops::neg},
 };
+
 // static const func_map &get_int_expr_map() {
 
 //   return int_expr_map;
@@ -159,9 +184,16 @@ static func_map int_expr_map = {
 
 class HVar;
 class HTab;
-typedef std::vector<HVar> HVars;
-typedef std::vector<HTab> HTabs;
 class HModel;
+
+using IntTuples = std::vector<std::vector<int>>;
+using HDom = std::tuple<int, std::vector<int>>;
+using HRel = std::tuple<int, int, int, std::string, IntTuples>;
+
+using HDoms = std::vector<HDom>;
+using HVars = std::vector<HVar>;
+using HRels = std::vector<HRel>;
+using HTabs = std::vector<HTab>;
 
 class HVarNode : public Object {
  public:
@@ -191,7 +223,7 @@ class HVarNode : public Object {
 
   ~HVarNode() = default;
 
-  void Show();
+  void show();
 
  private:
 };
@@ -231,22 +263,13 @@ class HTabNode : public Object {
            std::vector<HVar> &scp);
   HTabNode &operator=(const HTabNode &other) = default;
 
-  //
-  // HTabNode(HTabNode *t, std::vector<HVar *> &scp);
-  //
-  // int GetAllSize() const;
-  //
   void GetSTDTuple(std::vector<int> &src_tuple, std::vector<int> &std_tuple);
-
   void GetORITuple(std::vector<int> &std_tuple, std::vector<int> &ori_tuple);
-
   bool SAT(std::vector<int> &t);
-
   bool SAT_STD(std::vector<int> &t);
 
-  //
-  // void Show();
-  //
+  void show();
+
   void GetTuple(int idx, std::vector<int> &t, std::vector<int> &t_idx);
 
   ~HTabNode() = default;
@@ -318,13 +341,13 @@ class HModelNode : public Object {
   int max_domain_size() const { return mds_; }
   int max_arity() const { return mas_; };
   void show();
-  int regist(std::string expr_name,
+  int regist(const std::string &expr_name,
              std::function<int(std::vector<int> &)> expr);
   static int calculate(std::vector<int> &stack, std::vector<int> &params_len);
   std::vector<HTab> solution_check(std::vector<int> &sol);
   bool have_same_scope() const { return have_same_scope_; }
 
-  int AddVar(int id, std::string name, std::vector<int> &v);
+  int AddVar(int id, const std::string &name, std::vector<int> &v);
   int AddTab(const bool sem, std::vector<std::vector<int>> &ts,
              std::vector<int> &scp);
   int AddTab(const bool sem, std::vector<std::vector<int>> &ts,
@@ -350,10 +373,13 @@ class HModelNode : public Object {
                    std::vector<HVar> &scp);
   std::tuple<ExpType, int> get_type_tuple(std::string &expr);
   static ExpType get_type(const int expr);
-  void subscript(HTab tab);
-  void neighbor(HTab tab);
+  void subscript(const HTab &tab);
+  void neighbor(const HTab &tab);
   void get_scope(std::vector<std::string> &scp_str, std::vector<HVar> &scp);
+  std::vector<HVar> get_scope(const std::string &scp_str) const;
   int get_var_id(const int id) const { return var_uid_ - MAX_VALUE - 1; }
+  static void generate_tuples(const std::string &ts_str_, int size, int arity,
+                              std::vector<std::vector<int>> &tuples);
   int generate_expr_uid() { return ++expr_id_; }
   int generate_var_uid() { return ++var_uid_; }
 

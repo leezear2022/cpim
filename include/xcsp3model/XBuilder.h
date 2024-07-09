@@ -8,6 +8,7 @@
 #ifndef XMLBUILDER_H_
 #define XMLBUILDER_H_
 
+#include <memory>
 #include <string>
 #include <xercesc/dom/DOM.hpp>
 #include <xercesc/dom/DOMTreeWalker.hpp>
@@ -51,7 +52,7 @@ class XBuilder {
    * \param[in] i_file_name	The name of file.
    * \param[in] i_type		The type of file, path file or benchmark file.
    */
-    XBuilder(std::string file_name, const XmlReaderType type);
+  XBuilder(const std::string &file_name, XmlReaderType type);
   virtual ~XBuilder();
 
   /**
@@ -62,9 +63,9 @@ class XBuilder {
    *	-<em>true</em> succeed
    */
   // void GenerateXModelFromXml(XModel * xm);
-  void GenerateHModel(HModel hm);
-
+  void GenerateHModel(const HModel &hm) const;
   // GenerateXModelFromXml
+
   std::string path() const;
   std::string file_name() const;
   /**
@@ -79,39 +80,16 @@ class XBuilder {
   std::string benchmark_path_;  ///< XML file name(path)
   std::string file_name_;
   XmlReaderType type_;  ///< file type
-  XercesDOMParser *parser_;
+  std::unique_ptr<XercesDOMParser> parser_;
   DOMElement *root_;
   DOMDocument *document_;
+  static void generate_tuples(const std::string &ts_str_, int size, int arity,
+                              IntTuples &tuples);
+  static std::vector<int> get_scope(const std::string &scp_str);
+  static void get_scope(const std::string &scp_str, std::vector<int> &scp);
 
-  /**
-   * \brief createDomain
-   * \return Created domain
-   */
-  //	void createDomain(XMLModel * network, const u32 dom_id, const u32
-  // dom_size, 			std::string domain_values);
-  // std::vector<int> generateValues(const u32 dom_size, string values_str);
-
-  //   void generateDomains(XModel *model) const;
-
-  //   void generateVariables(XModel *model) const;
-
-  //   void generateRelations(XModel *model) const;
-
-  // void generateTabulars(XModel *model);
-
-  // void generatePredicates(XModel *model);
-
-  //   void generateConstraints(XModel *model) const;
-
-  // u32 getConstraintsCount();
-
-  // RelationType getRelationTpye();
-
-  // void getNetworkFeature(XMLModel * network);
-
-  // int getMaxArity();
-  void del() const;
-  bool initial(const std::string s);
+  void del();
+  bool initial(const std::string &s);
 
  private:
   static std::vector<int> parseCharArray(const char *input);

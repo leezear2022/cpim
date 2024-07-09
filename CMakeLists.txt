@@ -4,15 +4,13 @@ set(CMAKE_CUDA_COMPILER /usr/local/cuda/bin/nvcc)
 
 project(cpim CUDA CXX)
 
-set(CMAKE_CUDA_STANDARD 23)
+set(CMAKE_CUDA_STANDARD 20)
 
 # 设置 CUDA 架构
 set(CMAKE_CUDA_ARCHITECTURES 60 70 80)
 find_package(LibXml2 REQUIRED)
 include_directories(${LIBXML2_INCLUDE_DIR})
-
 find_package(XercesC REQUIRED)
-
 include_directories(${XercesC_INCLUDE_DIRS})
 
 # 添加头文件目录

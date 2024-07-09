@@ -10,7 +10,7 @@
 
 namespace cpim::common {
 
-XBuilder::XBuilder(const std::string file_name, const XmlReaderType type) {
+XBuilder::XBuilder(const std::string& file_name, const XmlReaderType type) {
   const bool res = initial(file_name);
   if (res && type == XRT_BM_PATH) {
     benchmark_path_ = GetBMFile();
@@ -30,24 +30,27 @@ XBuilder::XBuilder(const std::string file_name, const XmlReaderType type) {
 
 XBuilder::~XBuilder() {
   if (root_) {
-    delete parser_;
+    parser_.reset();  // 使用智能指针自动删除对象
     XMLPlatformUtils::Terminate();
   }
 }
 
-bool XBuilder::initial(const std::string s) {
-  if (s == "") {
+bool XBuilder::initial(const std::string& s) {
+  if (s.empty()) {
     return false;
+  } else {
+    std::cout << "current bm file: " << s << std::endl;
   }
 
   try {
     XMLPlatformUtils::Initialize();
   } catch (const XMLException& toCatch) {
-    // Do your failure processing here
+    // 处理初始化失败
     return false;
   }
-  // Do your actual work with Xerces-C++ here.
-  parser_ = new XercesDOMParser();
+
+  // 使用 std::unique_ptr 管理 XercesDOMParser
+  parser_ = std::make_unique<XercesDOMParser>();
   parser_->setValidationScheme(XercesDOMParser::Val_Always);
   parser_->setDoNamespaces(true);
 
@@ -56,8 +59,7 @@ bool XBuilder::initial(const std::string s) {
   root_ = document_->getDocumentElement();
 
   if (!root_) {
-    delete (parser_);
-    parser_ = nullptr;
+    parser_.reset();
     return false;
   }
   return true;
@@ -91,14 +93,62 @@ std::string XBuilder::GetBMFile() const {
 // 	}
 // }
 
-void XBuilder::del() const {
-  if (root_) {
-    delete parser_;
-    XMLPlatformUtils::Terminate();
+void XBuilder::generate_tuples(const std::string& ts_str_, int size, int arity,
+                               IntTuples& tuples) {
+  std::istringstream iss(ts_str_);
+  std::string token;
+  tuples.clear();
+  tuples.resize(size, std::vector<int>(arity));
+
+  int i = 0;
+  std::string tuple_str;
+  std::istringstream tuple_stream;  // 在循环外声明
+
+  while (std::getline(iss, tuple_str, '|') && i < size) {
+    tuple_stream.clear();         // 重置状态
+    tuple_stream.str(tuple_str);  // 重新设置内容
+
+    for (int j = 0; j < arity; ++j) {
+      if (tuple_stream >> token) {
+        tuples[i][j] = std::stoi(token);
+      }
+    }
+    ++i;
   }
 }
 
-void XBuilder::GenerateHModel(HModel hm) {
+std::vector<int> XBuilder::get_scope(const std::string& scp_str) {
+  // 使用 stringstream 和 istringstream 来解析 scope_str
+  std::istringstream iss(scp_str);
+  std::string token;
+  // scope.reserve(arity);
+  std::vector<int> scope;
+  while (iss >> token) {
+    if (token[0] == 'V') {
+      scope.push_back(std::stoi(token.substr(1)));
+    }
+  }
+  return scope;
+}
+
+void XBuilder::get_scope(const std::string& scp_str, std::vector<int>& scp) {
+  // 使用 stringstream 和 istringstream 来解析 scope_str
+  std::istringstream iss(scp_str);
+  std::string token;
+  // scope.reserve(arity);
+  while (iss >> token) {
+    if (token[0] == 'V') {
+      scp.push_back(std::stoi(token.substr(1)));
+    }
+  }
+}
+
+void XBuilder::del() {
+  parser_.reset();  // 使用智能指针自动删除对象
+  XMLPlatformUtils::Terminate();
+}
+
+void XBuilder::GenerateHModel(const HModel& hm) const {
   DOMNode* doms_nodes =
       root_->getElementsByTagName(XMLString::transcode("domains"))->item(0);
   const int num_doms =
@@ -134,10 +184,6 @@ void XBuilder::GenerateHModel(HModel hm) {
 
   for (u32 i = 0; i < num_vars; ++i) {
     DOMNode* node = var_nodes->item(i);
-    // char* dom_id_str =
-    //     XMLString::transcode(node->getAttributes()
-    //                              ->getNamedItem(XMLString::transcode("domain"))
-    //                              ->getTextContent());
     char* var_name_str =
         XMLString::transcode(node->getAttributes()
                                  ->getNamedItem(XMLString::transcode("name"))
@@ -154,6 +200,83 @@ void XBuilder::GenerateHModel(HModel hm) {
     // model->add(i, dom_id_str);
     XMLString::release(&var_name_str);
     XMLString::release(&dom_id_str);
+  }
+
+  // generate relations
+  DOMNode* relations_node =
+      root_->getElementsByTagName(XMLString::transcode("relations"))->item(0);
+  const int relations_count = XMLString::parseInt(
+      relations_node->getAttributes()
+          ->getNamedItem(XMLString::transcode("nbRelations"))
+          ->getTextContent());
+  DOMNodeList* relation_nodes =
+      root_->getElementsByTagName(XMLString::transcode("relation"));
+
+  HRels Rels;
+  for (int i = 0; i < relations_count; ++i) {
+    DOMNode* node = relation_nodes->item(i);
+    const int arity =
+        XMLString::parseInt(node->getAttributes()
+                                ->getNamedItem(XMLString::transcode("arity"))
+                                ->getTextContent());
+    char* semantics = XMLString::transcode(
+        node->getAttributes()
+            ->getNamedItem(XMLString::transcode("semantics"))
+            ->getTextContent());
+    const int size =
+        XMLString::parseInt(node->getAttributes()
+                                ->getNamedItem(XMLString::transcode("nbTuples"))
+                                ->getTextContent());
+
+    HRel Rel;
+    if (size != 0) {
+      char* ts_str =
+          XMLString::transcode(node->getFirstChild()->getNodeValue());
+      IntTuples tuples;
+      generate_tuples(ts_str, size, arity, tuples);
+      Rel = std::make_tuple(i, arity, size, std::string(semantics), tuples);
+      // std::cout << tuples << std::endl;
+      XMLString::release(&ts_str);
+    } else {
+      Rel = std::make_tuple(i, arity, size, semantics,
+                            std::vector<std::vector<int>>());
+    }
+    XMLString::release(&semantics);
+    Rels.push_back(Rel);
+  }
+
+  // generate constraints
+  DOMNode* cons_node =
+      root_->getElementsByTagName(XMLString::transcode("constraints"))->item(0);
+  const int num_cons = XMLString::parseInt(
+      cons_node->getAttributes()
+          ->getNamedItem(XMLString::transcode("nbConstraints"))
+          ->getTextContent());
+  DOMNodeList* con_nodes =
+      root_->getElementsByTagName(XMLString::transcode("constraint"));
+
+  for (int i = 0; i < num_cons; ++i) {
+    DOMNode* node = con_nodes->item(i);
+    const int arity =
+        XMLString::parseInt(node->getAttributes()
+                                ->getNamedItem(XMLString::transcode("arity"))
+                                ->getTextContent());
+    char* scp_str =
+        XMLString::transcode(node->getAttributes()
+                                 ->getNamedItem(XMLString::transcode("scope"))
+                                 ->getTextContent());
+    char* rel_id_str = XMLString::transcode(
+        node->getAttributes()
+            ->getNamedItem(XMLString::transcode("reference"))
+            ->getTextContent());
+    int rel_id = extractNumberFromString(rel_id_str);
+    std::vector<int> scope = get_scope(scp_str);
+    std::cout << std::get<3>(Rels[rel_id]) << std::endl;
+    std::cout << (std::get<3>(Rels[rel_id]) == "supports") << std::endl;
+    hm->AddTab(std::get<3>(Rels[rel_id]) == "supports",
+               std::get<4>(Rels[rel_id]), scope);
+    XMLString::release(&scp_str);
+    XMLString::release(&rel_id_str);
   }
 }
 

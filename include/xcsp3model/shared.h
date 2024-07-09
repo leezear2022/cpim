@@ -103,7 +103,7 @@ template <typename T>
 void Shared<T>::DecRef(T *p) {
   if (p) {
     if (ref_count(p).Dec() == 0) {
-      std::cout << "jiji\n";
+      // std::cout << "jiji\n";
       Destroy(p);
     }
   }

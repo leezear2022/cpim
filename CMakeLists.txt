@@ -23,10 +23,13 @@ add_executable(cpim samples/main.cu
         samples/main.cpp
         src/HModel.cpp
         src/XBuilder.cpp
-        src/Network.cc
-        include/Network.h
+#        src/Network2.cc
+#        include/Network2.h
         include/NaiveBitSet.h
         include/CPIMBase.h
+        src/Network.cpp
+        src/Solver.cpp
+        include/Timer.h
 )
 
 set_target_properties(cpim PROPERTIES

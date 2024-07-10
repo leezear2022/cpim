@@ -1,8 +1,4 @@
-//
-// Created by lee on 24-7-9.
-//
-
-#include "Network.h"
+﻿#include "Network.h"
 
 #include <unordered_set>
 
@@ -67,9 +63,8 @@ IntVar::IntVar(const HVar& v, const int num_vars)
       limit_(v->vals.size() % BITSIZE),
       num_bit_(ceil(static_cast<float>(v->vals.size()) / BITSIZE)),
       vals_(v->vals) {
-  bit_tmp_.resize(num_bit_);
-  bit_tmp_.flip();
-  // if (limit_ != BITSIZE) bit_tmp_.back() >>= BITSIZE - limit_;
+  bit_tmp_.resize(num_bit_, ULLONG_MAX);
+  if (limit_ != BITSIZE) bit_tmp_.back() >>= BITSIZE - limit_;
   bit_doms_.resize(num_vars + 3, bit_tmp_);
   assigned_.resize(num_vars + 3, false);
 }
@@ -93,75 +88,108 @@ IntVar::IntVar(const HVar& v, const int num_vars)
 //	//}
 // }
 
-bool IntVar::operator==(const IntVar& int_var) const {
-  return id_ == int_var.id();
-}
-
 void IntVar::RemoveValue(const int a, const int p) {
-  // const auto index = GetBitIdx(a);
-  // bit_doms_[p][get<0>(index)].reset(get<1>(index));
-  bit_doms_[p].clear(a);
+  const auto index = GetBitIdx(a);
+  bit_doms_[p][get<0>(index)].reset(get<1>(index));
   --top_size;
 }
 
 void IntVar::ReduceTo(const int a, const int p) {
-  // const auto index = GetBitIdx(a);
-  // for (auto& v : bit_doms_[p]) v.reset();
-  bit_doms_[p].singleton(a);
+  const auto index = GetBitIdx(a);
+  for (auto& v : bit_doms_[p]) v.reset();
+  bit_doms_[p][get<0>(index)].set(get<1>(index));
   top_size = 0;
 }
 
-// void IntVar::AddValue(const int a, const int p) {
-//   const auto index = GetBitIdx(a);
-//   bit_doms_[p][get<0>(index)].set(get<1>(index));
-//   ++top_size;
-// }
-
-int IntVar::size(const int p) const { return bit_doms_[p].count(); }
-
-int IntVar::next(const int a, const int p) const {
-  return bit_doms_[p].nextOneBit(a);
+void IntVar::AddValue(const int a, const int p) {
+  const auto index = GetBitIdx(a);
+  bit_doms_[p][get<0>(index)].set(get<1>(index));
+  ++top_size;
 }
 
-// void IntVar::next_value(int& a, const int p) {
-//   //++a;
-//   // for (; a < init_size_; ++a) {
-//   //	const auto index = GetBitIdx(a);
-//   //	if (bit_doms_[p][get<0>(index)].test(get<1>(index)))
-//   //		return;
-//   //}
-//   // a = Limits::INDEX_OVERFLOW;
-//
-//   auto index = GetBitIdx(a++);
-//   bitset<BITSIZE> b = bit_doms_[p][get<0>(index)];
-//   b >>= get<1>(index);
-//   b >>= 1;
-//
-//   if (b.any()) {
-//     a += FirstOne(b);
-//     return;
-//   }
-//
-//   for (size_t i = get<0>(index) + 1; i < num_bit_; ++i)
-//     if (bit_doms_[p][i].any()) {
-//       a = GetValue(i, FirstOne(bit_doms_[p][i]));
-//       return;
-//     }
-//   a = Limits::INDEX_OVERFLOW;
-// }
+int IntVar::size(const int p) const {
+  int size = 0;
+  for (auto& a : bit_doms_[p]) size += a.count();
+  return size;
+}
+
+int IntVar::next(const int a, const int p) const {
+  // for (int i = (a + 1); i < init_size_; ++i) {
+  //	const auto index = GetBitIdx(i);
+  //	if (bit_doms_[p][get<0>(index)].test(get<1>(index)))
+  //		return i;
+  // }
+  auto index = GetBitIdx(a);
+  bitset<BITSIZE> b = (bit_doms_[p][get<0>(index)] >> get<1>(index)) >> 1;
+  if (b.any()) return a + FirstOne(b) + 1;
+
+  for (size_t i = get<0>(index) + 1; i < num_bit_; ++i)
+    if (bit_doms_[p][i].any()) return GetValue(i, FirstOne(bit_doms_[p][i]));
+  return Limits::INDEX_OVERFLOW;
+}
+
+void IntVar::next_value(int& a, const int p) {
+  //++a;
+  // for (; a < init_size_; ++a) {
+  //	const auto index = GetBitIdx(a);
+  //	if (bit_doms_[p][get<0>(index)].test(get<1>(index)))
+  //		return;
+  //}
+  // a = Limits::INDEX_OVERFLOW;
+
+  auto index = GetBitIdx(a++);
+  bitset<BITSIZE> b = bit_doms_[p][get<0>(index)];
+  b >>= get<1>(index);
+  b >>= 1;
+
+  if (b.any()) {
+    a += FirstOne(b);
+    return;
+  }
+
+  for (size_t i = get<0>(index) + 1; i < num_bit_; ++i)
+    if (bit_doms_[p][i].any()) {
+      a = GetValue(i, FirstOne(bit_doms_[p][i]));
+      return;
+    }
+  a = Limits::INDEX_OVERFLOW;
+}
 
 int IntVar::prev(const int a, const int p) const {
-  return bit_doms_[p].prevOneBit(a);
+  for (int i = (a - 1); i >= 0; --i) {
+    const auto index = GetBitIdx(i);
+    if (bit_doms_[p][get<0>(index)].test(get<1>(index))) return i;
+  }
+  return Limits::INDEX_OVERFLOW;
 }
 
 bool IntVar::have(const int a, const int p) const {
-  return bit_doms_[p].check(a);
+  if (a == Limits::INDEX_OVERFLOW) return false;
+  const auto index = GetBitIdx(a);
+  return bit_doms_[p][get<0>(index)].test(get<1>(index));
 }
 
-int IntVar::head(const int p) const { return bit_doms_[p].nextOneBit(0); }
+int IntVar::head(const int p) const {
+  // for (int i = 0; i < num_bit_; ++i)
+  //	if (bit_doms_[p][i].any()) {
+  //		for (int j = 0; j < BITSIZE; ++j) {
+  //			if (bit_doms_[p][i].test(j))
+  //				return GetValue(i, j);
+  //		}
+  //	}
+
+  for (size_t i = 0; i < num_bit_; ++i) {
+    if (bit_doms_[p][i].any()) return GetValue(i, FirstOne(bit_doms_[p][i]));
+  }
+  return Limits::INDEX_OVERFLOW;
+}
 
 int IntVar::tail(const int p) const {
-  return bit_doms_[p].prevOneBit(init_size_ - 1);
+  for (int i = (num_bit_ - 1); i >= 0; --i)
+    if (bit_doms_[p][i].any())
+      for (int j = (BITSIZE - 1); j >= 0; --j)
+        if (bit_doms_[p][i].test(j)) return GetValue(i, j);
+  return Limits::INDEX_OVERFLOW;
 }
 
 void IntVar::show(const int p) {
@@ -179,15 +207,14 @@ void IntVar::show(const int p) {
 //	return a;
 // }
 
-// int IntVar::GetDelete(const int src, const int dest, bitSetVector& del_vals)
-// {
-//   int size = 0;
-//   for (int i = 0; i < num_bit_; ++i) {
-//     del_vals[i] = bit_doms_[src][i] ^ bit_doms_[dest][i];
-//     size = del_vals[i].count();
-//   }
-//   return size;
-// }
+int IntVar::GetDelete(const int src, const int dest, bitSetVector& del_vals) {
+  int size = 0;
+  for (int i = 0; i < num_bit_; ++i) {
+    del_vals[i] = bit_doms_[src][i] ^ bit_doms_[dest][i];
+    size = del_vals[i].count();
+  }
+  return size;
+}
 
 void IntVar::BackTo(const int dest) {
   for (int i = dest; i <= top_; ++i) assigned_[i] = false;
@@ -208,7 +235,7 @@ int IntVar::new_level(const int src) {
 }
 
 void IntVar::copy(const int src, const int dest) {
-  bit_doms_[dest].set(bit_doms_[src]);
+  bit_doms_[dest].assign(bit_doms_[src].begin(), bit_doms_[src].end());
   assigned_[dest] = assigned_[src];
 }
 
@@ -217,45 +244,56 @@ void IntVar::copy(const int src, const int dest) {
 // }
 
 ///////////////////////////////////////////////////////////////
-// 实现示例
 const IntVal& IntVal::operator=(const IntVal& rhs) {
-  if (this == &rhs) {
-    return *this;
-  }
   v_ = rhs.v_;
   a_ = rhs.a_;
   aop_ = rhs.aop_;
   return *this;
 }
 
+void IntVal::flip() { aop_ = !aop_; }
+
 IntVal IntVal::next(const int p) const {
   return IntVal(v_, v_->next(a_, p), true);
 }
 
-bool IntVal::operator==(const IntVal& rhs) const {
-  return v_ == rhs.v_ && a_ == rhs.a_ && aop_ == rhs.aop_;
+bool IntVal::operator==(const IntVal& rhs) {
+  return (this == &rhs) || (v_ == rhs.v_ && a_ == rhs.a_ && aop_ == rhs.aop_);
 }
 
-bool IntVal::operator!=(const IntVal& rhs) const { return !(*this == rhs); }
+bool IntVal::operator!=(const IntVal& rhs) {
+  return !((this == &rhs) ||
+           (v_ == rhs.v_ && a_ == rhs.a_ && aop_ == rhs.aop_));
+}
 
-std::ostream& operator<<(std::ostream& os, const IntVal& v_val) {
-  os << "IntVal(" << v_val.a() << ", " << v_val.op() << ")";
+// tuple<int, int> IntVal::get_bit_index() const {
+//	tuple<int, int> a;
+//	get<0>(a) = a_ / BITSIZE;
+//	get<1>(a) = a_ % BITSIZE;
+//	return a;
+// }
+
+ostream& operator<<(ostream& os, IntVal& v_val) {
+  const string s = (v_val.aop_) ? " = " : " != ";
+  os << "(" << v_val.vid() << s << v_val.a_ << ")";
   return os;
 }
 ////////////////////////////////////////////////////////////////////////////
 
-Tabular::Tabular(const HTab& t, const vector<shared_ptr<IntVar>>& scp)
+Tabular::Tabular(const HTab& t, const vector<IntVar*>& scp)
     : arity(scp.size()),
       scope(scp),
       weight(1),
       id_(t->id),
-      tuples_(t->tuples) {}
+      tuples_(t->tuples),
+      stamp_(0) {}
 
-bool Tabular::sat(vector<int>& t) const {
+bool Tabular::sat(const vector<int>& t) const {
   return binary_search(tuples_.begin(), tuples_.end(), t);
 }
 
-void Tabular::GetFirstValidTuple(IntVal& v_a, vector<int>& t, const int p) {
+void Tabular::GetFirstValidTuple(const IntVal& v_a, vector<int>& t,
+                                 const int p) {
   for (int i = 0; i < arity; ++i)
     if (scope[i] != v_a.v())
       t[i] = scope[i]->head(p);
@@ -277,7 +315,7 @@ void Tabular::GetNextValidTuple(IntVal& v_a, vector<int>& t, const int p) {
   Exclude(t);
 }
 
-int Tabular::index(const shared_ptr<IntVar>& v) const {
+int Tabular::index(IntVar* v) const {
   for (int i = scope.size() - 1; i >= 0; --i)
     if (scope[i] == v) return i;
   return -1;
@@ -286,7 +324,7 @@ int Tabular::index(const shared_ptr<IntVar>& v) const {
 bool Tabular::IsValidTuple(vector<int>& t, const int p) {
   if (!Existed(t)) return false;
 
-  for (const auto& v : scope)
+  for (IntVar* v : scope)
     if (!v->have(t[index(v)], p)) return false;
   return true;
 }
@@ -308,20 +346,18 @@ Network::Network(const HModel& h)
   vars.reserve(num_vars_);
   tabs.reserve(num_tabs_);
   nei_.resize(num_vars_);
-
   for (const auto& hv : hm_->Vars()) {
-    auto v = std::make_shared<IntVar>(hv, num_vars_);
+    IntVar* v = new IntVar(hv, num_vars_);
     vars.push_back(v);
   }
 
-  for (const auto& ht : hm_->Tabs()) {
-    auto scope = get_scope(ht);
-    auto t = std::make_shared<Tabular>(ht, scope);
+  for (auto ht : hm_->Tabs()) {
+    Tabular* t = new Tabular(ht, get_scope(ht));
     tabs.push_back(t);
   }
 
-  for (const auto& t : tabs)
-    for (const auto& v : t->scope) subscription[v].push_back(t);
+  for (auto t : tabs)
+    for (auto v : t->scope) subscription[v].push_back(t);
 
   for (auto v : vars) {
     neighborhood[v] = get_neighbor(v);
@@ -385,13 +421,13 @@ void Network::ClearLevel(const int p) {
 //		v->RestoreUpTo(level);
 // }
 
-vector<shared_ptr<IntVar>> Network::get_neighbor(const shared_ptr<IntVar>& v) {
-  unordered_set<shared_ptr<IntVar>> vs;
+vector<IntVar*> Network::get_neighbor(IntVar* v) {
+  unordered_set<IntVar*> vs;
   for (auto c : subscription[v])
     for (auto x : c->scope)
       if (x != v) vs.insert(x);
 
-  return vector<shared_ptr<IntVar>>(vs.begin(), vs.end());
+  return vector<IntVar*>(vs.begin(), vs.end());
 }
 
 void Network::show(const int p) {
@@ -401,20 +437,19 @@ void Network::show(const int p) {
 }
 
 Network::~Network() {
+  for (auto v : vars) delete v;
+  for (auto t : tabs) delete t;
   vars.clear();
   tabs.clear();
-  subscription.clear();
-  neighborhood.clear();
-  nei_.clear();
 }
 
-vector<shared_ptr<IntVar>> Network::get_scope(const HTab& t) const {
-  vector<shared_ptr<IntVar>> tt(t->scope.size());
+vector<IntVar*> Network::get_scope(const HTab& t) {
+  vector<IntVar*> tt(t->scope.size());
   for (int i = 0; i < t->scope.size(); ++i) tt[i] = vars[t->scope[i]->id];
   return tt;
 }
 
-void Network::get_scope(const HTab& t, vector<shared_ptr<IntVar>> scp) {
+void Network::get_scope(const HTab& t, vector<IntVar*> scp) {
   for (int i = 0; i < t->scope.size(); ++i) scp[i] = vars[t->scope[i]->id];
 }
 
@@ -425,4 +460,4 @@ const IntConVal& IntConVal::operator=(const IntConVal& rhs) {
 
   return *this;
 }
-}  // namespace cpim
+}  // namespace cp

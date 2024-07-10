@@ -1,11 +1,15 @@
 //
 // Created by lee on 24-7-4.
 //
+#include <Solver.h>
+
 #include <filesystem>
 #include <iostream>
 
+// #include "Network2.h"
 #include "xcsp3model/HModel.h"
 #include "xcsp3model/XBuilder.h"
+using namespace cpim;
 using namespace cpim::common;
 // const std::string X_PATH =
 //     "/home/lee/CLionProjects/cpim/samples/bench/BMPath.xml";
@@ -26,28 +30,34 @@ int main(int argc, char* argv[]) {
   //   std::cout << tab->id << std::endl;
   // }
   // std::cout << "jiji2\n";
-  {
-    std::filesystem::path currentPath = std::filesystem::current_path();
-    std::cout << "当前执行路径是：" << currentPath << std::endl;
-    XBuilder builder(X_PATH, XRT_BM_PATH);
-    // return 0;
-    HModel hm = HModelNode::Make();
-    builder.GenerateHModel(hm);
-    hm->show();
-  }
+
+  std::filesystem::path currentPath = std::filesystem::current_path();
+  std::cout << "当前执行路径是：" << currentPath << std::endl;
+  XBuilder builder(X_PATH, XRT_BM_PATH);
+  // return 0;
+  HModel hm = HModelNode::Make();
+  builder.GenerateHModel(hm);
+  hm->show();
+
   // std::cout << "jiji2\n";
-  return 0;
-  // Network* n = new Network(hm);
+  // shared_ptr<Network> n = std::make_shared<Network>(hm);
+
+  auto* n = new Network(hm);
+  MAC mac(n, AC_3bit, Heuristic::VRH_DOM_WDEG_MIN, Heuristic::VLH_MIN);
   // AC3bit ac_(n);
+
+
+  delete n;
+  return 0;
   // ac_.enforce(n->vars, 0);
+  ////hm->show();
+  ////MAC mac(n, AC_3, Heuristic::VRH_DOM_MIN, Heuristic::VLH_MIN);
   // n->vars[0]->ReduceTo(0, 0);
   // n->vars[0]->assign(true, 0);
   // vector<IntVar*> vs;
   // vs.push_back(n->vars[0]);
   // ac_.enforce(vs, 0);
-  ////hm->show();
   // n->show(0);
-  ////MAC mac(n, AC_3, Heuristic::VRH_DOM_MIN, Heuristic::VLH_MIN);
   // MAC mac(n, CA_LMRPC_BIT, Heuristic::VRH_DOM_WDEG_MIN, Heuristic::VLH_MIN);
   // MAC mac(n, AC_3bit, Heuristic::VRH_DOM_WDEG_MIN, Heuristic::VLH_MIN);
   // MAC mac(n, CA_LMRPC_BIT, Heuristic::VRH_DOM_MIN, Heuristic::VLH_MIN);

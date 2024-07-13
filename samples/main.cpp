@@ -42,12 +42,12 @@ int main(int argc, char* argv[]) {
   // std::cout << "jiji2\n";
   // shared_ptr<Network> n = std::make_shared<Network>(hm);
 
-  auto* n = new Network(hm);
-  MAC mac(n, AC_3bit, Heuristic::VRH_DOM_WDEG_MIN, Heuristic::VLH_MIN);
+  // auto* n = new Network(hm);
+  // MAC mac(n, AC_3bit, Heuristic::VRH_DOM_WDEG_MIN, Heuristic::VLH_MIN);
   // AC3bit ac_(n);
 
 
-  delete n;
+  // delete n;
   return 0;
   // ac_.enforce(n->vars, 0);
   ////hm->show();

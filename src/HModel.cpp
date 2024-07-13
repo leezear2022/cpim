@@ -8,8 +8,7 @@
 #include <sstream>
 #include <utility>
 
-namespace cpim ::common {
-
+namespace cpim {
 
 ////////// HVar //////////
 HVar HVarNode::Make(int id, int uid, const std::string &name, int min_val,
@@ -588,4 +587,4 @@ int HModelNode::AddTab(const std::string expr) {
   return AddTab(true, ts, scp, true);
 }
 
-}  // namespace cpim::common
+}  // namespace cpim

@@ -271,8 +271,8 @@ void XBuilder::GenerateHModel(const HModel& hm) const {
             ->getTextContent());
     int rel_id = extractNumberFromString(rel_id_str);
     std::vector<int> scope = get_scope(scp_str);
-    std::cout << std::get<3>(Rels[rel_id]) << std::endl;
-    std::cout << (std::get<3>(Rels[rel_id]) == "supports") << std::endl;
+    // std::cout << std::get<3>(Rels[rel_id]) << std::endl;
+    // std::cout << (std::get<3>(Rels[rel_id]) == "supports") << std::endl;
     hm->AddTab(std::get<3>(Rels[rel_id]) == "supports",
                std::get<4>(Rels[rel_id]), scope);
     XMLString::release(&scp_str);

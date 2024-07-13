@@ -19,7 +19,8 @@
 #include "object.h"
 
 namespace cpim {
-namespace common {
+// namespace common {
+using namespace cpim::common;
 
 // 定义统一编号范围
 const int MAX_VALUE = INT_MAX - 4096;
@@ -375,7 +376,7 @@ class HModel : public Shared<HModelNode> {
   explicit HModel(HModelNode *p) : Shared(p) {}
 };
 
-}  // namespace common
+// }  // namespace common
 }  // namespace cpim
 
 #endif  // HMODEL_H

@@ -21,7 +21,6 @@
 namespace cpim {
 // namespace common {
 using namespace cpim::common;
-
 // 定义统一编号范围
 const int MAX_VALUE = INT_MAX - 4096;
 const int MAX_OPT = INT_MIN + 4096;
@@ -231,6 +230,7 @@ class HTabNode : public Object {
            std::vector<HVar> &scp);
   HTabNode &operator=(const HTabNode &other) = default;
 
+  int Arity() const { return scope.size(); }
   void GetSTDTuple(std::vector<int> &src_tuple, std::vector<int> &std_tuple);
   void GetORITuple(std::vector<int> &std_tuple, std::vector<int> &ori_tuple);
   bool SAT(std::vector<int> &t);

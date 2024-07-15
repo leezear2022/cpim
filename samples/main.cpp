@@ -7,6 +7,7 @@
 #include <iostream>
 
 // #include "Network2.h"
+#include "cuSAC.cuh"
 #include "xcsp3model/HModel.h"
 #include "xcsp3model/XBuilder.h"
 using namespace cpim;
@@ -38,6 +39,8 @@ int main(int argc, char* argv[]) {
   HModel hm = HModelNode::Make();
   builder.GenerateHModel(hm);
   hm->show();
+  BuildBitModel(hm);
+  DelGPUModel();
 
   // std::cout << "jiji2\n";
   // shared_ptr<Network> n = std::make_shared<Network>(hm);
@@ -45,7 +48,6 @@ int main(int argc, char* argv[]) {
   // auto* n = new Network(hm);
   // MAC mac(n, AC_3bit, Heuristic::VRH_DOM_WDEG_MIN, Heuristic::VLH_MIN);
   // AC3bit ac_(n);
-
 
   // delete n;
   return 0;

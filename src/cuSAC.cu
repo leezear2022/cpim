@@ -56,21 +56,43 @@ __device__ __managed__ int3* S_Con;
 int intsizeof(const int nbits) {
   return ((nbits + BITS_PER_WORD - 1) / BITS_PER_WORD);
 }
-int CModel::GetBitSupIndexById(const int cid) const {
+
+// int2 CModel::GetBitSupIndexByTuple_C_MDS_MDINTS(int cid, int2 t) {
+//   return make_int2(
+//       cid * BITSUP_INTSIZE + t.x * BITDOM_INTSIZE + (t.y >> U32_POS),
+//       cid * BITSUP_INTSIZE + t.y * BITDOM_INTSIZE + (t.x >> U32_POS));
+// }
+
+////////////////////////////////  CModel  ////////////////////////////////
+
+int CModel::GetBitSupIndexById_C_MDS_MDINTS(const int cid) {
   return cid * BITSUP_INTSIZE;
 }
-int2 CModel::GetBitSupIndexByTuple(int cid, int2 t) {
+// c, (x, a), (y, a)
+// t.x = x, a
+// t.y = y, a
+// 若维度是[e][d][d/w],因此索引的计算公式如下:
+int2 CModel::GetBitSupIndexByTuple_C_MDS_MDINTS(const int cid, const int2 t) {
   return make_int2(
       cid * BITSUP_INTSIZE + t.x * BITDOM_INTSIZE + (t.y >> U32_POS),
       cid * BITSUP_INTSIZE + t.y * BITDOM_INTSIZE + (t.x >> U32_POS));
 }
 
-////////////////////////////////  CModel  ////////////////////////////////
+// c, (x, a), (y, a)
+// t.x = x, a
+// t.y = y, a
+// 若维度是[e][d/w][d],因此索引的计算公式如下:
+int2 CModel::GetBitSupIndexByTuple_C_MDINTS_MDS(const int cid, const int2 t) {
+  return make_int2(
+      cid * BITSUP_INTSIZE + (t.y >> U32_POS) * MAX_DOM_SIZE + t.x,
+      cid * BITSUP_INTSIZE + (t.x >> U32_POS) * MAX_DOM_SIZE + t.y);
+}
 
 CModel::CModel(const HModel& xm)
-    : num_vars(xm->Vars().size()),
-      num_tabs(xm->Tabs().size()),
-      max_dom_size(xm->max_domain_size()) {
+    : kNumVars(xm->Vars().size()),
+      kNumTabs(xm->Tabs().size()),
+      kMaxDomSize(xm->max_domain_size()),
+      kBitDomIntSize(intsizeof(xm->max_domain_size())) {
   // 初始化常量
   initialCPUConstant();
   // 初始化GPU数据
@@ -110,6 +132,77 @@ __global__ void transformKernel(cudaTextureObject_t texObj, int width,
     printf("Texture value at (%d, %d): %d\n", x, y, value);
   }
 }
+// CUDA kernel function to read from 3D texture object
+// width -> dom
+// height-> bit
+// depth -> c
+__global__ void transformKernel3D(cudaTextureObject_t texObj3D, int width,
+                                  int height, int depth) {
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+  int z = blockIdx.z * blockDim.z + threadIdx.z;
+
+  if (x < width && y < height && z < depth) {
+    // 访问3D纹理内存
+    uint2 value3D = tex3D<uint2>(texObj3D, x, y, z);
+    printf("Texture3D value at (%d, %d, %d): (%x, %x)\n", z, x, y, value3D.x,
+           value3D.y);
+  }
+}
+
+
+__global__ void CsCheckMain(int* mConEvt, int* mVarPre, int3* scope,
+        u32* bitDom, uint2* bitSup) {
+  const int bid = blockIdx.x;
+  const int tid = threadIdx.x;
+  __shared__ int3 s_scp;
+  __shared__ uint2 s_bitDom;
+
+  uint2 l_sum = make_uint2(0, 0);
+  uint2 l_res = make_uint2(0, 0);
+
+  if (tid == 0) {
+    const int c_id = mConEvt[bid];
+    s_scp = scope[c_id];
+    s_bitDom.x = bitDom[s_scp.x];
+    s_bitDom.y = bitDom[s_scp.y];
+  }
+  __syncthreads();
+
+  if (tid < D_MDS)
+    l_sum = bitSup[GetBitSupIdxDevice(s_scp.z, tid)];
+  __syncthreads();
+
+  //归约
+  l_sum.x &= s_bitDom.y;
+  l_sum.y &= s_bitDom.x;
+
+  //投票并反转
+  l_res.x = __brev(__ballot(l_sum.x));
+  l_res.y = __brev(__ballot(l_sum.y));
+
+  __syncthreads();
+  if (tid == 0) {
+    //存入全局内存,并记录改变
+    l_res.x &= s_bitDom.x;
+    if (s_bitDom.x != l_res.x) {
+      atomicAnd(&bitDom[s_scp.x], l_res.x);
+      mVarPre[s_scp.x] = 1;
+
+      if (bitDom[s_scp.x] == 0)
+        mVarPre[s_scp.x] = INT_MIN;
+    }
+
+    l_res.y &= s_bitDom.y;
+    if (s_bitDom.y != l_res.y) {
+      atomicAnd(&bitDom[s_scp.y], l_res.y);
+      mVarPre[s_scp.y] = 1;
+
+      if (bitDom[s_scp.y] == 0)
+        mVarPre[s_scp.y] = INT_MIN;
+    }
+  }
+}
 
 void CModel::BuildBitModel(const HModel& xm) {
 #pragma region 计算常量
@@ -126,7 +219,7 @@ void CModel::BuildBitModel(const HModel& xm) {
   // 总bitDom长度，一个子问题的所有bitDoms的长度
   BITDOMS_INTSIZE = BITDOM_INTSIZE * VS_SIZE;
   // 一个bitSup的int长度
-  // TODO: 这里看情况可能可乘个2, 现在这里暂不乘
+  // TODO: 这里看情况可能可乘个2, 现在这里暂不乘，因为用了int2的数据类型
   BITSUP_INTSIZE = MAX_DOM_SIZE * BITDOM_INTSIZE;
   // 所有bitSup的int长度
   BITSUPS_INTSIZE = BITSUP_INTSIZE * CS_SIZE;
@@ -162,62 +255,64 @@ void CModel::BuildBitModel(const HModel& xm) {
 
   // 初始化数据
   std::cout << "-----texture-----" << std::endl;
-  cudaMalloc(&d_ConNeighbor, sizeof(int) * num_tabs * num_tabs);
-  int h_ConNeighbor[num_tabs * num_tabs] = {};
+  cudaMalloc(&d_ConNeighbor, sizeof(int) * kNumTabs * kNumTabs);
+  int h_ConNeighbor[kNumTabs * kNumTabs] = {};
 
-  for (int i = 0; i < num_tabs; ++i) {
-    for (int j = 0; j < num_tabs; ++j) {
-      h_ConNeighbor[i * num_tabs + j] = i + j;  // 简单初始化
+  for (int i = 0; i < kNumTabs; ++i) {
+    for (int j = 0; j < kNumTabs; ++j) {
+      h_ConNeighbor[i * kNumTabs + j] = i + j;  // 简单初始化
     }
   }
 
   // 打印初始化后的数据
-  for (size_t i = 0; i < num_tabs * num_tabs; i++) {
+  for (size_t i = 0; i < kNumTabs * kNumTabs; i++) {
     std::cout << h_ConNeighbor[i] << " ";
   }
   std::cout << std::endl;
 
-  cudaMemcpy(d_ConNeighbor, h_ConNeighbor, sizeof(int) * num_tabs * num_tabs,
+  cudaMemcpy(d_ConNeighbor, h_ConNeighbor, sizeof(int) * kNumTabs * kNumTabs,
              cudaMemcpyHostToDevice);
 
   // Allocate CUDA array in device memory
   cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<int>();
-  cudaMallocArray(&cuArray, &channelDesc, num_tabs, num_tabs);
+  cudaMallocArray(&cuArray_MCon, &channelDesc, kNumTabs, kNumTabs);
 
   // Copy data to device memory
-  const size_t spitch = num_tabs * sizeof(int);
-  cudaMemcpy2DToArray(cuArray, 0, 0, h_ConNeighbor, spitch,
-                      num_tabs * sizeof(int), num_tabs, cudaMemcpyHostToDevice);
+  const size_t spitch = kNumTabs * sizeof(int);
+  cudaMemcpy2DToArray(cuArray_MCon, 0, 0, h_ConNeighbor, spitch,
+                      kNumTabs * sizeof(int), kNumTabs, cudaMemcpyHostToDevice);
   cudaDeviceSynchronize();
 
   // Specify texture resource
-  memset(&resDesc, 0, sizeof(resDesc));
-  resDesc.resType = cudaResourceTypeArray;
-  resDesc.res.array.array = cuArray;
+  memset(&resDesc_MCon, 0, sizeof(resDesc_MCon));
+  resDesc_MCon.resType = cudaResourceTypeArray;
+  resDesc_MCon.res.array.array = cuArray_MCon;
 
   // Specify texture object parameters
-  memset(&texDesc, 0, sizeof(texDesc));
-  texDesc.addressMode[0] = cudaAddressModeClamp;
-  texDesc.addressMode[1] = cudaAddressModeClamp;
-  texDesc.filterMode = cudaFilterModePoint;
-  texDesc.readMode = cudaReadModeElementType;
-  texDesc.normalizedCoords = 0;  // 不使用归一化坐标
+  memset(&texDesc_MCon, 0, sizeof(texDesc_MCon));
+  texDesc_MCon.addressMode[0] = cudaAddressModeClamp;
+  texDesc_MCon.addressMode[1] = cudaAddressModeClamp;
+  texDesc_MCon.filterMode = cudaFilterModePoint;
+  texDesc_MCon.readMode = cudaReadModeElementType;
+  texDesc_MCon.normalizedCoords = 0;  // 不使用归一化坐标
 
   // Create texture object
-  cudaCreateTextureObject(&texObj, &resDesc, &texDesc, NULL);
+  cudaCreateTextureObject(&texObj_MCon, &resDesc_MCon, &texDesc_MCon, NULL);
 
   // Invoke kernel
   dim3 threadsPerBlock(16, 16);
-  dim3 numBlocks((num_tabs + threadsPerBlock.x - 1) / threadsPerBlock.x,
-                 (num_tabs + threadsPerBlock.y - 1) / threadsPerBlock.y);
-  std::cout << num_tabs << std::endl;
+  dim3 numBlocks((kNumTabs + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                 (kNumTabs + threadsPerBlock.y - 1) / threadsPerBlock.y);
+  std::cout << kNumTabs << std::endl;
   std::cout << numBlocks.x << " " << numBlocks.y << " " << numBlocks.z
             << std::endl;
   std::cout << threadsPerBlock.x << " " << threadsPerBlock.y << " "
             << threadsPerBlock.z << std::endl;
-  transformKernel<<<numBlocks, threadsPerBlock>>>(texObj, num_tabs, num_tabs);
+  transformKernel<<<numBlocks, threadsPerBlock>>>(texObj_MCon, kNumTabs,
+                                                  kNumTabs);
   cudaDeviceSynchronize();
   std::cout << "-----texture-----" << std::endl;
+
   // std::cout << "-----texture-----" << std::endl;
   // cudaMalloc(&d_ConNeighbor, sizeof(int) * num_tabs * num_tabs);
   // int h_ConNeighbor[num_tabs * num_tabs] = {};
@@ -353,79 +448,122 @@ void CModel::BuildBitModel(const HModel& xm) {
 #pragma endregion 创建bitSubDom
 
 #pragma region 拷贝bitSup
+  printf("-------------bitSup-------------\n");
   cudaMallocManaged(&bitSup, sizeof(uint2) * BITSUPS_INTSIZE);
-  cudaMalloc(&d_bitSup, sizeof(uint2) * BITSUPS_INTSIZE);
+  // cudaMalloc(&d_bitSup, sizeof(uint2) * BITSUPS_INTSIZE);
+  auto* h_bitSup = new uint2[BITSUPS_INTSIZE]();
+
+  // 填充bitSup
   for (int i = 0; i < CS_SIZE; ++i) {
     const HTab c = xm->Tabs(i);
-    // 仅适用于二元约束
+    // 仅适用于二元约束，支持语义
     if (c->Arity() != 2)
       throw std::invalid_argument("Only support binary constraint.");
-    // 现在的约束元组都是支持的
-    const std::array<HVar, 2> v = {c->scope[0], c->scope[1]};
-    const u64 dom_size[2] = {v[0]->vals.size(), v[1]->vals.size()};
-
-    // 初始化位矩阵
-    for (int j = 0; j < MAX_DOM_SIZE; ++j) {
-      for (int k = 0; k < BITDOM_INTSIZE; ++k) {
-        const int idx = GetBitSupIndexByINTPrstn(c->id, j, k);
-        if (j < dom_size[0] && (k < (dom_size[1] >> U32_POS))) {
-          // 支持取0x0000..., 冲突取0xFFF...
-          bitSup[idx].x = (!c->semantics) ? UINT32_MAX : 0;
-          bitSup[idx].y = (!c->semantics) ? UINT32_MAX : 0;
-        } else if (k == (v[1]->vals.size() >> U32_POS)) {
-          bitSup[idx].x = (!c->semantics) ? UINT32_MAX : 0;
-          bitSup[idx].y = (!c->semantics) ? UINT32_MAX : 0;
-          bitSup[idx].x <<= U32_BIT - (dom_size[1] & U32_MOD_MASK);
-          bitSup[idx].y <<= U32_BIT - (dom_size[1] & U32_MOD_MASK);
-        } else {
-          bitSup[idx].x = 0;
-          bitSup[idx].y = 0;
-        }
-      }
-    }
-
-    // 向位矩阵中填充值
+    if (!c->semantics)
+      throw std::invalid_argument("Only support support semantics.");
+    // 向位矩阵中填充值，这里假设bitSup和h_bitSup的维度顺序是不一样的
+    // 维度是[e,d,d/w]
     for (int j = 0; j < c->tuples.size(); ++j) {
       const int2 t = make_int2(c->tuples[j][0], c->tuples[j][1]);
-      // printf("c_id= %d, %d, %d\n", c->id, t.x, t.y);
-      const int2 idx = GetBitSupIndexByTuple(c->id, t);
-      // printf("idx = %d, %d\n", idx.x, idx.y);
-      if (c->semantics) {
-        bitSup[idx.x].x |= U32_MASK1[t.y & U32_MOD_MASK];
-        bitSup[idx.y].y |= U32_MASK1[t.x & U32_MOD_MASK];
-      } else {
-        bitSup[idx.x].x &= U32_MASK0[t.y & U32_MOD_MASK];
-        bitSup[idx.y].y &= U32_MASK0[t.x & U32_MOD_MASK];
-      }
+      const int2 idx = GetBitSupIndexByTuple_C_MDS_MDINTS(c->id, t);
+      bitSup[idx.x].x |= U32_MASK1[t.y & U32_MOD_MASK];
+      bitSup[idx.y].y |= U32_MASK1[t.x & U32_MOD_MASK];
+      // h_bitSup[idx.x].x |= U32_MASK1[t.y & U32_MOD_MASK];
+      // h_bitSup[idx.y].y |= U32_MASK1[t.x & U32_MOD_MASK];
     }
 
-    cudaMemcpy(d_bitSup, bitSup, sizeof(uint2) * BITSUPS_INTSIZE,
-               cudaMemcpyDeviceToDevice);
-
-    for (int j = 0; j < MAX_DOM_SIZE; ++j) {
-      printf("c_id = %d, j = %d: ", i, j);
-      for (int k = 0; k < BITDOM_INTSIZE; ++k) {
-        const int idx = GetBitSupIndexByINTPrstn(c->id, j, k);
-        printf("%x, %x", bitSup[idx].x, bitSup[idx].y);
-      }
-      printf("\n");
+    // 维度是[e,d,d/w]
+    for (int j = 0; j < c->tuples.size(); ++j) {
+      const int2 t = make_int2(c->tuples[j][0], c->tuples[j][1]);
+      const int2 idx = GetBitSupIndexByTuple_C_MDINTS_MDS(c->id, t);
+      // bitSup[idx.x].x |= U32_MASK1[t.y & U32_MOD_MASK];
+      // bitSup[idx.y].y |= U32_MASK1[t.x & U32_MOD_MASK];
+      h_bitSup[idx.x].x |= U32_MASK1[t.y & U32_MOD_MASK];
+      h_bitSup[idx.y].y |= U32_MASK1[t.x & U32_MOD_MASK];
     }
-
-    printf("-------------------\n");
-    cudaMemcpy(bitSup, d_bitSup, sizeof(uint2) * BITSUPS_INTSIZE,
-               cudaMemcpyDeviceToHost);
-    for (int j = 0; j < MAX_DOM_SIZE; ++j) {
-      printf("c_id = %d, j = %d: ", i, j);
-      for (int k = 0; k < BITDOM_INTSIZE; ++k) {
-        const int idx = GetBitSupIndexByINTPrstn(c->id, j, k);
-        printf("%x, %x", bitSup[idx].x, bitSup[idx].y);
-      }
-      printf("\n");
-    }
-    printf("-------------------\n");
   }
+
+  printf("----------bitSup---------\n");
+  for (int i = 0; i < CS_SIZE; ++i) {
+    for (int j = 0; j < MAX_DOM_SIZE; ++j) {
+      printf("c_id = %d, j = %d: ", i, j);
+      for (int k = 0; k < BITDOM_INTSIZE; ++k) {
+        const int idx = GetBitSupIndexByINTPrstn(i, j, k);
+        printf("%x, %x", bitSup[idx].x, bitSup[idx].y);
+      }
+      printf("\n");
+    }
+  }
+
+  printf("----------h_bitSup---------\n");
+  for (int i = 0; i < CS_SIZE; ++i) {
+    for (int j = 0; j < BITDOM_INTSIZE; ++j) {
+      printf("c_id = %d, j = %d: ", i, j);
+      for (int k = 0; k < MAX_DOM_SIZE; ++k) {
+        const int idx = GetBitSupIndexByINTPrstn(i, j, k);
+        // printf("%x, %x", bitSup[idx].x, bitSup[idx].y);
+        printf("%x, %x | ", h_bitSup[idx].x, h_bitSup[idx].y);
+      }
+      printf("\n");
+    }
+  }
+  // cudaMemcpy(d_bitSup, h_bitSup, sizeof(uint2) * BITSUPS_INTSIZE,
+  //            cudaMemcpyDeviceToDevice);
+
+  printf("---------bitSup texture---------\n");
+  // 分配3D CUDA数组内存
+  // cudaChannelFormatDesc channelDesc3D = cudaCreateChannelDesc<uint2>();
+  // cudaExtent extent = make_cudaExtent(kNumTabs, kNumVars, kBitDomIntSize);
+  // cudaMalloc3DArray(&cuArray3D, &channelDesc3D, extent);
+  // udaExtent extent = make_cudaExtent(a, b, c);
+  // 这里a是最内维，b是次内维，c是最外维
+  // 维度变换后是: kMaxDomSize, kBitDomIntSize, kNumTabs -> kNumTabs, kNumVars,
+  // kBitDomIntSize
+  cudaChannelFormatDesc channelDesc3D = cudaCreateChannelDesc<uint2>();
+  cudaExtent extent = make_cudaExtent(kMaxDomSize, kBitDomIntSize, kNumTabs);
+  cudaMalloc3DArray(&cuArray3D, &channelDesc3D, extent);
+
+  // 将3D数据复制到设备内存
+  cudaMemcpy3DParms copyParams = {0};
+  copyParams.srcPtr = make_cudaPitchedPtr(h_bitSup, kMaxDomSize * sizeof(uint2),
+                                          kMaxDomSize, kBitDomIntSize);
+  copyParams.dstArray = cuArray3D;
+  copyParams.extent = extent;
+  copyParams.kind = cudaMemcpyHostToDevice;
+  cudaMemcpy3D(&copyParams);
+  cudaDeviceSynchronize();
+
+  // 设置3D纹理资源描述符
+  memset(&resDesc3D, 0, sizeof(resDesc3D));
+  resDesc3D.resType = cudaResourceTypeArray;
+  resDesc3D.res.array.array = cuArray3D;
+
+  // 设置3D纹理对象描述符
+  memset(&texDesc3D, 0, sizeof(texDesc3D));
+  texDesc3D.addressMode[0] = cudaAddressModeClamp;
+  texDesc3D.addressMode[1] = cudaAddressModeClamp;
+  texDesc3D.addressMode[2] = cudaAddressModeClamp;
+  texDesc3D.filterMode = cudaFilterModePoint;
+  texDesc3D.readMode = cudaReadModeElementType;
+  texDesc3D.normalizedCoords = 0;
+
+  // 创建3D纹理对象
+  cudaCreateTextureObject(&texObj3D, &resDesc3D, &texDesc3D, NULL);
+
+  // 调用内核函数
+  dim3 threadsPerBlock3(8, 8, 8);
+  dim3 numBlocks3((kNumTabs + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                  (kNumVars + threadsPerBlock.y - 1) / threadsPerBlock.y,
+                  (kBitDomIntSize + threadsPerBlock.z - 1) / threadsPerBlock.z);
+
+  transformKernel3D<<<numBlocks3, threadsPerBlock3>>>(texObj3D, kMaxDomSize,
+                                                      kBitDomIntSize, kNumTabs);
+  cudaDeviceSynchronize();
+
+  delete[] h_bitSup;
+  printf("==================bitSup==================\n");
 #pragma endregion 拷贝bitSup
-//
+
 #pragma region 生成约束
   cudaMallocManaged(&M_Con, sizeof(uint3) * CS_SIZE);
   cudaMallocManaged(&M_ConEvt, sizeof(uint3) * CS_SIZE);
@@ -529,7 +667,7 @@ void CModel::initialCPUConstant() {
 
 CModel::~CModel() {
   std::cout << "CModel析构函数" << std::endl;
-  cudaFree(d_bitSup);
+  // cudaFree(d_bitSup);
   cudaFree(d_ConNeighbor);
   cudaFree(bitDom);
   cudaFree(M_VarPre);
@@ -545,10 +683,15 @@ CModel::~CModel() {
   cudaFree(S_VarPre);
 
   // Destroy texture object
-  cudaDestroyTextureObject(texObj);
+  cudaDestroyTextureObject(texObj_MCon);
   // Free device memory
-  cudaFreeArray(cuArray);
+  cudaFreeArray(cuArray_MCon);
   // cudaFree(d_output);
+
+  // 销毁纹理对象
+  cudaDestroyTextureObject(texObj3D);
+  // 释放设备内存
+  cudaFreeArray(cuArray3D);
 }
 
 void CModel::DelGPUModel() const {

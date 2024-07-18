@@ -17,8 +17,12 @@
 #include <iostream>
 
 // #include "cuda_runtime_api.h"
-#include "xcsp3model//HModel.h"
+#include "xcsp3model/HModel.h"
 namespace cpim {
+
+using u32x2 = uint2;
+using u32x3 = uint3;
+using u32x4 = uint4;
 
 #ifndef MIN
 #define MIN(x, y) ((x < y) ? x : y)
@@ -200,22 +204,30 @@ extern __managed__ int3* S_Con;
 __global__ void exampleKernel(uint3* MCon, int size);
 
 __global__ void exampleKernelUMask();
+__global__ void CsCheckMain(int* mConEvt, int* mVarPre, int3* scope,
+                            u32* bitDom, uint2* bitSup);
 
 class CModel {
  public:
-  const int num_vars;
-  const int num_tabs;
-  const int max_dom_size;
+  const int kNumVars;
+  const int kNumTabs;
+  const int kMaxDomSize;
+  const int kBitDomIntSize;
   // num_threads
   // 以后很有可能会放到纹理内存里
-  uint2* d_bitSup;
+  // uint2* d_bitSup{};
   // 约束和约束的相邻关系
-  i32* d_ConNeighbor;
+  i32* d_ConNeighbor{};
 
-  cudaArray_t cuArray;
-  cudaTextureObject_t texObj;
-  cudaResourceDesc resDesc;
-  cudaTextureDesc texDesc;
+  cudaArray_t cuArray_MCon{};
+  cudaTextureObject_t texObj_MCon{};
+  cudaResourceDesc resDesc_MCon{};
+  cudaTextureDesc texDesc_MCon{};
+
+  cudaArray_t cuArray3D{};
+  cudaTextureObject_t texObj3D{};
+  cudaResourceDesc resDesc3D{};
+  cudaTextureDesc texDesc3D{};
 
   thrust::device_vector<uint3> d_MCon;
   thrust::device_vector<uint3> d_MConEvt;
@@ -247,13 +259,15 @@ class CModel {
 #define pow2i(e) (1 << e)
   // __device__ __inline__ int pow2i(int e) { return 1 << e; }
 
-#define GetBitSupIndexByINTPrstn(cid, x_val, y_val) \
-  (cid * BITSUP_INTSIZE + x_val * BITDOM_INTSIZE + y_val)
+// #define GetBitSupIndexByINTPrstn(cid, x_val, y_val) \
+//   (cid * BITSUP_INTSIZE + x_val * BITDOM_INTSIZE + y_val)
 
-  __device__ __host__ int GetBitSupIndexById(int cid) const;
-  __device__ __host__ int2 GetBitSupIndexByTuple(int cid, int2 t);
+  __device__ __host__  int GetBitSupIndexById_C_MDS_MDINTS(int cid) ;
+  __device__ __host__  int2 GetBitSupIndexByTuple_C_MDS_MDINTS(int cid, int2 t);
+  __device__ __host__  int2 GetBitSupIndexByTuple_C_MDINTS_MDS( int cid,  int2 t);
+  // __device__ __host__  int2 GetBitSupIndexByINTPrstn_C_MDINTS_MDS( int cid,  int2 t);
 
-  CModel(const HModel& xm);
+  explicit CModel(const HModel& xm);
 
   void BuildBitModel(const HModel& xm);
 

@@ -83,6 +83,7 @@ add_executable(cpim samples/main.cu
         src/Solver.cpp
         include/Timer.h
         include/cuSAC.cuh
+        src/cuSAC.cu
 )
 
 set_target_properties(cpim PROPERTIES

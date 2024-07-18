@@ -39,8 +39,12 @@ int main(int argc, char* argv[]) {
   HModel hm = HModelNode::Make();
   builder.GenerateHModel(hm);
   hm->show();
-  BuildBitModel(hm);
-  DelGPUModel();
+  CModel cm(hm);
+  // cm.BuildBitModel(hm);
+  // cm.DelGPUModel();
+  // BuildBitModel(hm);
+  // DelGPUModel();
+  // M_Con.clear();
 
   // std::cout << "jiji2\n";
   // shared_ptr<Network> n = std::make_shared<Network>(hm);

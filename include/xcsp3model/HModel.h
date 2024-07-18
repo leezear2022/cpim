@@ -325,17 +325,19 @@ class HModelNode : public Object {
   int AddTab(const std::string expr);
   int AddTabAsPrevious(HTab &t, std::vector<std::string> &scp);
 
-  ~HModelNode() = default;
-
- private:
-  std::vector<HVar> vars;
-  std::vector<HTab> tabs;
   std::unordered_map<HVar, std::vector<HTab>, HVarHash, HVarEqual>
       subscriptions;
   // // 两个矩阵组成的矩阵,矩阵内容为，作用在两个变量之间约束的个数
   // //.empty()表示无约束作用在该两个变量之间
   std::vector<std::vector<std::vector<int>>> neighborhoods;
+
+  ~HModelNode() = default;
+
+ private:
+  std::vector<HVar> vars;
+  std::vector<HTab> tabs;
   std::string name_;
+
   void get_postfix(const std::string expr, std::vector<int> &data,
                    std::vector<int> &params, std::vector<int> &num_op_params,
                    std::vector<HVar> &scp);

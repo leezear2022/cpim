@@ -3,13 +3,22 @@
 namespace cpim {
 
 // 初始化常量
-__constant__ int D_BITDOM_INTSIZE;
-__constant__ int D_BITDOMS_INTSIZE;
+__constant__ int kDeviceBitDomIntSize;
+__constant__ int kDeviceMaxDomSize;
+__constant__ int kDeviceBitDomsIntSize;
+__constant__ int kDeviceNumVars;
+__constant__ int kDeviceNumTabs;
+__constant__ int* kDeviceDomSize;
+
+__constant__ int kDeviceBitSupIntSize;
+__constant__ int kDeviceBitSupsIntSize;
+__constant__ int kDeviceBitSubDomsIntSize;
+
+__constant__ u32 kDeviceU32Mask1[32];
+__constant__ u32 kDeviceU32Mask0[32];
+
 __constant__ int D_NUM_BD_BLOCK;
 __constant__ int D_NUM_CS_SIZE_BLOCKS;
-__constant__ u32 kU32Mask1[32];
-__constant__ u32 kU32Mask0[32];
-
 __device__ __managed__ int NUM_BD_BLOCK;
 __device__ __managed__ int NUM_CS_SIZE_BLOCKS;
 __device__ __managed__ int BITDOM_INTSIZE;
@@ -65,35 +74,47 @@ int intsizeof(const int nbits) {
 
 ////////////////////////////////  CModel  ////////////////////////////////
 
-int CModel::GetBitSupIndexById_C_MDS_MDINTS(const int cid) {
-  return cid * BITSUP_INTSIZE;
-}
-// c, (x, a), (y, a)
-// t.x = x, a
-// t.y = y, a
-// 若维度是[e][d][d/w],因此索引的计算公式如下:
-int2 CModel::GetBitSupIndexByTuple_C_MDS_MDINTS(const int cid, const int2 t) {
-  return make_int2(
-      cid * BITSUP_INTSIZE + t.x * BITDOM_INTSIZE + (t.y >> U32_POS),
-      cid * BITSUP_INTSIZE + t.y * BITDOM_INTSIZE + (t.x >> U32_POS));
-}
-
-// c, (x, a), (y, a)
-// t.x = x, a
-// t.y = y, a
-// 若维度是[e][d/w][d],因此索引的计算公式如下:
-int2 CModel::GetBitSupIndexByTuple_C_MDINTS_MDS(const int cid, const int2 t) {
-  return make_int2(
-      cid * BITSUP_INTSIZE + (t.y >> U32_POS) * MAX_DOM_SIZE + t.x,
-      cid * BITSUP_INTSIZE + (t.x >> U32_POS) * MAX_DOM_SIZE + t.y);
-}
+// int CModel::GetBitSupIndexByCID(const int cid) {
+//   return cid * BITSUP_INTSIZE;
+// }
+// // c, (x, a), (y, a)
+// // t.x = x, a
+// // t.y = y, a
+// // 若维度是[e][d][d/w],因此索引的计算公式如下:
+// int2 CModel::GetBitSupIndexByTuple_C_MDS_MDINTS(const int cid, const int2 t)
+// {
+//   return make_int2(
+//       cid * BITSUP_INTSIZE + t.x * BITDOM_INTSIZE + (t.y >> U32_POS),
+//       cid * BITSUP_INTSIZE + t.y * BITDOM_INTSIZE + (t.x >> U32_POS));
+// }
+//
+// // c, (x, a), (y, a)
+// // t.x = x, a
+// // t.y = y, a
+// // 若维度是[e][d/w][d],因此索引的计算公式如下:
+// int2 CModel::GetBitSupIndexByTuple_C_MDINTS_MDS(const int cid, const int2 t)
+// {
+//   return make_int2(
+//       cid * BITSUP_INTSIZE + (t.y >> U32_POS) * MAX_DOM_SIZE + t.x,
+//       cid * BITSUP_INTSIZE + (t.x >> U32_POS) * MAX_DOM_SIZE + t.y);
+// }
 
 CModel::CModel(const HModel& xm)
     : kNumVars(xm->Vars().size()),
       kNumTabs(xm->Tabs().size()),
       kMaxDomSize(xm->max_domain_size()),
-      kBitDomIntSize(intsizeof(xm->max_domain_size())) {
-  // 初始化常量
+      kBitDomIntSize(intsizeof(xm->max_domain_size())),
+      kBitDomsIntSize(kBitDomIntSize * kNumVars),
+      kBitSupIntSize(kMaxDomSize * kBitDomIntSize),
+      kBitSupsIntSize(kMaxDomSize * kBitDomIntSize * kNumTabs),
+      kBitSubDomsIntSize(kNumVars * kMaxDomSize * kBitDomsIntSize) {
+  dom_size.resize(kNumVars);
+  for (int i = 0; i < kNumVars; ++i) {
+    const HVar v = xm->Vars(i);
+    dom_size[i] = v->vals.size();
+  }
+
+  // 初始化GPU常量
   initialCPUConstant();
   // 初始化GPU数据
   BuildBitModel(xm);
@@ -114,8 +135,8 @@ __global__ void exampleKernel(uint3* MCon, int size) {
 __global__ void exampleKernelUMask() {
   int idx = threadIdx.x;
   if (idx < 32) {
-    printf("kU32Mask1[%d] = 0x%x, kU32Mask0[%d] = 0x%x\n", idx, kU32Mask1[idx],
-           idx, kU32Mask0[idx]);
+    printf("kU32Mask1[%d] = 0x%x, kU32Mask0[%d] = 0x%x\n", idx,
+           kDeviceU32Mask1[idx], idx, kDeviceU32Mask0[idx]);
   }
 }
 
@@ -149,60 +170,61 @@ __global__ void transformKernel3D(cudaTextureObject_t texObj3D, int width,
            value3D.y);
   }
 }
-
-
-__global__ void CsCheckMain(int* mConEvt, int* mVarPre, int3* scope,
-        u32* bitDom, uint2* bitSup) {
-  const int bid = blockIdx.x;
-  const int tid = threadIdx.x;
-  __shared__ int3 s_scp;
-  __shared__ uint2 s_bitDom;
-
-  uint2 l_sum = make_uint2(0, 0);
-  uint2 l_res = make_uint2(0, 0);
-
-  if (tid == 0) {
-    const int c_id = mConEvt[bid];
-    s_scp = scope[c_id];
-    s_bitDom.x = bitDom[s_scp.x];
-    s_bitDom.y = bitDom[s_scp.y];
-  }
-  __syncthreads();
-
-  if (tid < D_MDS)
-    l_sum = bitSup[GetBitSupIdxDevice(s_scp.z, tid)];
-  __syncthreads();
-
-  //归约
-  l_sum.x &= s_bitDom.y;
-  l_sum.y &= s_bitDom.x;
-
-  //投票并反转
-  l_res.x = __brev(__ballot(l_sum.x));
-  l_res.y = __brev(__ballot(l_sum.y));
-
-  __syncthreads();
-  if (tid == 0) {
-    //存入全局内存,并记录改变
-    l_res.x &= s_bitDom.x;
-    if (s_bitDom.x != l_res.x) {
-      atomicAnd(&bitDom[s_scp.x], l_res.x);
-      mVarPre[s_scp.x] = 1;
-
-      if (bitDom[s_scp.x] == 0)
-        mVarPre[s_scp.x] = INT_MIN;
-    }
-
-    l_res.y &= s_bitDom.y;
-    if (s_bitDom.y != l_res.y) {
-      atomicAnd(&bitDom[s_scp.y], l_res.y);
-      mVarPre[s_scp.y] = 1;
-
-      if (bitDom[s_scp.y] == 0)
-        mVarPre[s_scp.y] = INT_MIN;
-    }
-  }
-}
+//
+// __global__ void CsCheckMain(i32x3* mConPre, i32x3* mCon, int* mVarPre,
+//                             int3* scope, u32* bitDom, uint2* bitSup) {
+//   // 约束ID
+//   const int cid = blockIdx.x;
+//   // bitDom索引
+//   const int x_a_0 = threadIdx.x;
+//   // bitDom索引
+//   const int x_a_1 = threadIdx.y;
+//   __shared__ int3 s_scp;
+//   __shared__ uint2 s_bitDom;
+//
+//   uint2 l_sum = make_uint2(0, 0);
+//   uint2 l_res = make_uint2(0, 0);
+//
+//   // 拿到当前约束信息
+//   if (tid == 0) {
+//     const int c_id = mConEvt[bid];
+//     s_scp = scope[c_id];
+//     s_bitDom.x = bitDom[s_scp.x];
+//     s_bitDom.y = bitDom[s_scp.y];
+//   }
+//   __syncthreads();
+//
+//   if (tid < D_MDS) l_sum = bitSup[GetBitSupIdxDevice(s_scp.z, tid)];
+//   __syncthreads();
+//
+//   // 归约
+//   l_sum.x &= s_bitDom.y;
+//   l_sum.y &= s_bitDom.x;
+//
+//   // 投票并反转
+//   l_res.x = __brev(__ballot(l_sum.x));
+//   l_res.y = __brev(__ballot(l_sum.y));
+//
+//   __syncthreads();
+//   if (tid == 0) {
+//     // 存入全局内存,并记录改变
+//     l_res.x &= s_bitDom.x;
+//     if (s_bitDom.x != l_res.x) {
+//       atomicAnd(&bitDom[s_scp.x], l_res.x);
+//       mVarPre[s_scp.x] = 1;
+//
+//       if (bitDom[s_scp.x] == 0) mVarPre[s_scp.x] = INT_MIN;
+//     }
+//
+//     l_res.y &= s_bitDom.y;
+//     if (s_bitDom.y != l_res.y) {
+//       atomicAnd(&bitDom[s_scp.y], l_res.y);
+//       mVarPre[s_scp.y] = 1;
+//
+//       if (bitDom[s_scp.y] == 0) mVarPre[s_scp.y] = INT_MIN;
+//     }
+//   }
+// }
 
 void CModel::BuildBitModel(const HModel& xm) {
 #pragma region 计算常量
@@ -659,10 +681,22 @@ void CModel::BuildBitModel(const HModel& xm) {
   //   MCC_BlocksOffset = thrust::raw_pointer_cast(MCC_BOffset.data());
   // #pragma endregion
 }
+
 void CModel::initialCPUConstant() {
   // 将 CPU 数据复制到 GPU 常量内存
-  cudaMemcpyToSymbol(kU32Mask1, U32_MASK1, sizeof(U32_MASK1));
-  cudaMemcpyToSymbol(kU32Mask0, U32_MASK0, sizeof(U32_MASK0));
+  cudaMemcpyToSymbol(kDeviceU32Mask1, U32_MASK1, sizeof(U32_MASK1));
+  cudaMemcpyToSymbol(kDeviceU32Mask0, U32_MASK0, sizeof(U32_MASK0));
+  cudaMemcpyToSymbol(kDeviceBitDomIntSize, &kBitDomIntSize, sizeof(int));
+  cudaMemcpyToSymbol(kDeviceBitDomsIntSize, &kBitDomsIntSize, sizeof(int));
+  cudaMemcpyToSymbol(kDeviceMaxDomSize, &kMaxDomSize, sizeof(int));
+  cudaMemcpyToSymbol(kDeviceNumTabs, &kNumTabs, sizeof(int));
+  cudaMemcpyToSymbol(kDeviceNumVars, &kNumVars, sizeof(int));
+  cudaMemcpyToSymbol(kDeviceMaxDomSize, &kMaxDomSize, sizeof(int));
+  cudaMemcpyToSymbol(kDeviceDomSize, thrust::raw_pointer_cast(dom_size.data()), kNumVars * sizeof(int));
+  cudaMemcpyToSymbol(kDeviceBitSupIntSize, &kBitSupIntSize, sizeof(int));
+  cudaMemcpyToSymbol(kDeviceBitSupsIntSize, &kBitSupsIntSize, sizeof(int));
+  cudaMemcpyToSymbol(kDeviceBitSubDomsIntSize, &kBitSubDomsIntSize, sizeof(int));
+
 }
 
 CModel::~CModel() {

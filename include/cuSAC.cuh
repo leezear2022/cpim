@@ -24,6 +24,10 @@ using u32x2 = uint2;
 using u32x3 = uint3;
 using u32x4 = uint4;
 
+using i32x2 = int2;
+using i32x3 = int3;
+using i32x4 = int3;
+
 #ifndef MIN
 #define MIN(x, y) ((x < y) ? x : y)
 #endif
@@ -52,9 +56,9 @@ inline int intsizeof(int nbits);
 // #define GetBitSupIndexByTuple(cid, t)(make_int2(
 // cid * BITSUP_INTSIZE + t.x * BITDOM_INTSIZE + (t.y >> U32_POS),
 // cid * BITSUP_INTSIZE + t.y * BITDOM_INTSIZE + (t.x >> U32_POS)))
-extern __constant__ u32 kU32Mask1[32];
+extern __constant__ u32 kDeviceU32Mask1[32];
 
-extern __constant__ u32 kU32Mask0[32];
+extern __constant__ u32 kDeviceU32Mask0[32];
 
 const u32 U32_MASK1[32] = {
     0x80000000, 0x40000000, 0x20000000, 0x10000000, 0x08000000, 0x04000000,
@@ -92,15 +96,23 @@ const u32 U32_MASK0[32] = {
 };
  */
 // 一个bitDom[x]的长度
-extern __constant__ int D_BITDOM_INTSIZE;
+extern __constant__ int kDeviceBitDomIntSize;
 // 整个bitDom的长度
-extern __constant__ int D_BITDOMS_INTSIZE;
+extern __constant__ int kDeviceBitDomsIntSize;
+extern __constant__ int kDeviceMaxDomSize;
+extern __constant__ int kDeviceNumVars;
+extern __constant__ int kDeviceNumTabs;
+extern __constant__ int* kDeviceDomSize;
 
-const int num_threads = 32;
-const int U32_SIZE = sizeof(u32);  ///< 4
-const int U32_BIT = U32_SIZE * 8;  ///< 32
-const int U32_POS = 5;
-const int U32_MOD_MASK = 31;
+extern __constant__ int kDeviceBitSupIntSize;
+extern __constant__ int kDeviceBitSupsIntSize;
+extern __constant__ int kDeviceBitSubDomsIntSize;
+
+// constexpr int num_threads = 32;
+constexpr int U32_SIZE = sizeof(u32);  ///< 4
+constexpr int U32_BIT = U32_SIZE * 8;  ///< 32
+constexpr int U32_POS = 5;
+constexpr int U32_MOD_MASK = 31;
 
 constexpr int ADDRESS_BITS_PER_WORD = 5;
 constexpr int BITS_PER_WORD = 1 << ADDRESS_BITS_PER_WORD;
@@ -213,6 +225,10 @@ class CModel {
   const int kNumTabs;
   const int kMaxDomSize;
   const int kBitDomIntSize;
+  const int kBitDomsIntSize;
+  const int kBitSupIntSize;
+  const int kBitSupsIntSize;
+  const int kBitSubDomsIntSize;
   // num_threads
   // 以后很有可能会放到纹理内存里
   // uint2* d_bitSup{};
@@ -232,6 +248,7 @@ class CModel {
   thrust::device_vector<uint3> d_MCon;
   thrust::device_vector<uint3> d_MConEvt;
   thrust::device_vector<int> d_ConPre;
+  thrust::host_vector<int> dom_size;
   //
   //   __device__ __managed__ ushort4* subVar;
   ////标记子问题发生改动的变量id，初始化全部为0
@@ -239,32 +256,104 @@ class CModel {
   ////标记子问题发生改动的约束id，初始化全部为1
   //   __device__ __managed__ int* subEvtCon;
 
-  // 根据x和index获得bitDom位置
-#define GetBitDomIndex(x, i) (x * BITDOM_INTSIZE + i)
   // 根据落在最后文字的值的个数获取bit表示的偏移量
 #define GetOffSet(x) (U32_BIT - (x & U32_MOD_MASK))
-
-#define GetBitSubDomStartIndex(x, a) ((x * MAX_DOM_SIZE + a) * BITDOMS_INTSIZE)
-#define GetBitSubDomIndex(x, a, y, i) \
-  (GetBitSubDomStartIndex(x, a) + GetBitDomIndex(y, i))
-
-  // __device__ bool IsGtZero(int x) { return x > 0; }
 #define IsGtZero(x) (x > 0)
 #define GetTopNum(num_elements, num_threads) \
   ((num_elements + (num_threads - 1)) / num_threads)
-
-#define GetBitSupIndexByINTPrstn(cid, x_val, y_val) \
-  (cid * BITSUP_INTSIZE + x_val * BITDOM_INTSIZE + y_val)
-
 #define pow2i(e) (1 << e)
-  // __device__ __inline__ int pow2i(int e) { return 1 << e; }
 
-// #define GetBitSupIndexByINTPrstn(cid, x_val, y_val) \
+  //   // 根据x和index获得bitDom位置
+  // #define GetBitDomIndex(x, i) (x * BITDOM_INTSIZE + i)
+  // #define GetBitSubDomStartIndex(x, a) ((x * MAX_DOM_SIZE + a) * \
+  // BITDOMS_INTSIZE)
+
+  // #define GetBitSubDomIndex(x, a, y, i) \
+//   (GetBitSubDomStartIndex(x, a) + GetBitDomIndex(y, i))
+  // #define GetBitSupIndexByINTPrstn(cid, x_val, y_val) \
 //   (cid * BITSUP_INTSIZE + x_val * BITDOM_INTSIZE + y_val)
 
-  __device__ __host__  int GetBitSupIndexById_C_MDS_MDINTS(int cid) ;
-  __device__ __host__  int2 GetBitSupIndexByTuple_C_MDS_MDINTS(int cid, int2 t);
-  __device__ __host__  int2 GetBitSupIndexByTuple_C_MDINTS_MDS( int cid,  int2 t);
+  // __device__ __inline__ int pow2i(int e) { return 1 << e; }
+
+  // #define GetBitSupIndexByINTPrstn(cid, x_val, y_val) \
+//   (cid * BITSUP_INTSIZE + x_val * BITDOM_INTSIZE + y_val)
+
+  //   // 获取常量值的模板函数
+  //   template <typename T>
+  //   __host__ __device__ static inline T GetConstantValue(const T& hostValue,
+  //   const T& deviceValue) {
+  // #ifdef __CUDA_ARCH__
+  //     return deviceValue;
+  // #else
+  //     return hostValue;
+  // #endif
+  //   }
+
+  // 获取常量值的模板函数
+  template <typename T>
+  __host__ __device__ static inline T GetConstantValue(const T& hostValue,
+                                                       const T& deviceValue) {
+#ifdef __CUDA_ARCH__
+    return deviceValue;
+#else
+    return hostValue;
+#endif
+  }
+
+  // 函数定义，替代宏
+  __host__ __device__ int GetBitDomIndex(int x, int i) {
+    return x * GetConstantValue(kBitDomIntSize, kDeviceBitDomIntSize) + i;
+  }
+
+  __host__ __device__ int GetBitSubDomStartIndex(int x, int a) {
+    return (x * GetConstantValue(kMaxDomSize, kDeviceMaxDomSize) + a) *
+           GetConstantValue(kBitDomsIntSize, kDeviceBitDomsIntSize);
+  }
+
+  __host__ __device__ int GetBitSubDomIndex(int x, int a, int y, int i) {
+    return GetBitSubDomStartIndex(x, a) + GetBitDomIndex(y, i);
+  }
+
+  __host__ __device__ int GetBitSupIndexByINTPrstn(int cid, int x_val,
+                                                   int y_val) {
+    return cid * GetConstantValue(kBitSupIntSize, kDeviceBitSupIntSize) +
+           x_val * GetConstantValue(kBitDomIntSize, kDeviceBitDomIntSize) +
+           y_val;
+  }
+
+  __host__ __device__ inline int GetBitSupIndexByCID(const int cid) {
+    int bitSupIntSize = GetConstantValue(kBitSupIntSize, kDeviceBitSupIntSize);
+    return cid * bitSupIntSize;
+  }
+
+  // // c, (x, a), (y, a)
+  // // t.x = x, a
+  // // t.y = y, a
+  // // 若维度是[e][d][d/w],因此索引的计算公式如下:
+  __host__ __device__ inline int2 GetBitSupIndexByTuple_C_MDS_MDINTS(
+      const int cid, const int2 t) {
+    int bitSupIntSize = GetConstantValue(kBitSupIntSize, kDeviceBitSupIntSize);
+    int bitDomIntSize = GetConstantValue(kBitDomIntSize, kDeviceBitDomIntSize);
+    return make_int2(
+        cid * bitSupIntSize + t.x * bitDomIntSize + (t.y >> U32_POS),
+        cid * bitSupIntSize + t.y * bitDomIntSize + (t.x >> U32_POS));
+  }
+
+  // // c, (x, a), (y, a)
+  // // t.x = x, a
+  // // t.y = y, a
+  // // 若维度是[e][d/w][d],因此索引的计算公式如下:
+  __host__ __device__ inline int2 GetBitSupIndexByTuple_C_MDINTS_MDS(const int cid, const int2 t) {
+    int bitSupIntSize = GetConstantValue(kBitSupIntSize, kDeviceBitSupIntSize);
+    int maxDomSize = GetConstantValue(kMaxDomSize, kDeviceMaxDomSize);
+    return make_int2(
+        cid * bitSupIntSize + (t.y >> U32_POS) * maxDomSize + t.x,
+        cid * bitSupIntSize + (t.x >> U32_POS) * maxDomSize + t.y
+    );
+  }
+  // __device__ __host__  int GetBitSupIndexByCID(int cid) ;
+  // __device__ __host__  int2 GetBitSupIndexByTuple_C_MDS_MDINTS(int cid, int2 t);
+  // __device__ __host__  int2 GetBitSupIndexByTuple_C_MDINTS_MDS( int cid,  int2 t);
   // __device__ __host__  int2 GetBitSupIndexByINTPrstn_C_MDINTS_MDS( int cid,  int2 t);
 
   explicit CModel(const HModel& xm);

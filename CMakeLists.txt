@@ -68,6 +68,21 @@ include_directories(${LIBXML2_INCLUDE_DIR})
 find_package(XercesC REQUIRED)
 include_directories(${XercesC_INCLUDE_DIRS})
 
+# 查找依赖库
+find_package(GTest REQUIRED)
+find_package(gflags REQUIRED)
+find_package(glog REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(Unwind REQUIRED libunwind)
+find_package(absl REQUIRED)
+
+# 包含目录
+include_directories(${GTEST_INCLUDE_DIRS})
+include_directories(${GFLAGS_INCLUDE_DIRS})
+include_directories(${GLOG_INCLUDE_DIRS})
+include_directories(${Unwind_INCLUDE_DIRS})
+include_directories(${ABSL_INCLUDE_DIRS})
+
 # 添加头文件目录
 include_directories(include)
 

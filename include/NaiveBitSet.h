@@ -42,9 +42,9 @@ class NaiveBitSet {
     words_[intSize_ - 1] &= lastMask_;
   }
 
-  void set(int bitIndex) {
-    int idx = wordIndex(bitIndex);
-    int offset = wordOffset(bitIndex);
+  void set(const int bitIndex) {
+    const int idx = wordIndex(bitIndex);
+    const int offset = wordOffset(bitIndex);
     words_[idx] |= 1U << offset;
   }
 
@@ -52,6 +52,12 @@ class NaiveBitSet {
     for (int i = 0; i < intSize_; ++i) {
       words_[i] = s.words_[i];
     }
+  }
+
+  int get(int bitIndex) {
+    const int wordIndex = wordIndex(bitIndex);
+    const int offset = wordOffset(bitIndex);
+    return wordIndex < intSize_ && (words_[wordIndex] & 1 << offset) != 0L;
   }
 
   void clear(int bitIndex) {
@@ -269,11 +275,13 @@ class NaiveBitSet {
   static constexpr int BITS_PER_WORD = 1 << ADDRESS_BITS_PER_WORD;
   static constexpr int BIT_INDEX_MASK = BITS_PER_WORD - 1;
 
-  static int wordIndex(int bitIndex) {
+  inline static int wordIndex(const int bitIndex) {
     return bitIndex >> ADDRESS_BITS_PER_WORD;
   }
 
-  static int wordOffset(int bitIndex) { return bitIndex & BIT_INDEX_MASK; }
+  inline static int wordOffset(const int bitIndex) {
+    return bitIndex & BIT_INDEX_MASK;
+  }
 };
 }  // namespace cpim
 

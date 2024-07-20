@@ -6,15 +6,9 @@
 #define CUSAC_CUH
 // CUDA Runtime
 #include <cuda_runtime.h>
-// #include <device_functions.h>
-#include <device_launch_parameters.h>
-// Utilities and system includes
+#include <thrust/copy.h>
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
-#include <thrust/scan.h>
-
-#include <cmath>
-#include <iostream>
 
 // #include "cuda_runtime_api.h"
 #include "xcsp3model/HModel.h"
@@ -36,7 +30,7 @@ struct int_predicate {
   __host__ __device__ bool operator()(const int x) { return x > 0; }
 };
 
-//__forceinline__ int  GetBitDomIndex(int var_id)
+//__forceinline__ int  GetBitDomByIndex(int var_id)
 //{
 //	return var_id * BITDOM_INTSIZE;
 //}
@@ -47,10 +41,10 @@ struct int_predicate {
 // }
 
 // inline int intsizeof(const int x) { return (int)ceil((float)x / U32_BIT); }
-// #define intsizeof(x) ((nbits + BITS_PER_WORD - 1) / BITS_PER_WORD)
+// #define intsizeof(x) ((nbits + kBitsPerWord - 1) / kBitsPerWord)
 inline int intsizeof(int nbits);
 //  {
-//   return ((nbits + BITS_PER_WORD - 1) / BITS_PER_WORD);
+//   return ((nbits + kBitsPerWord - 1) / kBitsPerWord);
 // }
 
 // #define GetBitSupIndexByTuple(cid, t)(make_int2(
@@ -114,13 +108,24 @@ constexpr int U32_BIT = U32_SIZE * 8;  ///< 32
 constexpr int U32_POS = 5;
 constexpr int U32_MOD_MASK = 31;
 
-constexpr int ADDRESS_BITS_PER_WORD = 5;
-constexpr int BITS_PER_WORD = 1 << ADDRESS_BITS_PER_WORD;
-constexpr int BIT_INDEX_MASK = BITS_PER_WORD - 1;
+constexpr int kAddressBitsPerWord = 5;
+constexpr int kBitsPerWord = 1 << kAddressBitsPerWord;
+constexpr int kBitIndexMask = kBitsPerWord - 1;
+
+#define WORD_INDEX(bitIndex) ((bitIndex) >> kAddressBitsPerWord)
+#define WORD_OFFSET(bitIndex) ((bitIndex) & kBitIndexMask)
+
+#define BITSET_GET(words, bitIndex) \
+  ((words[WORD_INDEX(bitIndex)] >> WORD_OFFSET(bitIndex)) & 1U)
+#define BITSET_SET(words, bitIndex) \
+  (words[WORD_INDEX(bitIndex)] |= (1U << WORD_OFFSET(bitIndex)))
+#define BITSET_CLEAR(words, bitIndex) \
+  (words[WORD_INDEX(bitIndex)] &= ~(1U << WORD_OFFSET(bitIndex)))
 
 // 定义纹理内存描述符
 // 纹理内存描述符
-extern cudaTextureObject_t texObject;
+// extern cudaTextureObject_t texObject;
+// extern cudaTextureObject_t texObject;
 // // 一个bitDom[x]的长度
 // __constant__ int D_BITDOM_INTSIZE;
 // // 整个bitDom的长度
@@ -249,6 +254,7 @@ class CModel {
   thrust::device_vector<uint3> d_MConEvt;
   thrust::device_vector<int> d_ConPre;
   thrust::host_vector<int> dom_size;
+
   //
   //   __device__ __managed__ ushort4* subVar;
   ////标记子问题发生改动的变量id，初始化全部为0
@@ -264,12 +270,12 @@ class CModel {
 #define pow2i(e) (1 << e)
 
   //   // 根据x和index获得bitDom位置
-  // #define GetBitDomIndex(x, i) (x * BITDOM_INTSIZE + i)
+  // #define GetBitDomByIndex(x, i) (x * BITDOM_INTSIZE + i)
   // #define GetBitSubDomStartIndex(x, a) ((x * MAX_DOM_SIZE + a) * \
   // BITDOMS_INTSIZE)
 
   // #define GetBitSubDomIndex(x, a, y, i) \
-//   (GetBitSubDomStartIndex(x, a) + GetBitDomIndex(y, i))
+//   (GetBitSubDomStartIndex(x, a) + GetBitDomByIndex(y, i))
   // #define GetBitSupIndexByINTPrstn(cid, x_val, y_val) \
 //   (cid * BITSUP_INTSIZE + x_val * BITDOM_INTSIZE + y_val)
 
@@ -300,9 +306,15 @@ class CModel {
 #endif
   }
 
-  // 函数定义，替代宏
-  __host__ __device__ int GetBitDomIndex(int x, int i) {
+  // 通过值(x,ith)拿到(x,ith)所在的word
+  __host__ __device__ int GetBitDomByIndex(const int x, const int i) const {
     return x * GetConstantValue(kBitDomIntSize, kDeviceBitDomIntSize) + i;
+  }
+
+  // 通过值(x,a)拿到(x,a)所在的word
+  __host__ __device__ int GetBitDomByValue(const int x, const int a) const {
+    return x * GetConstantValue(kBitDomIntSize, kDeviceBitDomIntSize) + a &
+           U32_MOD_MASK;
   }
 
   __host__ __device__ int GetBitSubDomStartIndex(int x, int a) {
@@ -311,7 +323,7 @@ class CModel {
   }
 
   __host__ __device__ int GetBitSubDomIndex(int x, int a, int y, int i) {
-    return GetBitSubDomStartIndex(x, a) + GetBitDomIndex(y, i);
+    return GetBitSubDomStartIndex(x, a) + GetBitDomByIndex(y, i);
   }
 
   __host__ __device__ int GetBitSupIndexByINTPrstn(int cid, int x_val,

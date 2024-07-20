@@ -63,7 +63,7 @@ __device__ __managed__ int3* S_Con;
 // extern const u32 U32_MASK1[32] =
 
 int intsizeof(const int nbits) {
-  return ((nbits + BITS_PER_WORD - 1) / BITS_PER_WORD);
+  return ((nbits + kBitsPerWord - 1) / kBitsPerWord);
 }
 
 // int2 CModel::GetBitSupIndexByTuple_C_MDS_MDINTS(int cid, int2 t) {
@@ -170,61 +170,151 @@ __global__ void transformKernel3D(cudaTextureObject_t texObj3D, int width,
            value3D.y);
   }
 }
-//
-// __global__ void CsCheckMain(i32x3* mConPre, i32x3* mCon, int* mVarPre,
-//                             int3* scope, u32* bitDom, uint2* bitSup) {
-//   // 约束ID
-//   const int cid = blockIdx.x;
-//   // bitDom索引
-//   const int x_a_0 = threadIdx.x;
-//   // bitDom索引
-//   const int x_a_1 = threadIdx.y;
-//   __shared__ int3 s_scp;
-//   __shared__ uint2 s_bitDom;
-//
-//   uint2 l_sum = make_uint2(0, 0);
-//   uint2 l_res = make_uint2(0, 0);
-//
-//   // 拿到当前约束信息
-//   if (tid == 0) {
-//     const int c_id = mConEvt[bid];
-//     s_scp = scope[c_id];
-//     s_bitDom.x = bitDom[s_scp.x];
-//     s_bitDom.y = bitDom[s_scp.y];
-//   }
-//   __syncthreads();
-//
-//   if (tid < D_MDS) l_sum = bitSup[GetBitSupIdxDevice(s_scp.z, tid)];
-//   __syncthreads();
-//
-//   // 归约
-//   l_sum.x &= s_bitDom.y;
-//   l_sum.y &= s_bitDom.x;
-//
-//   // 投票并反转
-//   l_res.x = __brev(__ballot(l_sum.x));
-//   l_res.y = __brev(__ballot(l_sum.y));
-//
-//   __syncthreads();
-//   if (tid == 0) {
-//     // 存入全局内存,并记录改变
-//     l_res.x &= s_bitDom.x;
-//     if (s_bitDom.x != l_res.x) {
-//       atomicAnd(&bitDom[s_scp.x], l_res.x);
-//       mVarPre[s_scp.x] = 1;
-//
-//       if (bitDom[s_scp.x] == 0) mVarPre[s_scp.x] = INT_MIN;
-//     }
-//
-//     l_res.y &= s_bitDom.y;
-//     if (s_bitDom.y != l_res.y) {
-//       atomicAnd(&bitDom[s_scp.y], l_res.y);
-//       mVarPre[s_scp.y] = 1;
-//
-//       if (bitDom[s_scp.y] == 0) mVarPre[s_scp.y] = INT_MIN;
-//     }
-//   }
-// }
+
+__inline__ __device__ int DeviceGetBitDomByValue(const int x, const int a) {
+  return x * kDeviceBitDomIntSize + a & U32_MOD_MASK;
+}
+
+// 通过值(x,ith)拿到(x,ith)所在的word
+__inline__ __device__ int DeviceGetBitDomByIndex(const int x, const int i) {
+  return x * kDeviceBitDomIntSize + i;
+}
+
+// 每个线程对应一个论域
+__global__ void CsCheckMain(i32* mConPre, const i32x3* mCon, int* mVarPre,
+                            u32* bitDom, const i32* dom_size,
+                            cudaTextureObject_t bitSup) {
+  // 约束ID
+  const int cid = blockIdx.x;
+  // bitDom索引
+  const int a_0 = threadIdx.x;
+  // bitDom索引
+  const int a_1 = threadIdx.y;
+  // 此约束活动置0
+  if (a_0 == 0 && a_1 == 0) mConPre[cid] = 0;
+
+  uint2 l_res = make_uint2(0, 0);
+  // 每个线程都拿到当前约束信息
+  i32x3 c = mCon[cid];
+  int xid = c.x;
+  int yid = c.y;
+  // 论域大小
+  int xsize = dom_size[xid];
+  int ysize = dom_size[yid];
+
+  // bitDom 当前(x,a)(y,a)是否存在
+  // int l_xa = 0, l_ya = 0;
+  __shared__ u32 s_bitDom_x[kDeviceBitDomIntSize];
+  __shared__ u32 s_bitDom_y[kDeviceBitDomIntSize];
+  // 把共享内存写入bitDom
+  // 还原回去
+  if (a_0 < kDeviceMaxDomSize * 32) {
+    s_bitDom_x[a_0] = bitDom[DeviceGetBitDomByIndex(xid, a_0)];
+    s_bitDom_y[a_0] = bitDom[DeviceGetBitDomByIndex(yid, a_0)];
+  }
+  __syncthreads();
+  // 取当前值(x, a_0)是否有效
+  // 取当前值(y, a_0)是否有效
+  int l_xa = BITSET_GET(s_bitDom_x, a_0);
+  int l_ya = BITSET_GET(s_bitDom_y, a_0);
+
+  u32 val_x = 0;
+  u32 val_y = 0;
+  // 取得cid里支持(x, a_0)的bitDom->bitSup[c][a_1][a_0]->bitSup[c][~][a],
+  // TODO:这里有问题，没有进行好块内归约，我需要按threadIdx.y的对数步长归约
+  if (kDeviceBitDomIntSize == 1) {
+    // Case 1: MaxDomSize \in (0,32]
+    auto bitSup_cid = tex3D<uint2>(bitSup, a_0, 0, cid);
+    val_x |= l_xa && (bitSup_cid.x & s_bitDom_y[0]);
+    val_y |= l_ya && (bitSup_cid.y & s_bitDom_x[0]);
+  }
+
+  __syncthreads();
+  // 只有threadIdx.x的那一维度归约
+  if (a_1 == 0) {
+    // 线程束内投票
+    unsigned int vote_x = __ballot_sync(0xFFFFFFFF, val_x == 0);
+    unsigned int vote_y = __ballot_sync(0xFFFFFFFF, val_y == 0);
+    // 只是线程束里的第一个线程做如下操作：
+    // 只写回自己那块bitDom
+    // 先获取bitDom的分块索引
+    // 先与共享内存里的bitDom比较有改变才写回
+    if (a_0 % warpSize == 0) {
+      int bitIdx = a_0 / 32;
+      if (s_bitDom_x[bitIdx] ^ vote_x) {
+        mConPre[cid] = 1;
+        atomicAnd(&bitDom[DeviceGetBitDomByIndex(xid, bitIdx)], vote_x);
+      }
+
+      if (s_bitDom_y[bitIdx] ^ vote_y) {
+        mConPre[cid] = 1;
+        atomicAnd(&bitDom[DeviceGetBitDomByIndex(yid, bitIdx)], vote_y);
+      }
+    }
+  }
+
+  // 局部写回全局内存
+
+  // // 启动规模
+  //
+  // // 从全局内存加载bitSup到本地内存
+  // // 这里需要根据启动规模，判断一下怎么么读取bitSup
+  // uint2 bitSup_cid = tex3D<uint2>(bitSup, a_0, 0 ~kbitDomIntSize, cid);
+  // // 通过这个我们知道它要了几个轮读写
+  // kDeviceBitDomIntSize
+  //
+  //     // l_sum = make_uint2(0, 0);
+  //
+  //     if (tid < D_MDS) l_sum = bitSup[GetBitSupIdxDevice(s_scp.z, tid)];
+  // __syncthreads();
+  //
+  // // 归约
+  // l_sum.x &= s_bitDom.y;
+  // l_sum.y &= s_bitDom.x;
+  //
+  // // 投票并反转
+  // l_res.x = __brev(__ballot(l_sum.x));
+  // l_res.y = __brev(__ballot(l_sum.y));
+  //
+  // __syncthreads();
+  // if (tid == 0) {
+  //   // 存入全局内存,并记录改变
+  //   l_res.x &= s_bitDom.x;
+  //   if (s_bitDom.x != l_res.x) {
+  //     atomicAnd(&bitDom[s_scp.x], l_res.x);
+  //     mVarPre[s_scp.x] = 1;
+  //
+  //     if (bitDom[s_scp.x] == 0) mVarPre[s_scp.x] = INT_MIN;
+  //   }
+  //
+  //   l_res.y &= s_bitDom.y;
+  //   if (s_bitDom.y != l_res.y) {
+  //     atomicAnd(&bitDom[s_scp.y], l_res.y);
+  //     mVarPre[s_scp.y] = 1;
+  //
+  //     if (bitDom[s_scp.y] == 0) mVarPre[s_scp.y] = INT_MIN;
+  //   }
+  // }
+}
+// 定义一个判断条件的谓词
+struct is_one {
+  __host__ __device__ bool operator()(const int x) const { return x == 1; }
+};
+
+void compress_Main(const thrust::device_vector<uint3>& d_MCon,
+                   const thrust::device_vector<int>& d_ConPre,
+                   thrust::device_vector<uint3>& d_MConEvt) {
+  d_MConEvt.resize(d_MCon.size());
+  // 使用 thrust::copy_if 进行流压缩
+  auto end = thrust::copy_if(d_MCon.begin(), d_MCon.end(),  // 输入范围
+                             d_ConPre.begin(),   // 输入范围的判断条件
+                             d_MConEvt.begin(),  // 输出范围
+                             is_one()            // 判断条件
+  );
+
+  // 调整 d_MConEvt 的大小以匹配实际复制的元素数
+  d_MConEvt.resize(thrust::distance(d_MConEvt.begin(), end));
+}
 
 void CModel::BuildBitModel(const HModel& xm) {
 #pragma region 计算常量
@@ -411,7 +501,7 @@ void CModel::BuildBitModel(const HModel& xm) {
     const int dom_int_size = intsizeof(dom_size);
 
     for (int j = 0; j < BITDOM_INTSIZE; ++j) {
-      const int idx = GetBitDomIndex(i, j);
+      const int idx = GetBitDomByIndex(i, j);
       // printf("idx = %d\n", idx);
       //  三种情况
       if (j < dom_int_size - 1)
@@ -427,7 +517,7 @@ void CModel::BuildBitModel(const HModel& xm) {
 
   for (int i = 0; i < VS_SIZE; ++i) {
     for (int j = 0; j < BITDOM_INTSIZE; ++j) {
-      int idx = GetBitDomIndex(i, j);
+      int idx = GetBitDomByIndex(i, j);
       printf("var = %d, j = %d, idx = %d, bitDom = %x, pre= %x\n", i, j, idx,
              bitDom[idx], M_VarPre[i]);
     }
@@ -490,16 +580,12 @@ void CModel::BuildBitModel(const HModel& xm) {
       const int2 idx = GetBitSupIndexByTuple_C_MDS_MDINTS(c->id, t);
       bitSup[idx.x].x |= U32_MASK1[t.y & U32_MOD_MASK];
       bitSup[idx.y].y |= U32_MASK1[t.x & U32_MOD_MASK];
-      // h_bitSup[idx.x].x |= U32_MASK1[t.y & U32_MOD_MASK];
-      // h_bitSup[idx.y].y |= U32_MASK1[t.x & U32_MOD_MASK];
     }
 
     // 维度是[e,d,d/w]
     for (int j = 0; j < c->tuples.size(); ++j) {
       const int2 t = make_int2(c->tuples[j][0], c->tuples[j][1]);
       const int2 idx = GetBitSupIndexByTuple_C_MDINTS_MDS(c->id, t);
-      // bitSup[idx.x].x |= U32_MASK1[t.y & U32_MOD_MASK];
-      // bitSup[idx.y].y |= U32_MASK1[t.x & U32_MOD_MASK];
       h_bitSup[idx.x].x |= U32_MASK1[t.y & U32_MOD_MASK];
       h_bitSup[idx.y].y |= U32_MASK1[t.x & U32_MOD_MASK];
     }

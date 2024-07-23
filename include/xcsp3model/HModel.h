@@ -329,7 +329,9 @@ class HModelNode : public Object {
       subscriptions;
   // // 两个矩阵组成的矩阵,矩阵内容为，作用在两个变量之间约束的个数
   // //.empty()表示无约束作用在该两个变量之间
-  std::vector<std::vector<std::vector<int>>> neighborhoods;
+  std::vector<std::vector<std::vector<int>>> neighborhoods_am;
+  std::vector<std::vector<int>> neighbor_constraint_list;
+  std::vector<std::vector<int>> neighbor_constraint_matrix;
 
   ~HModelNode() = default;
 

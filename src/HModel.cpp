@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <iostream>
+#include <set>
 #include <sstream>
 #include <utility>
 
@@ -413,20 +414,37 @@ void HModelNode::subscript(const HTab &tab) {
 }
 
 void HModelNode::neighbor(const HTab &tab) {
-  if (neighborhoods.empty())
-    neighborhoods.resize(vars.size(),
-                         std::vector<std::vector<int>>(vars.size()));
+  if (neighborhoods_am.empty())
+    neighborhoods_am.resize(vars.size(),
+                            std::vector<std::vector<int>>(vars.size()));
 
+  if (neighbor_constraint_list.empty())
+    neighbor_constraint_list.resize(tabs.size(), std::vector<int>());
+
+  if (neighbor_constraint_matrix.empty())
+    neighbor_constraint_matrix.resize(tabs.size(),
+                                      std::vector<int>(tabs.size(), 0));
+  // constraint set s;
+  std::set<int> s;
   for (const auto &x : tab->scope) {
     for (const auto &y : tab->scope) {
       if (x != y) {
-        neighborhoods[x->id][y->id].push_back(tab->id);
-        if (neighborhoods[x->id][y->id].size() > 1) {
+        neighborhoods_am[x->id][y->id].push_back(tab->id);
+        if (neighborhoods_am[x->id][y->id].size() > 1) {
           have_same_scope_ = true;
         }
       }
     }
+
+    for (const auto &c : subscriptions[x]) {
+      s.insert(c->id);
+    }
+
+    for (const auto &c : subscriptions[x]) {
+      neighbor_constraint_matrix[tab->id][c->id] = 1;
+    }
   }
+  neighbor_constraint_list[tab->id].assign(s.begin(), s.end());
 }
 
 void HModelNode::get_scope(std::vector<std::string> &scp_str,

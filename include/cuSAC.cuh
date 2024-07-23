@@ -50,26 +50,26 @@ inline int intsizeof(int nbits);
 // #define GetBitSupIndexByTuple(cid, t)(make_int2(
 // cid * BITSUP_INTSIZE + t.x * BITDOM_INTSIZE + (t.y >> U32_POS),
 // cid * BITSUP_INTSIZE + t.y * BITDOM_INTSIZE + (t.x >> U32_POS)))
-extern __constant__ u32 kDeviceU32Mask1[32];
+// extern __constant__ u32 kDeviceU32Mask1[32];
+//
+// extern __constant__ u32 kDeviceU32Mask0[32];
 
-extern __constant__ u32 kDeviceU32Mask0[32];
-
-const u32 U32_MASK1[32] = {
-    0x80000000, 0x40000000, 0x20000000, 0x10000000, 0x08000000, 0x04000000,
-    0x02000000, 0x01000000, 0x00800000, 0x00400000, 0x00200000, 0x00100000,
-    0x00080000, 0x00040000, 0x00020000, 0x00010000, 0x00008000, 0x00004000,
-    0x00002000, 0x00001000, 0x00000800, 0x00000400, 0x00000200, 0x00000100,
-    0x00000080, 0x00000040, 0x00000020, 0x00000010, 0x00000008, 0x00000004,
-    0x00000002, 0x00000001,
-};
-const u32 U32_MASK0[32] = {
-    0x7FFFFFFF, 0xBFFFFFFF, 0xDFFFFFFF, 0xEFFFFFFF, 0xF7FFFFFF, 0xFBFFFFFF,
-    0xFDFFFFFF, 0xFEFFFFFF, 0xFF7FFFFF, 0xFFBFFFFF, 0xFFDFFFFF, 0xFFEFFFFF,
-    0xFFF7FFFF, 0xFFFBFFFF, 0xFFFDFFFF, 0xFFFEFFFF, 0xFFFF7FFF, 0xFFFFBFFF,
-    0xFFFFDFFF, 0xFFFFEFFF, 0xFFFFF7FF, 0xFFFFFBFF, 0xFFFFFDFF, 0xFFFFFEFF,
-    0xFFFFFF7F, 0xFFFFFFBF, 0xFFFFFFDF, 0xFFFFFFEF, 0xFFFFFFF7, 0xFFFFFFFB,
-    0xFFFFFFFD, 0xFFFFFFFE,
-};
+// const u32 U32_MASK1[32] = {
+//     0x80000000, 0x40000000, 0x20000000, 0x10000000, 0x08000000, 0x04000000,
+//     0x02000000, 0x01000000, 0x00800000, 0x00400000, 0x00200000, 0x00100000,
+//     0x00080000, 0x00040000, 0x00020000, 0x00010000, 0x00008000, 0x00004000,
+//     0x00002000, 0x00001000, 0x00000800, 0x00000400, 0x00000200, 0x00000100,
+//     0x00000080, 0x00000040, 0x00000020, 0x00000010, 0x00000008, 0x00000004,
+//     0x00000002, 0x00000001,
+// };
+// const u32 U32_MASK0[32] = {
+//     0x7FFFFFFF, 0xBFFFFFFF, 0xDFFFFFFF, 0xEFFFFFFF, 0xF7FFFFFF, 0xFBFFFFFF,
+//     0xFDFFFFFF, 0xFEFFFFFF, 0xFF7FFFFF, 0xFFBFFFFF, 0xFFDFFFFF, 0xFFEFFFFF,
+//     0xFFF7FFFF, 0xFFFBFFFF, 0xFFFDFFFF, 0xFFFEFFFF, 0xFFFF7FFF, 0xFFFFBFFF,
+//     0xFFFFDFFF, 0xFFFFEFFF, 0xFFFFF7FF, 0xFFFFFBFF, 0xFFFFFDFF, 0xFFFFFEFF,
+//     0xFFFFFF7F, 0xFFFFFFBF, 0xFFFFFFDF, 0xFFFFFFEF, 0xFFFFFFF7, 0xFFFFFFFB,
+//     0xFFFFFFFD, 0xFFFFFFFE,
+// };
 /*
 * 怎么把这两个CPU常量赋值给GPU常量：extern __constant__ u32
 kU32Mask1[32];和extern __constant__ u32 kU32Mask0[32];？ const u32 U32_MASK1[32]
@@ -180,6 +180,7 @@ extern __managed__ int3* scope;
 extern __managed__ int MAX_DOM_SIZE;
 // subCon长度
 extern __managed__ int SUBCON_SIZE;
+extern __managed__ int GAC_success;
 
 //    __managed__ int BITDOM_SIZE;
 //    __managed__ int
@@ -221,8 +222,10 @@ extern __managed__ int3* S_Con;
 __global__ void exampleKernel(uint3* MCon, int size);
 
 __global__ void exampleKernelUMask();
-__global__ void CsCheckMain(int* mConEvt, int* mVarPre, int3* scope,
-                            u32* bitDom, uint2* bitSup);
+
+__global__ void CsCheckMain(i32* mConPre, const u32x3* mCon, u32* bitDom,
+                            const i32* dom_size, cudaTextureObject_t bitSup,
+                            int num_ConEvt);
 
 class CModel {
  public:
@@ -246,7 +249,7 @@ class CModel {
   cudaTextureDesc texDesc_MCon{};
 
   cudaArray_t cuArray3D{};
-  cudaTextureObject_t texObj3D{};
+  cudaTextureObject_t textureBitSup{};
   cudaResourceDesc resDesc3D{};
   cudaTextureDesc texDesc3D{};
 
@@ -370,9 +373,13 @@ class CModel {
 
   explicit CModel(const HModel& xm);
 
-  void BuildBitModel(const HModel& xm);
+  int compress_Main();void BuildBitModel(const HModel& xm);
 
-  void initialCPUConstant();
+  void initialGPUConstant();
+  bool enforceGAC();
+  void enforceSAC();
+  void solve();
+
   void DelGPUModel() const;
 
   ~CModel();

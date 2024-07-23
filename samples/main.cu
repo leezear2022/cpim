@@ -40,6 +40,7 @@ int main(int argc, char* argv[]) {
   builder.GenerateHModel(hm);
   hm->show();
   CModel cm(hm);
+  cm.enforceGAC();
   // cm.BuildBitModel(hm);
   // cm.DelGPUModel();
   // BuildBitModel(hm);

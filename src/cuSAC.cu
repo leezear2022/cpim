@@ -344,9 +344,9 @@ __global__ void CsCheckMain(i32* mConPre, const u32x3* mCon, u32* bitDom,
   if (a_0 == 0 && a_1 == 0 && empty_dom[0] == 1) {
     GAC_success = 0;
   }
-
+  __syncthreads();
   // propagate changed to neighbour constraints
-  if (changed) {
+  if (GAC_success && changed) {
     for (int idx = tid; idx < kDeviceNumTabs; idx += blockDim.x * blockDim.y) {
       if (tex2D<int>(neiCon, idx, cid) != 0) {
         mConPre[idx] = 1;
@@ -938,14 +938,12 @@ bool CModel::enforceGAC() {
   //   num_ConEvt);
 
   int num_ConEvt = compress_Main();
-  while (num_ConEvt!=0) {
-    CsCheckMain<<<num_ConEvt,dim3(kBitDomIntSize*32,1,1),sharedMemSize>>>(
-      thrust::raw_pointer_cast(d_ConPre.data()),
-      thrust::raw_pointer_cast(d_MCon.data()),
-      bitDom,
-      thrust::raw_pointer_cast(dom_size.data()),
-      textureBitSup,texObj_MCon,
-      num_ConEvt);
+  while (num_ConEvt != 0) {
+    CsCheckMain<<<num_ConEvt, dim3(kBitDomIntSize * 32, 1, 1), sharedMemSize>>>(
+        thrust::raw_pointer_cast(d_ConPre.data()),
+        thrust::raw_pointer_cast(d_MCon.data()), bitDom,
+        thrust::raw_pointer_cast(dom_size.data()), textureBitSup, texObj_MCon,
+        num_ConEvt);
     if (GAC_success) {
       return false;
     }
@@ -954,12 +952,9 @@ bool CModel::enforceGAC() {
   return true;
 }
 
-void CModel::enforceSAC(){
-}
+void CModel::enforceSAC() {}
 
-void CModel::solve(){
-}
-
+void CModel::solve() {}
 
 CModel::~CModel() {
   std::cout << "CModel析构函数" << std::endl;

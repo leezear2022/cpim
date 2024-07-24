@@ -212,7 +212,7 @@ class IntVal {
   bool operator==(const IntVal& rhs);
   bool operator!=(const IntVal& rhs);
   // bool operator<(const IntVar &v);
-  friend std::ostream& operator<<(std::ostream& os, IntVal& v_val);
+  friend std::ostream& operator<<(std::ostream& os, const IntVal& v_val);
 
   // inline tuple<int, int> get_bit_index() const;
   ~IntVal(){};
@@ -287,7 +287,8 @@ class IntConVal {
   IntConVal() {}
   IntConVal(Tabular* c, IntVar* v, const int a) : c_(c), v_(v), a_(a) {}
   IntConVal(Tabular* c, IntVal& va) : c_(c), v_(va.v()), a_(va.a()) {}
-  IntConVal(arc& rc, const int a) : c_(rc.c()), v_(rc.v()), a_(a) {}
+  // IntConVal(arc& rc, const int a) : c_(rc.c()), v_(rc.v()), a_(a) {}
+  IntConVal(const arc& rc, const int a) : c_(rc.c()), v_(rc.v()), a_(a) {}
 
   virtual ~IntConVal() {}
 
@@ -331,14 +332,15 @@ class Network {
   vector<vector<IntVar*>> nei_;
   // unordered_map<IntVar*, vector<IntVar*>> neighborhood;
   Network(const HModel& h);
-  static void GetFirstValidTuple(IntConVal& c_val, vector<int>& t, const int p);
-  static void GetNextValidTuple(IntConVal& c_val, vector<int>& t, const int p);
+  static void GetFirstValidTuple(const IntConVal& c_val, vector<int>& t, const int p);
+  static void GetNextValidTuple(const IntConVal& c_val, vector<int>& t, const int p);
 
   //  由于所有变量的域长度不一定相同 所以这里的c-value值不一定真实存在
-  inline int GetIntConValIndex(IntConVal& c_val) const {
+  inline int GetIntConValIndex(const IntConVal& c_val) const {
     return c_val.c_->id_ * max_arity_ * max_dom_size_ +
            c_val.c_->index(c_val.v_) * max_dom_size_ + c_val.a_;
   }
+
   inline int GetIntConValIndex(const int c_id, const int v_id, const int a) {
     const auto tid = tabs[c_id]->index(vars[v_id]);
     return c_id * max_arity_ * max_dom_size_ + tid * max_dom_size_ + a;

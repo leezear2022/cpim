@@ -1,6 +1,4 @@
-﻿#pragma once
-
-#include "Solver.h"
+﻿#include "Solver.h"
 namespace cpim {
 // residues::residues(Network* nt):nt_(nt)
 //{
@@ -11,7 +9,7 @@ AC3rm::AC3rm(Network* n) : AC3(n) {
   res_.resize(m_->tabs.size() * m_->max_domain_size() * m_->max_arity(),
               tmp_tuple_);
 }
-bool AC3rm::seek_support(IntConVal& c_val, const int p) {
+bool AC3rm::seek_support(const IntConVal& c_val, const int p) {
   auto c = c_val.c();
   auto index = m_->GetIntConValIndex(c_val);
   tmp_tuple_ = res_[index];

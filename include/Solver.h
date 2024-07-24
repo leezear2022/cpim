@@ -2,6 +2,7 @@
 #include <functional>
 #include <queue>
 #include <set>
+// #include <limits>
 #include <unordered_set>
 
 #include "Network.h"
@@ -311,12 +312,15 @@ class AC {
   // AC(Network *m, const LookAhead look_ahead, const LookBack look_back);
   virtual ~AC(){};
   // virtual bool enforce(VarEvt* x_evt, const int level = 0) = 0;
-  virtual ConsistencyState enforce(vector<IntVar*>& x_evt, const int level) = 0;
+  virtual ConsistencyState enforce(vector<IntVar*>& x_evt, int level) = 0;
   // virtual ConsistencyState enforce_arc(vector<IntVar*>& x_evt, const int
   // level) = 0;
   ConsistencyState cs;
   // void q_insert(IntVar* v);
   int del() const { return delete_; }
+
+  // virtual bool revise(const arc& c_x, int level) = 0;
+  // virtual bool seek_support(const IntConVal& c_val, int level) = 0;
 
  protected:
   // vector<IntVar*> q_;
@@ -331,9 +335,11 @@ class AC3 : public AC {
   AC3(Network* m);
   virtual ~AC3(){};
   // bool enforce(VarEvt* x_evt, const int level = 0) override;
-  ConsistencyState enforce(vector<IntVar*>& x_evt, const int level) override;
+  ConsistencyState enforce(vector<IntVar*>& x_evt, int level) override;
   // ConsistencyState enforce_arc(vector<IntVar*>& x_evt, const int level = 0)
   // override; SearchError se;
+  virtual bool revise(const arc& c_x, int level);
+  virtual bool seek_support(const IntConVal& c_val, int level);
 
  protected:
   // pro_que<T> q;
@@ -346,8 +352,7 @@ class AC3 : public AC {
   LookAhead la_;
   LookBack lb_;
   int level_ = 0;
-  virtual bool revise(arc& c_x, const int level);
-  virtual bool seek_support(IntConVal& c_val, const int level);
+
   void insert(IntVar* v);
   // void inital_q_arc();
   // private:
@@ -357,7 +362,7 @@ class AC3 : public AC {
 class FC : public AC3 {
  public:
   FC(Network* n);
-  ConsistencyState enforce(vector<IntVar*>& x_evt, const int level) override;
+  ConsistencyState enforce(vector<IntVar*>& x_evt, int level) override;
 
  private:
   // int max_bitDom_size_;
@@ -369,8 +374,9 @@ class AC3bit : public AC3 {
   AC3bit(Network* m);
   virtual ~AC3bit(){};
 
+  virtual bool seek_support(const IntConVal& c_val, int p) override;
+
  protected:
-  virtual bool seek_support(IntConVal& c_val, const int p) override;
   int max_bitDom_size_;
   vector<vector<bitset<BITSIZE>>> bitSup_;
 };
@@ -378,7 +384,7 @@ class AC3bit : public AC3 {
 class FCbit : public AC3bit {
  public:
   FCbit(Network* n);
-  ConsistencyState enforce(vector<IntVar*>& x_evt, const int level) override;
+  ConsistencyState enforce(vector<IntVar*>& x_evt, int level);
 
  private:
   // int max_bitDom_size_;
@@ -407,8 +413,9 @@ class AC3rm : public AC3 {
   AC3rm(Network* nt);
   virtual ~AC3rm(){};
 
+  bool seek_support(const IntConVal& c_val, int p) override;
+
  protected:
-  bool seek_support(IntConVal& c_val, const int p) override;
   vector<vector<int>> res_;
 };
 
@@ -486,7 +493,8 @@ class SAC3 : public SAC1 {
 // = 0) override; protected: 	unordered_map<IntVar*, bitSetVector> neibor_;
 // bool is_neibor(IntVar* x, IntVar* v); 	var_que q_nei_; 	var_que
 // q_var_; 	void insert_(var_que& q, IntVar* v); 	bool
-// in_neibor_exp(Tabular* t, IntVar* x); 	bool in_neibor(Tabular* t, IntVar* x);
+// in_neibor_exp(Tabular* t, IntVar* x); 	bool in_neibor(Tabular* t,
+// IntVar* x);
 //	bool has_sigleton_domain_neibor(IntVar* x) const;
 // };
 

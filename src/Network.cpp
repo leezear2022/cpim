@@ -273,7 +273,7 @@ bool IntVal::operator!=(const IntVal& rhs) {
 //	return a;
 // }
 
-ostream& operator<<(ostream& os, IntVal& v_val) {
+ostream& operator<<(ostream& os, const IntVal& v_val) {
   const string s = (v_val.aop_) ? " = " : " != ";
   os << "(" << v_val.vid() << s << v_val.a_ << ")";
   return os;
@@ -367,13 +367,13 @@ Network::Network(const HModel& h)
   tmp_ = vars.size() + 2;
 }
 
-void Network::GetFirstValidTuple(IntConVal& c_val, vector<int>& t,
+void Network::GetFirstValidTuple(const IntConVal& c_val, vector<int>& t,
                                  const int p) {
   IntVal v_a(c_val.v(), c_val.a());
   c_val.c()->GetFirstValidTuple(v_a, t, p);
 }
 
-void Network::GetNextValidTuple(IntConVal& c_val, vector<int>& t, const int p) {
+void Network::GetNextValidTuple(const IntConVal& c_val, vector<int>& t, const int p) {
   IntVal v_a(c_val.v(), c_val.a());
   c_val.c()->GetNextValidTuple(v_a, t, p);
 }
@@ -437,8 +437,8 @@ void Network::show(const int p) {
 }
 
 Network::~Network() {
-  for (auto v : vars) delete v;
-  for (auto t : tabs) delete t;
+  for (const auto v : vars) delete v;
+  for (const auto t : tabs) delete t;
   vars.clear();
   tabs.clear();
 }
@@ -460,4 +460,4 @@ const IntConVal& IntConVal::operator=(const IntConVal& rhs) {
 
   return *this;
 }
-}  // namespace cp
+}  // namespace cpim

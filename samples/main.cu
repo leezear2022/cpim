@@ -7,6 +7,8 @@
 #include <iostream>
 
 // #include "Network2.h"
+#include <glog/logging.h>
+
 #include "cuSAC.cuh"
 #include "xcsp3model/HModel.h"
 #include "xcsp3model/XBuilder.h"
@@ -18,27 +20,19 @@ const std::string X_PATH = "../samples/bench/BMPath.xml";
 
 // constexpr long TimeLimit = 1800000000000;
 int main(int argc, char* argv[]) {
-  // {
-  //   auto var0 = HVarNode::Make(0, 0, "var0", 0, 10);
-  //   auto var1 = HVarNode::Make(1, 1, "var1", 0, 10);
-  //   var0->show();
-  //   std::cout << var0->id << std::endl;
-  //   std::cout << var1->id << std::endl;
-  //   // std::vector<<>>
-  //   std::vector<std::vector<int>> myVector = {{0, 0}, {1, 1}};
-  //   std::vector<HVar> scp = {var0, var1};
-  //   auto tab = HTabNode::Make(0, true, myVector, scp);
-  //   std::cout << tab->id << std::endl;
-  // }
-  // std::cout << "jiji2\n";
-
-  std::filesystem::path currentPath = std::filesystem::current_path();
-  std::cout << "当前执行路径是：" << currentPath << std::endl;
-  XBuilder builder(X_PATH, XRT_BM_PATH);
-  // return 0;
-  HModel hm = HModelNode::Make();
+  const XBuilder builder(X_PATH, XRT_BM_PATH);
+  const HModel hm = HModelNode::Make();
   builder.GenerateHModel(hm);
   hm->show();
+  // auto* n = new Network(hm);
+  // n->show(0);
+  //
+  // AC3bit ac_(n);
+  // ac_.enforce(n->vars, 0);
+  // n->show(0);
+  // delete n;
+
+  // MAC mac(n, AC_3, Heuristic::VRH_DOM_MIN, Heuristic::VLH_MIN);
   CModel cm(hm);
   cm.enforceGAC();
   // cm.BuildBitModel(hm);
@@ -54,7 +48,6 @@ int main(int argc, char* argv[]) {
   // MAC mac(n, AC_3bit, Heuristic::VRH_DOM_WDEG_MIN, Heuristic::VLH_MIN);
   // AC3bit ac_(n);
 
-  // delete n;
   return 0;
   // ac_.enforce(n->vars, 0);
   ////hm->show();

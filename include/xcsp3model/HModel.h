@@ -314,6 +314,7 @@ class HModelNode : public Object {
   static int calculate(std::vector<int> &stack, std::vector<int> &params_len);
   std::vector<HTab> solution_check(std::vector<int> &sol);
   bool have_same_scope() const { return have_same_scope_; }
+  static bool is_neighbour(const HTab &a, const HTab &b);
 
   int AddVar(int id, const std::string &name, std::vector<int> &v);
   int AddTab(const bool sem, std::vector<std::vector<int>> &ts,
@@ -330,8 +331,8 @@ class HModelNode : public Object {
   // // 两个矩阵组成的矩阵,矩阵内容为，作用在两个变量之间约束的个数
   // //.empty()表示无约束作用在该两个变量之间
   std::vector<std::vector<std::vector<int>>> neighborhoods_am;
-  std::vector<std::vector<int>> neighbor_constraint_list;
-  std::vector<std::vector<int>> neighbor_constraint_matrix;
+  // std::vector<std::vector<int>> neighbor_constraint_list;
+  // std::vector<std::vector<int>> neighbor_constraint_matrix;
 
   ~HModelNode() = default;
 
@@ -363,7 +364,7 @@ class HModelNode : public Object {
                             std::vector<HVar> &scp);
   static void get_ori_tuple_by_index(int idx, std::vector<int> &t,
                                      const std::vector<HVar> &scp);
-  static void result(int op, std::vector<int> &result, const int len);
+  static void result(int op, std::vector<int> &result, int len);
   std::unordered_map<std::string, HVar> str_var_map_;
   std::unordered_map<int, HVar> int_var_map_;
   size_t mds_ = 0;
@@ -376,7 +377,7 @@ class HModelNode : public Object {
 class HModel : public Shared<HModelNode> {
  public:
   HModel() = default;
-
+  static bool is_neighbour(const HTab &a, const HTab &b);
   explicit HModel(HModelNode *p) : Shared(p) {}
 };
 

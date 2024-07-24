@@ -3,6 +3,8 @@
 //
 #include "xcsp3model/HModel.h"
 
+#include <glog/logging.h>
+
 #include <algorithm>
 #include <iostream>
 #include <set>
@@ -414,18 +416,18 @@ void HModelNode::subscript(const HTab &tab) {
 }
 
 void HModelNode::neighbor(const HTab &tab) {
+  // LOG(INFO)<< "neighbor";
   if (neighborhoods_am.empty())
     neighborhoods_am.resize(vars.size(),
                             std::vector<std::vector<int>>(vars.size()));
 
-  if (neighbor_constraint_list.empty())
-    neighbor_constraint_list.resize(tabs.size(), std::vector<int>());
+  // if (neighbor_constraint_list.empty())
+  //   neighbor_constraint_list.resize(tabs.size(), std::vector<int>());
 
-  if (neighbor_constraint_matrix.empty())
-    neighbor_constraint_matrix.resize(tabs.size(),
-                                      std::vector<int>(tabs.size(), 0));
+  // if (neighbor_constraint_matrix.empty())
+  //   neighbor_constraint_matrix.resize(tabs.size(),
+  //                                     std::vector<int>(tabs.size(), 0));
   // constraint set s;
-  std::set<int> s;
   for (const auto &x : tab->scope) {
     for (const auto &y : tab->scope) {
       if (x != y) {
@@ -436,15 +438,15 @@ void HModelNode::neighbor(const HTab &tab) {
       }
     }
 
-    for (const auto &c : subscriptions[x]) {
-      s.insert(c->id);
-    }
+    // for (const auto &c : subscriptions[x]) {
+    //   s.insert(c->id);
+    // }
 
-    for (const auto &c : subscriptions[x]) {
-      neighbor_constraint_matrix[tab->id][c->id] = 1;
-    }
+    // for (const auto &c : subscriptions[x]) {
+    //   neighbor_constraint_matrix[tab->id][c->id] = 1;
+    // }
   }
-  neighbor_constraint_list[tab->id].assign(s.begin(), s.end());
+  // neighbor_constraint_list[tab->id].assign(s.begin(), s.end());
 }
 
 void HModelNode::get_scope(std::vector<std::string> &scp_str,
@@ -516,6 +518,24 @@ void HModelNode::result(const int op, std::vector<int> &result, const int len) {
     result.pop_back();
   }
   result.push_back(Funcs::int_expr_map[op](a));
+}
+
+bool HModel::is_neighbour(const HTab &a, const HTab &b) {
+  for (const auto &x : a->scope) {
+    for (const auto &y : b->scope) {
+      if (x == y) return true;
+    }
+  }
+  return false;
+}
+
+bool HModelNode::is_neighbour(const HTab &a, const HTab &b) {
+  for (const auto &x : a->scope) {
+    for (const auto &y : b->scope) {
+      if (x == y) return true;
+    }
+  }
+  return false;
 }
 
 int HModelNode::AddVar(const int id, const std::string &name,

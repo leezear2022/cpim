@@ -147,23 +147,23 @@ constexpr int kBitIndexMask = kBitsPerWord - 1;
 // __managed__ int NUM_BD_BLOCK;
 // __device__ __managed__ int NUM_CS_SIZE_BLOCKS;
 // 一个变量论域的int长度
-extern __managed__ int BITDOM_INTSIZE;
-// 整个变量集合的论域的int长度
-extern __managed__ int BITDOMS_INTSIZE;
-// 一个约束的bitsup的int长度
-extern __managed__ int BITSUP_INTSIZE;
-// 整个约束集合的bitsup的int长度
-extern __managed__ int BITSUPS_INTSIZE;
-// 子问题论域总长度
-extern __managed__ int BITSUBDOMS_INTSIZE;
-// 变量个数
-extern __managed__ int VS_SIZE;
-// 约束个数
-extern __managed__ int CS_SIZE;
-// 约束最大元数，目前仅支持二元
-extern __managed__ int MAX_ARITY;
-// 主问题约束压缩BLOCK数
-extern __managed__ int MCC_BLOCK;
+// extern __managed__ int BITDOM_INTSIZE;
+// // 整个变量集合的论域的int长度
+// extern __managed__ int BITDOMS_INTSIZE;
+// // 一个约束的bitsup的int长度
+// extern __managed__ int BITSUP_INTSIZE;
+// // 整个约束集合的bitsup的int长度
+// extern __managed__ int BITSUPS_INTSIZE;
+// // 子问题论域总长度
+// extern __managed__ int BITSUBDOMS_INTSIZE;
+// // 变量个数
+// extern __managed__ int VS_SIZE;
+// // 约束个数
+// extern __managed__ int CS_SIZE;
+// // 约束最大元数，目前仅支持二元
+// extern __managed__ int MAX_ARITY;
+// // 主问题约束压缩BLOCK数
+// extern __managed__ int MCC_BLOCK;
 //////////////////////////////////////////////////////////////////////////
 //	一些GPU变量
 //////////////////////////////////////////////////////////////////////////
@@ -172,39 +172,40 @@ extern __managed__ int M_Qsize;
 //////////////////////////////////////////////////////////////////////////
 //  GPU约束记录信息，不可更改
 //////////////////////////////////////////////////////////////////////////
-//	每个变量的int大小
-extern __managed__ int* vars_size;
-// 存储约束的scope，类型int3，scope.x: x.id; scope.y: y.id; scope.z: c.id
-extern __managed__ int3* scope;
-// 最大dom
-extern __managed__ int MAX_DOM_SIZE;
-// subCon长度
-extern __managed__ int SUBCON_SIZE;
+// //	每个变量的int大小
+// extern __managed__ int* vars_size;
+// // 存储约束的scope，类型int3，scope.x: x.id; scope.y: y.id; scope.z: c.id
+// extern __managed__ int3* scope;
+// // 最大dom
+// extern __managed__ int MAX_DOM_SIZE;
+// // subCon长度
+// extern __managed__ int SUBCON_SIZE;
 extern __managed__ int GAC_success;
 
 //    __managed__ int BITDOM_SIZE;
 //    __managed__ int
 //  主问题数据结构，使用UM
-//  表示约束网络论域
+// //  表示约束网络论域
 extern __managed__ u32* bitDom;
-// 表示约束，不可修改
-extern __managed__ uint2* bitSup;
-////类似队列，存储约束id
-//    __managed__ int *mainCon;
-////子问题数据结构
-// 表示子问题的约束网络论域。
 extern __managed__ u32* bitSubDom;
-////类似队列，存储子问题约束id subCon.x: variable，subCon.y: value，subCon.z:
-/// c.id
-//    __managed__ ushort3* subCon;
-//  标记主问题变量域是否删减，初始化全部为1
-extern __managed__ int* M_VarPre;
-// 标记主问题约束是否需检查，初始化全部为1
-extern __managed__ int* M_ConPre;
-// 主问题约束传播队列(压缩版)
-extern __managed__ uint3* M_ConEvt;
-// 主问题约束传播队列
-extern __managed__ uint3* M_Con;
+// // 表示约束，不可修改
+// extern __managed__ uint2* bitSup;
+// ////类似队列，存储约束id
+// //    __managed__ int *mainCon;
+// ////子问题数据结构
+// // 表示子问题的约束网络论域。
+// extern __managed__ u32* bitSubDom;
+// ////类似队列，存储子问题约束id subCon.x: variable，subCon.y: value，subCon.z:
+// /// c.id
+// //    __managed__ ushort3* subCon;
+// //  标记主问题变量域是否删减，初始化全部为1
+// extern __managed__ int* M_VarPre;
+// // 标记主问题约束是否需检查，初始化全部为1
+// extern __managed__ int* M_ConPre;
+// // 主问题约束传播队列(压缩版)
+// extern __managed__ uint3* M_ConEvt;
+// // 主问题约束传播队列
+// extern __managed__ uint3* M_Con;
 //  thrust::device_vector<uint3> M_Con;
 //  thrust::device_vector<uint3> M_ConEvt;
 //  thrust::device_vector<int> M_ConPre;
@@ -249,7 +250,7 @@ class CModel {
   cudaTextureDesc texDesc_MCon{};
 
   cudaArray_t cuArray3D{};
-  cudaTextureObject_t textureBitSup{};
+  cudaTextureObject_t texObj_BitSup{};
   cudaResourceDesc resDesc3D{};
   cudaTextureDesc texDesc3D{};
 
@@ -271,32 +272,6 @@ class CModel {
 #define GetTopNum(num_elements, num_threads) \
   ((num_elements + (num_threads - 1)) / num_threads)
 #define pow2i(e) (1 << e)
-
-  //   // 根据x和index获得bitDom位置
-  // #define GetBitDomByIndex(x, i) (x * BITDOM_INTSIZE + i)
-  // #define GetBitSubDomStartIndex(x, a) ((x * MAX_DOM_SIZE + a) * \
-  // BITDOMS_INTSIZE)
-
-  // #define GetBitSubDomIndex(x, a, y, i) \
-//   (GetBitSubDomStartIndex(x, a) + GetBitDomByIndex(y, i))
-  // #define GetBitSupIndexByINTPrstn(cid, x_val, y_val) \
-//   (cid * BITSUP_INTSIZE + x_val * BITDOM_INTSIZE + y_val)
-
-  // __device__ __inline__ int pow2i(int e) { return 1 << e; }
-
-  // #define GetBitSupIndexByINTPrstn(cid, x_val, y_val) \
-//   (cid * BITSUP_INTSIZE + x_val * BITDOM_INTSIZE + y_val)
-
-  //   // 获取常量值的模板函数
-  //   template <typename T>
-  //   __host__ __device__ static inline T GetConstantValue(const T& hostValue,
-  //   const T& deviceValue) {
-  // #ifdef __CUDA_ARCH__
-  //     return deviceValue;
-  // #else
-  //     return hostValue;
-  // #endif
-  //   }
 
   // 获取常量值的模板函数
   template <typename T>
@@ -366,14 +341,12 @@ class CModel {
         cid * bitSupIntSize + (t.x >> U32_POS) * maxDomSize + t.y
     );
   }
-  // __device__ __host__  int GetBitSupIndexByCID(int cid) ;
-  // __device__ __host__  int2 GetBitSupIndexByTuple_C_MDS_MDINTS(int cid, int2 t);
-  // __device__ __host__  int2 GetBitSupIndexByTuple_C_MDINTS_MDS( int cid,  int2 t);
-  // __device__ __host__  int2 GetBitSupIndexByINTPrstn_C_MDINTS_MDS( int cid,  int2 t);
 
   explicit CModel(const HModel& xm);
 
-  int compress_Main();void BuildBitModel(const HModel& xm);
+  int compress_Main();
+
+  void BuildBitModel(const HModel& xm);
 
   void initialGPUConstant();
   bool enforceGAC();

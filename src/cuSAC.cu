@@ -1,3 +1,5 @@
+#include <glog/logging.h>
+
 #include "cuSAC.cuh"
 
 namespace cpim {
@@ -14,90 +16,24 @@ __constant__ int kDeviceBitSupIntSize;
 __constant__ int kDeviceBitSupsIntSize;
 __constant__ int kDeviceBitSubDomsIntSize;
 
-__constant__ u32 kDeviceU32Mask1[32];
-__constant__ u32 kDeviceU32Mask0[32];
-
-__constant__ int D_NUM_BD_BLOCK;
-__constant__ int D_NUM_CS_SIZE_BLOCKS;
-__device__ __managed__ int NUM_BD_BLOCK;
-__device__ __managed__ int NUM_CS_SIZE_BLOCKS;
-__device__ __managed__ int BITDOM_INTSIZE;
-__device__ __managed__ int BITDOMS_INTSIZE;
-__device__ __managed__ int BITSUP_INTSIZE;
-__device__ __managed__ int BITSUPS_INTSIZE;
-__device__ __managed__ int BITSUBDOMS_INTSIZE;
-__device__ __managed__ int VS_SIZE;
-__device__ __managed__ int CS_SIZE;
-__device__ __managed__ int MAX_ARITY;
-__device__ __managed__ int MCC_BLOCK;
-__device__ __managed__ int M_Qsize;
-
-// __device__ __managed__ int* vars_size;
-// __device__ __managed__ int3* scope;
-__device__ __managed__ int MAX_DOM_SIZE;
-// __device__ __managed__ int SUBCON_SIZE;
+// 全局传播是否成功，默认值是true
 __managed__ int GAC_success = true;
-__device__ __managed__ u32* bitDom;
-__device__ __managed__ uint2* bitSup;
-__device__ __managed__ u32* bitSubDom;
 
-// thrust::device_vector<uint3> M_Con;
-// thrust::device_vector<uint3> M_ConEvt;
-// thrust::device_vector<int> M_ConPre;
-__device__ __managed__ int* M_ConPre;
-__device__ __managed__ int* M_VarPre;
-__device__ __managed__ uint3* M_ConEvt;
-__device__ __managed__ uint3* M_Con;
-__device__ __managed__ int* S_VarPre;
-__device__ __managed__ uint3* S_Var;
-__device__ __managed__ int* S_ConPre;
-__device__ __managed__ int3* S_ConEvt;
-__device__ __managed__ int3* S_Con;
+// TODO: 这里未来可以改成纯device内存
+__managed__ u32* bitDom;
+__managed__ u32* bitSubDom;
 
-// int* MCC_BlocksCount;
-// int* MCC_BlocksOffset;
-//
-// thrust::device_vector<int> MCC_BCount;
-// thrust::device_vector<int> MCC_BOffset;
-
-// extern const u32 U32_MASK1[32] =
+__managed__ int* S_VarPre;
+__managed__ uint3* S_Var;
+__managed__ int* S_ConPre;
+__managed__ int3* S_ConEvt;
+__managed__ int3* S_Con;
 
 int intsizeof(const int nbits) {
   return ((nbits + kBitsPerWord - 1) / kBitsPerWord);
 }
 
-// int2 CModel::GetBitSupIndexByTuple_C_MDS_MDINTS(int cid, int2 t) {
-//   return make_int2(
-//       cid * BITSUP_INTSIZE + t.x * BITDOM_INTSIZE + (t.y >> U32_POS),
-//       cid * BITSUP_INTSIZE + t.y * BITDOM_INTSIZE + (t.x >> U32_POS));
-// }
-
 ////////////////////////////////  CModel  ////////////////////////////////
-
-// int CModel::GetBitSupIndexByCID(const int cid) {
-//   return cid * BITSUP_INTSIZE;
-// }
-// // c, (x, a), (y, a)
-// // t.x = x, a
-// // t.y = y, a
-// // 若维度是[e][d][d/w],因此索引的计算公式如下:
-// int2 CModel::GetBitSupIndexByTuple_C_MDS_MDINTS(const int cid, const int2 t)
-// {
-//   return make_int2(
-//       cid * BITSUP_INTSIZE + t.x * BITDOM_INTSIZE + (t.y >> U32_POS),
-//       cid * BITSUP_INTSIZE + t.y * BITDOM_INTSIZE + (t.x >> U32_POS));
-// }
-//
-// // c, (x, a), (y, a)
-// // t.x = x, a
-// // t.y = y, a
-// // 若维度是[e][d/w][d],因此索引的计算公式如下:
-// int2 CModel::GetBitSupIndexByTuple_C_MDINTS_MDS(const int cid, const int2 t)
-// {
-//   return make_int2(
-//       cid * BITSUP_INTSIZE + (t.y >> U32_POS) * MAX_DOM_SIZE + t.x,
-//       cid * BITSUP_INTSIZE + (t.x >> U32_POS) * MAX_DOM_SIZE + t.y);
-// }
 
 CModel::CModel(const HModel& xm)
     : kNumVars(xm->Vars().size()),
@@ -113,30 +49,17 @@ CModel::CModel(const HModel& xm)
     const HVar v = xm->Vars(i);
     dom_size[i] = v->vals.size();
   }
-
   // 初始化GPU常量
   initialGPUConstant();
   // 初始化GPU数据
   BuildBitModel(xm);
 }
 
-// int2  CModel::GetBitSupIndexByTuple(const int cid, const int2 t) {
-
-// int GetBitSupIndexById(int cid) { return cid * BITSUP_INTSIZE; }
 __global__ void exampleKernel(uint3* MCon, int size) {
   int idx = threadIdx.x + blockIdx.x * blockDim.x;
   if (idx < size) {
     uint3 val = MCon[idx];
     printf("d_MCon[%d] = (%u, %u, %u)\n", idx, val.x, val.y, val.z);
-  }
-}
-
-// 一个示例 kernel 函数，使用常量内存
-__global__ void exampleKernelUMask() {
-  int idx = threadIdx.x;
-  if (idx < 32) {
-    printf("kU32Mask1[%d] = 0x%x, kU32Mask0[%d] = 0x%x\n", idx,
-           kDeviceU32Mask1[idx], idx, kDeviceU32Mask0[idx]);
   }
 }
 
@@ -153,6 +76,7 @@ __global__ void transformKernel(cudaTextureObject_t texObj, int width,
     printf("Texture value at (%d, %d): %d\n", x, y, value);
   }
 }
+
 // CUDA kernel function to read from 3D texture object
 // width -> dom
 // height-> bit
@@ -165,7 +89,7 @@ __global__ void transformKernel3D(cudaTextureObject_t texObj3D, int width,
 
   if (x < width && y < height && z < depth) {
     // 访问3D纹理内存
-    uint2 value3D = tex3D<uint2>(texObj3D, x, y, z);
+    auto value3D = tex3D<uint2>(texObj3D, x, y, z);
     printf("Texture3D value at (%d, %d, %d): (%x, %x)\n", z, x, y, value3D.x,
            value3D.y);
   }
@@ -192,100 +116,52 @@ __global__ void CsCheckMain(i32* mConPre, const u32x3* mCon, u32* bitDom,
   const int a_1 = threadIdx.y;
   // 块内全局线程索引
   const int tid = threadIdx.x + threadIdx.y * blockDim.x;
-  printf("bid: %d, a_0: %d, a_1: %d, num_ConEvt: %d\n", bid, a_0, a_1,
-         num_ConEvt);
-  // return;
-  // 此约束活动置0
-  // printf("~bid: %d: %d\n", bid, num_ConEvt);
-  // uint2 l_res = make_uint2(0, 0);
+
+  // printf("bid: %d, a_0: %d, a_1: %d, num_ConEvt: %d\n", bid, a_0, a_1,
+  //        num_ConEvt);
+
   // 每个线程都拿到当前约束信息
-  // if (bid < num_ConEvt) {
   auto c = mCon[bid];
-  int xid = c.x;
-  int yid = c.y;
-  int cid = c.z;
+  const int xid = c.x;
+  const int yid = c.y;
+  const int cid = c.z;
+
   // 论域大小
   // int xsize = dom_size[xid];
   // int ysize = dom_size[yid];
-  // } else {
-  //
-  // }
-  // return;
-  // if (a_0 == 0 && a_1 == 0) {
-  //   printf("----cid: %d, a_0: %d, a_1: %d,mConPre: %d\n", cid, a_0, a_1,
-  //          mConPre[cid]);
-  //   // mConPre[cid] = 0;
-  //   int idx1 = DeviceGetBitDomByIndex(xid, a_0);
-  //   int idx2 = DeviceGetBitDomByIndex(yid, a_0);
-  //   // printf("----cid: %d, a_0: %d, a_1: %d,mConPre: %d, idx1: %d, idx2:
-  //   %d\n",
-  //   //        c.z, a_0, a_1, mConPre[cid], idx1, idx2);
-  // }
-  // bitDom 当前(x,a)(y,a)是否存在
-  // int l_xa = 0, l_ya = 0;
-  // __shared__ u32 s_bitDom_x[bitDomIntSize];
-  // __shared__ u32 s_bitDom_y[bitDomIntSize];
 
-  // // 动态分配共享内存
+  // 动态分配共享内存，共三段：
+  // 1. bitDom[x]
+  // 2. bitDom[y]
+  // 3. empty_dom，用于标记失败，默认值是1，即假设它失败，
+  //    在最后检查的时候，如有一段word非空则置为0。
   extern __shared__ u32 shared_mem[];
   u32* s_bitDom_x = shared_mem;
   u32* s_bitDom_y = &shared_mem[kDeviceBitDomIntSize];
   u32* empty_dom = &shared_mem[2 * kDeviceBitDomIntSize];
   if (a_0 == 0 && a_1 == 0) empty_dom[0] = 1;
-  // printf(
-  //     "cid: %d, a_0: %d, a_1: %d, xid: %d, yid: %d, xsize: %d, ysize: %d, "
-  //     "xsize: %d, ysize: %d\n",
-  //     bid, a_0, a_1, xid, yid, xsize, ysize, idx1, idx2);
-  // return;
-  // 把共享内存写入bitDom
-  // 还原回去
+
+  // 把bitDom写入两段共享内存
   if (a_0 < kDeviceBitDomIntSize && a_1 == 0) {
     s_bitDom_x[a_0] = bitDom[DeviceGetBitDomByIndex(xid, a_0)];
     s_bitDom_y[a_0] = bitDom[DeviceGetBitDomByIndex(yid, a_0)];
-    printf(
-        "----cid: %d, a_0: %d, a_1: %d, mConPre: %d, s_bitDom_x: %x, "
-        "s_bitDom_y: %x\n",
-        cid, a_0, a_1, mConPre[cid], s_bitDom_x[a_0], s_bitDom_y[a_0]);
+    // printf(
+    //     "----cid: %d, a_0: %d, a_1: %d, mConPre: %d, s_bitDom_x: %x, "
+    //     "s_bitDom_y: %x\n",
+    //     cid, a_0, a_1, mConPre[cid], s_bitDom_x[a_0], s_bitDom_y[a_0]);
   }
   __syncthreads();
 
   // 取当前值(x, a_0)是否有效
   // 取当前值(y, a_0)是否有效
-  int l_xa = BITSET_GET(s_bitDom_x, a_0);
-  int l_ya = BITSET_GET(s_bitDom_y, a_0);
-  // printf(
-  //     "----cid: %d, a_0: %d, a_1: %d,s_bitDom_x: %x, s_bitDom_y: %x, l_xa:
-  //     %d, " "l_ya: %d\n", cid, a_0, a_1, s_bitDom_x[a_0 / 32], s_bitDom_y[a_0
-  //     / 32], l_xa, l_ya);
-  //
-  // 输出这些变量的值
-  // if (a_0 == 0 && a_1 == 0) {
-  //   for (int i = 0; i < kDeviceBitDomIntSize; ++i) {
-  //     printf(
-  //         "cid: %d, a_0: %d, a_1: %d, xid: %d, yid: %d, xsize: %d, ysize: %d,
-  //         " "l_xa: %d, l_ya: %d, s_bitDom_x[%d]: %u, s_bitDom_y[%d]: %u\n",
-  //         cid, a_0, a_1, xid, yid, xsize, ysize, l_xa, l_ya, i,
-  //         s_bitDom_x[i], i, s_bitDom_y[i]);
-  //   }
-  // }
-  //
-  // return;
-  //
+  const int l_xa = BITSET_GET(s_bitDom_x, a_0);
+  const int l_ya = BITSET_GET(s_bitDom_y, a_0);
+
   u32 val_x = 0;
   u32 val_y = 0;
-  // auto bitSup_cid = tex3D<uint2>(bitSup, a_0, 0, bid);
-  //
-  // val_x |= l_xa && (bitSup_cid.x & s_bitDom_y[0]);
-  // val_y |= l_ya && (bitSup_cid.y & s_bitDom_x[0]);
 
-  // printf(
-  //     "----cid: %d, a_0: %d, a_1: %d,s_bitDom_x: %x, s_bitDom_y: %x, l_xa:
-  //     %d, " "l_ya: %d, bitSup_cid.x:%x, bitSup_cid.y :%x， val_x：%x,
-  //     val_y：%x,\n", cid, a_0, a_1, s_bitDom_x[a_0 / 32], s_bitDom_y[a_0 /
-  //     32], l_xa, l_ya, bitSup_cid.x, bitSup_cid.y, val_x, val_y);
-
-  // // 取得cid里支持(x, a_0)的bitDom->bitSup[c][a_1][a_0]->bitSup[c][~][a],
-  // // TODO:这里有问题，没有进行好块内归约，我需要按threadIdx.y的对数步长归约
+  // 取得cid里支持(x, a_0)的bitDom->bitSup[c][a_1][a_0]->bitSup[c][~][a],
+  // TODO:这里有问题，没有进行好块内归约，我需要按threadIdx.y的对数步长归约
   if (kDeviceBitDomIntSize == 1) {
     // Case 1: MaxDomSize \in (0,32]
     auto [x, y] = tex3D<uint2>(bitSup, a_0, 0, bid);
@@ -293,7 +169,7 @@ __global__ void CsCheckMain(i32* mConPre, const u32x3* mCon, u32* bitDom,
     val_y |= l_ya && (y & s_bitDom_x[0]);
   } else if (kDeviceBitDomIntSize == 2) {
     // Case 2: MaxDomSize \in (32,64]
-    for (int i = 1; i < kDeviceBitDomIntSize; ++i) {
+    for (int i = 0; i < kDeviceBitDomIntSize; ++i) {
       auto bitSup_cid = tex3D<uint2>(bitSup, a_0, i, bid);
       val_x |= l_xa && (bitSup_cid.x & s_bitDom_y[i]);
       val_y |= l_ya && (bitSup_cid.y & s_bitDom_x[i]);
@@ -310,45 +186,64 @@ __global__ void CsCheckMain(i32* mConPre, const u32x3* mCon, u32* bitDom,
     unsigned int vote_x = __ballot_sync(0xFFFFFFFF, val_x != 0);
     unsigned int vote_y = __ballot_sync(0xFFFFFFFF, val_y != 0);
 
-    printf(
-        "----cid: %d, a_0: %d, a_1: %d, s_bitDom_x: %x, s_bitDom_y: %x, l_xa: "
-        "%d, l_ya: %d, vote_x:%x, vote_y :%x\n",
-        cid, a_0, a_1, s_bitDom_x[a_0 / 32], s_bitDom_y[a_0 / 32], l_xa, l_ya,
-        vote_x, vote_y);
-    //   // 只是线程束里的第一个线程做如下操作：
-    //   // 只写回自己那块bitDom
-    //   // 先获取bitDom的分块索引
-    //   // 先与共享内存里的bitDom比较有改变才写回
+    // printf(
+    //     "----cid: %d, a_0: %d, a_1: %d, s_bitDom_x: %x, s_bitDom_y: %x, l_xa:
+    //     "
+    //     "%d, l_ya: %d, vote_x:%x, vote_y :%x\n",
+    //     cid, a_0, a_1, s_bitDom_x[a_0 / 32], s_bitDom_y[a_0 / 32], l_xa,
+    //     l_ya, vote_x, vote_y);
+
+    // 只是线程束里的第一个线程做如下操作：
+    // 只写回自己那块bitDom
+    // 先获取bitDom的分块索引
+    // 先与共享内存里的bitDom比较有改变才写回
+    // TODO:写回后能拿到写前的原值，这个值再与vote值与一下能拿到那一个bitdom的分块，
+    // TODO:如果这个果为0那么就是空的，这个时候就可以设置empty_dom为0，这个想法需要验证
+    // TODO:这里的写回操作应该是原子操作，如果可行，则可以省略一个检查是否为0的过程。
     if (a_0 % warpSize == 0) {
       int bitIdx = a_0 / 32;
       if (s_bitDom_x[bitIdx] ^ vote_x) {
-        // mConPre[bid] = 1;
         changed = true;
-        atomicAnd(&bitDom[DeviceGetBitDomByIndex(xid, bitIdx)], vote_x);
+        u32 oldVal =
+            atomicAnd(&bitDom[DeviceGetBitDomByIndex(xid, bitIdx)], vote_x);
+        // if (oldVal & vote_x != 0) empty_dom[0] = 0;
+        printf("v: %d, bitDom = %x, now = %x\n", xid, vote_x,
+               bitDom[DeviceGetBitDomByIndex(xid, bitIdx)]);
       }
 
       if (s_bitDom_y[bitIdx] ^ vote_y) {
-        // mConPre[bid] = 1;
         changed = true;
-        atomicAnd(&bitDom[DeviceGetBitDomByIndex(yid, bitIdx)], vote_y);
+        auto oldVal =
+            atomicAnd(&bitDom[DeviceGetBitDomByIndex(yid, bitIdx)], vote_y);
+        // if (oldVal & vote_y != 0) empty_dom[0] = 0;
+        // printf("a_0: %d, a_1: %d, empty_dom: %d\n", a_0, a_1, empty_dom[0]);
+        printf("v: %d, bitDom = %x, now = %x\n", yid, vote_y,
+               bitDom[DeviceGetBitDomByIndex(yid, bitIdx)]);
       }
     }
   }
-  __syncthreads();
 
-  // 再load一次检是否为0
+  __syncthreads();
+  // printf("changed: %d\n", changed);
+  // return;
+  // 再load一次检查是否为0
   if (a_0 < kDeviceBitDomIntSize && a_1 == 0) {
-    empty_dom[0] = (bitDom[DeviceGetBitDomByIndex(xid, a_0)] != 0);
-    empty_dom[0] = (bitDom[DeviceGetBitDomByIndex(yid, a_0)] != 0);
+    if (bitDom[DeviceGetBitDomByIndex(xid, a_0)] != 0) empty_dom[0] = 0;
+    if (bitDom[DeviceGetBitDomByIndex(yid, a_0)] != 0) empty_dom[0] = 0;
   }
+  __syncthreads();
   if (a_0 == 0 && a_1 == 0 && empty_dom[0] == 1) {
     GAC_success = 0;
+    // printf("a_0: %d, a_1: %d, empty_dom: %d\n", a_0, a_1, empty_dom[0]);
   }
   __syncthreads();
+  // printf("GAC_success: %d\n", GAC_success);
   // propagate changed to neighbour constraints
   if (GAC_success && changed) {
     for (int idx = tid; idx < kDeviceNumTabs; idx += blockDim.x * blockDim.y) {
-      if (tex2D<int>(neiCon, idx, cid) != 0) {
+      auto val = tex2D<int>(neiCon, idx, cid);
+      // printf("cid: %d, tid: %d = %d\n", cid, tid, val);
+      if (val != 0) {
         mConPre[idx] = 1;
       }
     }
@@ -420,71 +315,49 @@ int CModel::compress_Main() {
 void CModel::BuildBitModel(const HModel& xm) {
 #pragma region 计算常量
   // 变量个数
-  VS_SIZE = xm->Vars().size();
+  // VS_SIZE = xm->Vars().size();
   // 约束个数
-  CS_SIZE = xm->Tabs().size();
+  // CS_SIZE = xm->Tabs().size();
   // 约束最大元数
-  MAX_ARITY = xm->max_arity();
+  // MAX_ARITY = xm->max_arity();
   // 最大变量论域大小
-  MAX_DOM_SIZE = xm->max_domain_size();
+  // MAX_DOM_SIZE = xm->max_domain_size();
   // 计算有多少个int可以表示，一个bitDom[x]
-  BITDOM_INTSIZE = intsizeof(MAX_DOM_SIZE);
+  // BITDOM_INTSIZE = intsizeof(MAX_DOM_SIZE);
   // 总bitDom长度，一个子问题的所有bitDoms的长度
-  BITDOMS_INTSIZE = BITDOM_INTSIZE * VS_SIZE;
+  // BITDOMS_INTSIZE = BITDOM_INTSIZE * VS_SIZE;
   // 一个bitSup的int长度
   // TODO: 这里看情况可能可乘个2, 现在这里暂不乘，因为用了int2的数据类型
-  BITSUP_INTSIZE = MAX_DOM_SIZE * BITDOM_INTSIZE;
+  // BITSUP_INTSIZE = MAX_DOM_SIZE * BITDOM_INTSIZE;
   // 所有bitSup的int长度
-  BITSUPS_INTSIZE = BITSUP_INTSIZE * CS_SIZE;
+  // BITSUPS_INTSIZE = BITSUP_INTSIZE * CS_SIZE;
   // 总长度
-  BITSUBDOMS_INTSIZE = VS_SIZE * MAX_DOM_SIZE * BITDOMS_INTSIZE;
+  // BITSUBDOMS_INTSIZE = VS_SIZE * MAX_DOM_SIZE * BITDOMS_INTSIZE;
   // SUBCON_SIZE = VS_SIZE * MAX_DOM_SIZE * CS_SIZE;
 #pragma endregion 计算常量
 #pragma region 约束网络信息
-  // cudaMallocManaged(&vars_size, sizeof(int) * VS_SIZE);
-  //// 初始化变量域大小
-  // for (int i = 0; i < xm->feature.vs_size; ++i)
-  //{
-  //	XVar* v = xm->vars[i];
-  //	XDom* d = xm->doms[v->dom_id];
-  //	vars_size[i] = d->size;
-  // }
-
-  // 初始化scope
-  // cudaMallocManaged(&scope, sizeof(int3) * CS_SIZE);
-  // for (int i = 0; i < CS_SIZE; ++i) {
-  //   const HTab c = xm->Tabs(i);
-  //   // XCon* c = xm->cons[i];
-  //   scope[i].x = c->scope[0]->id;
-  //   scope[i].y = c->scope[1]->id;
-  //   scope[i].z = c->id;
-  // }
-
-  // 显示
-  // for (int i = 0; i < CS_SIZE; ++i) {
-  //   printf("scope[%d] = {%d, %d}\n", scope[i].z, scope[i].x, scope[i].y);
-  // }
-  // 这里存一些类内的常量什么的吧
-
   // 初始化数据
-  std::cout << "-----texture-----" << std::endl;
+  LOG(INFO) << "-----neighbour-----";
   cudaMalloc(&d_ConNeighbor, sizeof(int) * kNumTabs * kNumTabs);
   int h_ConNeighbor[kNumTabs * kNumTabs] = {};
 
   for (int i = 0; i < kNumTabs; ++i) {
     auto ci = xm->Tabs(i);
     for (int j = 0; j < kNumTabs; ++j) {
-      // h_ConNeighbor[i * kNumTabs + j] = i + j;  // 简单初始化
-      // auto cj = xm->Tabs(j);
-      h_ConNeighbor[i * kNumTabs + j] = xm->neighbor_constraint_matrix[i][j];
+      auto cj = xm->Tabs(j);
+      if (HModel::is_neighbour(ci, cj) && i != j) {
+        h_ConNeighbor[i * kNumTabs + j] = 1;  // 简单初始化
+      } else {
+        h_ConNeighbor[i * kNumTabs + j] = 0;
+      }
     }
   }
 
-  // 打印初始化后的数据
-  for (size_t i = 0; i < kNumTabs * kNumTabs; i++) {
-    std::cout << h_ConNeighbor[i] << " ";
-  }
-  std::cout << std::endl;
+  // // 打印初始化后的数据
+  // for (size_t i = 0; i < kNumTabs * kNumTabs; i++) {
+  //   std::cout << h_ConNeighbor[i] << " ";
+  // }
+  // std::cout << std::endl;
 
   cudaMemcpy(d_ConNeighbor, h_ConNeighbor, sizeof(int) * kNumTabs * kNumTabs,
              cudaMemcpyHostToDevice);
@@ -516,97 +389,37 @@ void CModel::BuildBitModel(const HModel& xm) {
   cudaCreateTextureObject(&texObj_MCon, &resDesc_MCon, &texDesc_MCon, NULL);
 
   // Invoke kernel
-  dim3 threadsPerBlock(16, 16);
-  dim3 numBlocks((kNumTabs + threadsPerBlock.x - 1) / threadsPerBlock.x,
-                 (kNumTabs + threadsPerBlock.y - 1) / threadsPerBlock.y);
-  std::cout << kNumTabs << std::endl;
-  std::cout << numBlocks.x << " " << numBlocks.y << " " << numBlocks.z
-            << std::endl;
-  std::cout << threadsPerBlock.x << " " << threadsPerBlock.y << " "
-            << threadsPerBlock.z << std::endl;
-  transformKernel<<<numBlocks, threadsPerBlock>>>(texObj_MCon, kNumTabs,
-                                                  kNumTabs);
-  cudaDeviceSynchronize();
-  std::cout << "-----texture-----" << std::endl;
-
-  // std::cout << "-----texture-----" << std::endl;
-  // cudaMalloc(&d_ConNeighbor, sizeof(int) * num_tabs * num_tabs);
-  // int h_ConNeighbor[num_tabs * num_tabs] = {};
-
-  // for (int i = 0; i < num_tabs; ++i) {
-  //   const auto c = xm->Tabs(i);
-  //   // subscriptions
-  //   for (const auto& v : c->scope) {
-  //     for (const auto& cc : xm->subscriptions[v]) {
-  //       h_ConNeighbor[i * CS_SIZE + cc->id] = 1;
-  //       h_ConNeighbor[cc->id * CS_SIZE + i] = 1;
-  //     }
-  //   }
-  // }
-
-  // for (size_t i = 0; i < num_tabs * num_tabs; i++) {
-  //   /* code */
-  //   std::cout << h_ConNeighbor[i] << " ";
-  // }
-  // std::cout << std::endl;
-
-  // cudaMemcpy(d_ConNeighbor, h_ConNeighbor, sizeof(int) * num_tabs * num_tabs,
-  //            cudaMemcpyHostToDevice);
-
-  // // Allocate CUDA array in device memory
-  // cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<int>();
-  // cudaMallocArray(&cuArray, &channelDesc, num_tabs, num_tabs);
-
-  // // Copy data to device memory
-  // const size_t spitch = num_tabs * sizeof(int);
-  // cudaMemcpy2DToArray(cuArray, 0, 0, h_ConNeighbor, spitch,
-  //                     num_tabs * sizeof(int), num_tabs,
-  //                     cudaMemcpyHostToDevice);
-  // cudaDeviceSynchronize();
-  // // Specify texture resource
-  // memset(&resDesc, 0, sizeof(resDesc));
-  // resDesc.resType = cudaResourceTypeArray;
-  // resDesc.res.array.array = cuArray;
-
-  // // Specify texture object parameters
-  // memset(&texDesc, 0, sizeof(texDesc));
-  // texDesc.addressMode[0] = cudaAddressModeWrap;
-  // texDesc.addressMode[1] = cudaAddressModeWrap;
-  // texDesc.filterMode = cudaFilterModeLinear;
-  // texDesc.readMode = cudaReadModeElementType;
-  // texDesc.normalizedCoords = 1;
-
-  // // Create texture object
-  // cudaCreateTextureObject(&texObj, &resDesc, &texDesc, NULL);
-
-  // // Invoke kernel
   // dim3 threadsPerBlock(16, 16);
-  // dim3 numBlocks((num_tabs + threadsPerBlock.x - 1) / threadsPerBlock.x,
-  //                (num_tabs + threadsPerBlock.y - 1) / threadsPerBlock.y);
-  // std::cout << num_tabs << std::endl;
-  // std::cout << numBlocks.x << numBlocks.y << numBlocks.z << std::endl;
-  // std::cout << threadsPerBlock.x << threadsPerBlock.y << threadsPerBlock.z
+  // dim3 numBlocks((kNumTabs + threadsPerBlock.x - 1) / threadsPerBlock.x,
+  //                (kNumTabs + threadsPerBlock.y - 1) / threadsPerBlock.y);
+  // std::cout << kNumTabs << std::endl;
+  // std::cout << numBlocks.x << " " << numBlocks.y << " " << numBlocks.z
   //           << std::endl;
-  // transformKernel<<<numBlocks, threadsPerBlock>>>(texObj, num_tabs,
-  // num_tabs); cudaDeviceSynchronize(); std::cout << "-----texture-----" <<
-  // std::endl;
+  // std::cout << threadsPerBlock.x << " " << threadsPerBlock.y << " "
+  //           << threadsPerBlock.z << std::endl;
+  // transformKernel<<<numBlocks, threadsPerBlock>>>(texObj_MCon, kNumTabs,
+  //                                                 kNumTabs);
+  cudaDeviceSynchronize();
+  // LOG(INFO) << "-----texture-----";
 #pragma endregion 约束网络信息
 
 #pragma region 拷贝bitDom
+  LOG(INFO) << "-----bitDom-----";
   // 现在少了一个回溯维度，所以不需要考虑回溯的问题
-  cudaMallocManaged(&bitDom, sizeof(u32) * BITDOMS_INTSIZE);
-  cudaMallocManaged(&M_VarPre, sizeof(int) * VS_SIZE);
+  // cudaMallocManaged(&bitDom, sizeof(u32) * BITDOMS_INTSIZE);
+  // cudaMallocManaged(&M_VarPre, sizeof(int) * VS_SIZE);
+  cudaMallocManaged(&bitDom, sizeof(u32) * kBitDomsIntSize);
+  // cudaMallocManaged(&M_VarPre, sizeof(int) * kNumVars);
 
   // 初始化bitDom
-  for (int i = 0; i < VS_SIZE; ++i) {
+  for (int i = 0; i < kNumVars; ++i) {
     const HVar v = xm->Vars(i);
     const int dom_size = v->vals.size();
     // 当前变量的实际INT长度
     const int dom_int_size = intsizeof(dom_size);
 
-    for (int j = 0; j < BITDOM_INTSIZE; ++j) {
+    for (int j = 0; j < kBitDomIntSize; ++j) {
       const int idx = GetBitDomByIndex(i, j);
-      // printf("idx = %d\n", idx);
       //  三种情况
       if (j < dom_int_size - 1)
         bitDom[idx] = UINT32_MAX;
@@ -615,122 +428,90 @@ void CModel::BuildBitModel(const HModel& xm) {
       else
         bitDom[idx] = 0;
     }
-
-    M_VarPre[i] = 1;
   }
 
-  for (int i = 0; i < VS_SIZE; ++i) {
-    for (int j = 0; j < BITDOM_INTSIZE; ++j) {
+  for (int i = 0; i < kNumVars; ++i) {
+    for (int j = 0; j < kBitDomIntSize; ++j) {
       int idx = GetBitDomByIndex(i, j);
-      printf("var = %d, j = %d, idx = %d, bitDom = %x, pre= %x\n", i, j, idx,
-             bitDom[idx], M_VarPre[i]);
+      printf("var = %d, j = %d, idx = %d, bitDom = %x\n", i, j, idx,
+             bitDom[idx]);
     }
   }
 #pragma endregion 拷贝bitDom
 
 #pragma region 创建bitSubDom
+  LOG(INFO) << "-----bitSubDom-----";
   // 现在少了一个回溯维度，所以不需要考虑回溯的问题
+  // cudaMalloc(&bitSubDom,
+  //                   sizeof(u32) * BITDOMS_INTSIZE * VS_SIZE * MAX_DOM_SIZE);
   cudaMallocManaged(&bitSubDom,
-                    sizeof(u32) * BITDOMS_INTSIZE * VS_SIZE * MAX_DOM_SIZE);
-  for (int i = 0; i < VS_SIZE; ++i) {
-    for (int j = 0; j < MAX_DOM_SIZE; ++j) {
+                    sizeof(u32) * kBitDomsIntSize * kNumVars * kMaxDomSize);
+  for (int i = 0; i < kNumVars; ++i) {
+    for (int j = 0; j < kMaxDomSize; ++j) {
       const int start_idx = GetBitSubDomStartIndex(i, j);
-      for (int k = 0; k < BITSUBDOMS_INTSIZE; ++k)
+      for (int k = 0; k < kBitSubDomsIntSize; ++k) {
         bitSubDom[start_idx + k] = bitDom[k];
-      // (i,j,i,j),子问题(i,j)的singleton问题(i,j)值需要singleton即清空bitSubDom[i,j,i]，并设置bitSubDom[i,j,i,j]=1bit
-      // 获取i,j,i的起始地址，
-      // 获取i,j,i的起始地址
-      const int ijistart = start_idx + i * BITDOM_INTSIZE;
-      // 将bitSubDom从ijistart到ijistart+BITDOM_INTSIZE的范围清零
-      for (int k = 0; k < BITDOM_INTSIZE; ++k) {
-        bitSubDom[ijistart + k] = 0;
       }
-
-      // u32* bitSubDom_ij = bitSubDom + ijistart;
-      // // 设置bitSubDom[i,j,i,j]的第j位为1
-      // BITSET_SET(bitSubDom_ij, j);
-
-      BITSET_SET((bitSubDom + ijistart), j);
+      // (i,j,i,j),子问题(i,j)的singleton问题：
+      // (i,j)值需要singleton即清空bitSubDom[i,j,i]，
+      // 并设置bitSubDom[i,j,i,j]=1bit
+      // 做法：  获取i,j,i的起始地址，
+      //        将bitSubDom从ijistart到ijistart+kBitDomIntSize的范围清零
+      //        设置bitSubDom[i,j,i,j]的第j位为1
+      const int iji_start_idx = start_idx + i * kBitDomIntSize;
+      for (int k = 0; k < kBitDomIntSize; ++k) bitSubDom[iji_start_idx + k] = 0;
+      BITSET_SET((bitSubDom + iji_start_idx), j);
     }
   }
 
-  for (int i = 0; i < VS_SIZE; ++i) {
-    for (int j = 0; j < MAX_DOM_SIZE; ++j) {
-      printf("sub problem:(%d, %d): ", i, j);
-      const int start_idx = GetBitSubDomStartIndex(i, j);
-      for (int k = 0; k < BITDOMS_INTSIZE; ++k) {
-        printf("%x ", bitSubDom[start_idx + k]);
-      }
-      printf("\n");
-    }
-  }
+  // for (int i = 0; i < kNumVars; ++i) {
+  //   for (int j = 0; j < kMaxDomSize; ++j) {
+  //     printf("sub problem:(%d, %d): ", i, j);
+  //     const int start_idx = GetBitSubDomStartIndex(i, j);
+  //     for (int k = 0; k < kBitDomsIntSize; ++k) {
+  //       printf("%x ", bitSubDom[start_idx + k]);
+  //     }
+  //     printf("\n");
+  //   }
+  // }
 
 #pragma endregion 创建bitSubDom
 
 #pragma region 拷贝bitSup
   printf("-------------bitSup-------------\n");
-  cudaMallocManaged(&bitSup, sizeof(uint2) * BITSUPS_INTSIZE);
+  // cudaMallocManaged(&bitSup, sizeof(uint2) * kBitSupsIntSize);
   // cudaMalloc(&d_bitSup, sizeof(uint2) * BITSUPS_INTSIZE);
-  auto* h_bitSup = new uint2[BITSUPS_INTSIZE]();
+  auto* h_bitSup = new uint2[kBitSupsIntSize]();
 
   // 填充bitSup
-  for (int i = 0; i < CS_SIZE; ++i) {
+  for (int i = 0; i < kNumTabs; ++i) {
     const HTab c = xm->Tabs(i);
     // 仅适用于二元约束，支持语义
     if (c->Arity() != 2)
       throw std::invalid_argument("Only support binary constraint.");
     if (!c->semantics)
       throw std::invalid_argument("Only support support semantics.");
-    // 向位矩阵中填充值，这里假设bitSup和h_bitSup的维度顺序是不一样的
-    // 维度是[e,d,d/w]
-    for (int j = 0; j < c->tuples.size(); ++j) {
-      const int2 t = make_int2(c->tuples[j][0], c->tuples[j][1]);
-      const int2 idx = GetBitSupIndexByTuple_C_MDS_MDINTS(c->id, t);
-      // bitSup[idx.x].x |= U32_MASK1[t.y & U32_MOD_MASK];
-      // bitSup[idx.y].y |= U32_MASK1[t.x & U32_MOD_MASK];
-
-      BITSET_SET(reinterpret_cast<uint32_t*>(&bitSup[idx.x].x), t.y);
-      BITSET_SET(reinterpret_cast<uint32_t*>(&bitSup[idx.y].y), t.x);
-    }
 
     // 维度是[e,d,d/w]
     for (int j = 0; j < c->tuples.size(); ++j) {
       const int2 t = make_int2(c->tuples[j][0], c->tuples[j][1]);
       const int2 idx = GetBitSupIndexByTuple_C_MDINTS_MDS(c->id, t);
-      // h_bitSup[idx.x].x |= U32_MASK1[t.y & U32_MOD_MASK];
-      // h_bitSup[idx.y].y |= U32_MASK1[t.x & U32_MOD_MASK];
-
       BITSET_SET(reinterpret_cast<uint32_t*>(&h_bitSup[idx.x].x), t.y);
       BITSET_SET(reinterpret_cast<uint32_t*>(&h_bitSup[idx.y].y), t.x);
     }
   }
 
-  printf("----------bitSup---------\n");
-  for (int i = 0; i < CS_SIZE; ++i) {
-    for (int j = 0; j < MAX_DOM_SIZE; ++j) {
-      printf("c_id = %d, j = %d: ", i, j);
-      for (int k = 0; k < BITDOM_INTSIZE; ++k) {
-        const int idx = GetBitSupIndexByINTPrstn(i, j, k);
-        printf("%x, %x", bitSup[idx].x, bitSup[idx].y);
-      }
-      printf("\n");
-    }
-  }
-
-  printf("----------h_bitSup---------\n");
-  for (int i = 0; i < CS_SIZE; ++i) {
-    for (int j = 0; j < BITDOM_INTSIZE; ++j) {
-      printf("c_id = %d, j = %d: ", i, j);
-      for (int k = 0; k < MAX_DOM_SIZE; ++k) {
-        const int idx = GetBitSupIndexByINTPrstn(i, j, k);
-        // printf("%x, %x", bitSup[idx].x, bitSup[idx].y);
-        printf("%x, %x | ", h_bitSup[idx].x, h_bitSup[idx].y);
-      }
-      printf("\n");
-    }
-  }
-  // cudaMemcpy(d_bitSup, h_bitSup, sizeof(uint2) * BITSUPS_INTSIZE,
-  //            cudaMemcpyDeviceToDevice);
+  // printf("----------h_bitSup---------\n");
+  // for (int i = 0; i < kNumTabs; ++i) {
+  //   for (int j = 0; j < kBitDomIntSize; ++j) {
+  //     printf("c_id = %d, j = %d: ", i, j);
+  //     for (int k = 0; k < kMaxDomSize; ++k) {
+  //       const int idx = GetBitSupIndexByINTPrstn(i, j, k);
+  //       printf("%x, %x | ", h_bitSup[idx].x, h_bitSup[idx].y);
+  //     }
+  //     printf("\n");
+  //   }
+  // }
 
   printf("---------bitSup texture---------\n");
   // 分配3D CUDA数组内存
@@ -770,16 +551,17 @@ void CModel::BuildBitModel(const HModel& xm) {
   texDesc3D.normalizedCoords = 0;
 
   // 创建3D纹理对象
-  cudaCreateTextureObject(&textureBitSup, &resDesc3D, &texDesc3D, NULL);
-
-  // 调用内核函数
-  dim3 threadsPerBlock3(8, 8, 8);
-  dim3 numBlocks3((kNumTabs + threadsPerBlock.x - 1) / threadsPerBlock.x,
-                  (kNumVars + threadsPerBlock.y - 1) / threadsPerBlock.y,
-                  (kBitDomIntSize + threadsPerBlock.z - 1) / threadsPerBlock.z);
-
-  transformKernel3D<<<numBlocks3, threadsPerBlock3>>>(
-      textureBitSup, kMaxDomSize, kBitDomIntSize, kNumTabs);
+  cudaCreateTextureObject(&texObj_BitSup, &resDesc3D, &texDesc3D, NULL);
+  //
+  // // 调用内核函数
+  // dim3 threadsPerBlock3(8, 8, 8);
+  // dim3 numBlocks3((kNumTabs + threadsPerBlock.x - 1) / threadsPerBlock.x,
+  //                 (kNumVars + threadsPerBlock.y - 1) / threadsPerBlock.y,
+  //                 (kBitDomIntSize + threadsPerBlock.z - 1) /
+  //                 threadsPerBlock.z);
+  //
+  // transformKernel3D<<<numBlocks3, threadsPerBlock3>>>(
+  //     texObj_BitSup, kMaxDomSize, kBitDomIntSize, kNumTabs);
   cudaDeviceSynchronize();
 
   delete[] h_bitSup;
@@ -787,43 +569,25 @@ void CModel::BuildBitModel(const HModel& xm) {
 #pragma endregion 拷贝bitSup
 
 #pragma region 生成约束
-  cudaMallocManaged(&M_Con, sizeof(uint3) * CS_SIZE);
-  cudaMallocManaged(&M_ConEvt, sizeof(uint3) * CS_SIZE);
-  cudaMallocManaged(&M_ConPre, sizeof(int) * CS_SIZE);
-  // thrust::host_vector<uint3>
-  // thrust::host_vector<uint3> HMCon(CS_SIZE);
-  // M_Con.resize(CS_SIZE);
-  // M_ConEvt.reserve(CS_SIZE);
-  // M_ConPre.resize(CS_SIZE, 1);
-  // // cudaMallocManaged(&M_ConPre, sizeof(int) * CS_SIZE);
-  // //
-  for (int i = 0; i < CS_SIZE; ++i) {
+  // 初始化h_MCon信息
+  thrust::host_vector<uint3> h_MCon(kNumTabs);
+  for (int i = 0; i < kNumTabs; ++i) {
     auto c = xm->Tabs(i);
-    M_Con[i] = make_uint3(xm->Tabs(i)->scope[0]->id, xm->Tabs(i)->scope[1]->id,
-                          xm->Tabs(i)->id);
-    M_ConPre[i] = 1;
+    h_MCon[i] = make_uint3(xm->Tabs(i)->scope[0]->id, xm->Tabs(i)->scope[1]->id,
+                           xm->Tabs(i)->id);
   }
 
-  d_MCon.resize(CS_SIZE);
   // 将 M_Con 的数据拷贝到 d_MCon
-  thrust::copy(M_Con, M_Con + CS_SIZE, d_MCon.begin());
-  d_MConEvt.reserve(CS_SIZE);
-  d_ConPre.resize(CS_SIZE, 1);
+  d_MCon = h_MCon;
+  d_MConEvt.reserve(kNumTabs);
+  d_ConPre.resize(kNumTabs, 1);
 
-  // 验证数据是否正确拷贝
-  for (int i = 0; i < CS_SIZE; ++i) {
-    uint3 val = d_MCon[i];
-    std::cout << "d_MCon[" << i << "] = (" << val.x << ", " << val.y << ", "
-              << val.z << "): " << d_ConPre[i] << "\n";
-  }
-
-  printf("-------\n");
-  uint3* d_MCon_ptr = thrust::raw_pointer_cast(d_MCon.data());
-
-  int threadsPerBlock2 = 32;
-  int blocksPerGrid = (CS_SIZE + threadsPerBlock2 - 1) / threadsPerBlock2;
-  exampleKernel<<<blocksPerGrid, threadsPerBlock2>>>(d_MCon_ptr, CS_SIZE);
-
+  // // 验证数据是否正确拷贝
+  // for (int i = 0; i < kNumTabs; ++i) {
+  //   uint3 val = d_MCon[i];
+  //   std::cout << "d_MCon[" << i << "] = (" << val.x << ", " << val.y << ", "
+  //             << val.z << "): " << d_ConPre[i] << "\n";
+  // }
 #pragma endregion 生成约束
 #pragma region 子问题约束队列
 //   cudaMallocManaged(&S_ConPre, sizeof(int) * SUBCON_SIZE);
@@ -881,6 +645,7 @@ void CModel::BuildBitModel(const HModel& xm) {
   //   MCC_BlocksOffset = thrust::raw_pointer_cast(MCC_BOffset.data());
   // #pragma endregion
 }
+
 void CModel::initialGPUConstant() {
   // 将 CPU 数据复制到 GPU 常量内存
   // cudaMemcpyToSymbol(kDeviceU32Mask1, U32_MASK1, sizeof(U32_MASK1));
@@ -903,16 +668,17 @@ bool CModel::enforceGAC() {
   printf("-------------------enforceGAC-------------------\n");
   int sharedMemSize =
       (2 * kBitDomIntSize + 1) * sizeof(u32);  // 动态共享内存大小
-  printf("d_ConPre.size = %lu\n", d_ConPre.size());
+  // printf("d_ConPre.size = %lu\n", d_ConPre.size());
+  GAC_success = 1;
   // // 1. 压缩约束
-  // int num_ConEvt = compress_Main();
+  int num_ConEvt = compress_Main();
   // // 2. 检查约束
   // // if(kBitDomIntSize==3||kBitDomIntSize==4) {
   // //
-  // CsCheckMain<<<num_ConEvt,dim3(kBitDomIntSize*32,1,1)>>>(thrust::raw_pointer_cast(d_ConPre.data()),thrust::raw_pointer_cast(d_MCon.data()),bitDom,thrust::raw_pointer_cast(dom_size.data()),textureBitSup);
+  // CsCheckMain<<<num_ConEvt,dim3(kBitDomIntSize*32,1,1)>>>(thrust::raw_pointer_cast(d_ConPre.data()),thrust::raw_pointer_cast(d_MCon.data()),bitDom,thrust::raw_pointer_cast(dom_size.data()),texObj_BitSup);
   // // }else if(kBitDomIntSize>=5||kBitDomIntSize<=8){
   // //
-  // CsCheckMain<<<num_ConEvt,dim3(kBitDomIntSize*32,1,1)>>>(thrust::raw_pointer_cast(d_ConPre.data()),thrust::raw_pointer_cast(d_MCon.data()),bitDom,thrust::raw_pointer_cast(dom_size.data()),textureBitSup);
+  // CsCheckMain<<<num_ConEvt,dim3(kBitDomIntSize*32,1,1)>>>(thrust::raw_pointer_cast(d_ConPre.data()),thrust::raw_pointer_cast(d_MCon.data()),bitDom,thrust::raw_pointer_cast(dom_size.data()),texObj_BitSup);
   // // }
   // // // CsCheckMain<<<num_ConEvt,kBitDomIntSize*32>>>
   // // 将 d_MConEvt 数据从设备复制到主机
@@ -926,29 +692,26 @@ bool CModel::enforceGAC() {
   // //             << h_MConEvt[i].y << ", "
   // //             << h_MConEvt[i].z << ")\n";
   // // }
-  //
-  //
-  //
-  // CsCheckMain<<<num_ConEvt,dim3(kBitDomIntSize*32,1,1),sharedMemSize>>>(
-  //   thrust::raw_pointer_cast(d_ConPre.data()),
-  //   thrust::raw_pointer_cast(d_MCon.data()),
-  //   bitDom,
-  //   thrust::raw_pointer_cast(dom_size.data()),
-  //   textureBitSup,texObj_MCon,
-  //   num_ConEvt);
+  CsCheckMain<<<num_ConEvt,dim3(kBitDomIntSize*32,1,1),sharedMemSize>>>(
+    thrust::raw_pointer_cast(d_ConPre.data()),
+    thrust::raw_pointer_cast(d_MCon.data()),
+    bitDom,
+    thrust::raw_pointer_cast(dom_size.data()),
+    texObj_BitSup,texObj_MCon,
+    num_ConEvt);
 
-  int num_ConEvt = compress_Main();
-  while (num_ConEvt != 0) {
-    CsCheckMain<<<num_ConEvt, dim3(kBitDomIntSize * 32, 1, 1), sharedMemSize>>>(
-        thrust::raw_pointer_cast(d_ConPre.data()),
-        thrust::raw_pointer_cast(d_MCon.data()), bitDom,
-        thrust::raw_pointer_cast(dom_size.data()), textureBitSup, texObj_MCon,
-        num_ConEvt);
-    if (GAC_success) {
-      return false;
-    }
-    num_ConEvt = compress_Main();
-  }
+  // int num_ConEvt = compress_Main();
+  // while (num_ConEvt != 0) {
+  //   CsCheckMain<<<num_ConEvt, dim3(kBitDomIntSize * 32, 1, 1), sharedMemSize>>>(
+  //       thrust::raw_pointer_cast(d_ConPre.data()),
+  //       thrust::raw_pointer_cast(d_MCon.data()), bitDom,
+  //       thrust::raw_pointer_cast(dom_size.data()), texObj_BitSup, texObj_MCon,
+  //       num_ConEvt);
+  //   if (GAC_success) {
+  //     return false;
+  //   }
+  //   num_ConEvt = compress_Main();
+  // }
   return true;
 }
 
@@ -957,31 +720,27 @@ void CModel::enforceSAC() {}
 void CModel::solve() {}
 
 CModel::~CModel() {
-  std::cout << "CModel析构函数" << std::endl;
+  LOG(INFO)<< "CModel析构函数";
   // cudaFree(d_bitSup);
   cudaFree(d_ConNeighbor);
   cudaFree(bitDom);
-  cudaFree(M_VarPre);
+  // cudaFree(M_VarPre);
   cudaFree(bitSubDom);
-  cudaFree(bitSup);
-  cudaFree(M_Con);
-  cudaFree(M_ConEvt);
-  cudaFree(M_ConPre);
+  // cudaFree(bitSup);
+  // cudaFree(M_Con);
+  // cudaFree(M_ConEvt);
+  // cudaFree(M_ConPre);
   cudaFree(S_ConPre);
   cudaFree(S_ConEvt);
   cudaFree(S_Con);
   cudaFree(S_Var);
   cudaFree(S_VarPre);
 
-  // Destroy texture object
+  // 析构纹理内存
   cudaDestroyTextureObject(texObj_MCon);
-  // Free device memory
   cudaFreeArray(cuArray_MCon);
-  // cudaFree(d_output);
 
-  // 销毁纹理对象
-  cudaDestroyTextureObject(textureBitSup);
-  // 释放设备内存
+  cudaDestroyTextureObject(texObj_BitSup);
   cudaFreeArray(cuArray3D);
 }
 

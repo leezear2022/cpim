@@ -74,8 +74,8 @@ if(MSVC)
     target_compile_options(${LIBRARY_NAME_DYNAMIC} PRIVATE /W3)
 endif()
 
-target_link_libraries(${LIBRARY_NAME} ${LIBXML2_LIBRARIES})
-target_link_libraries(${LIBRARY_NAME_DYNAMIC} ${LIBXML2_LIBRARIES})
+target_link_libraries(${LIBRARY_NAME} ${LIBXML2_LIBRARIES} glog::glog)
+target_link_libraries(${LIBRARY_NAME_DYNAMIC} ${LIBXML2_LIBRARIES} glog::glog)
 
 set_target_properties(${LIBRARY_NAME} PROPERTIES
         VERSION ${VERSION}
@@ -85,7 +85,7 @@ set_target_properties(${LIBRARY_NAME} PROPERTIES
 
 set(APPLICATION_NAME samplesXcsp3)
 add_executable(${APPLICATION_NAME} ${APP_SOURCES})
-target_link_libraries(${APPLICATION_NAME} ${LIBRARY_NAME} ${LIBXML2_LIBRARIES})
+target_link_libraries(${APPLICATION_NAME} ${LIBRARY_NAME} ${LIBXML2_LIBRARIES} glog::glog)
 target_include_directories(${LIBRARY_NAME} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 if(MSVC)

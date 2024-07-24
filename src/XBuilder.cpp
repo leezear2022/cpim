@@ -6,6 +6,8 @@
  */
 #include "xcsp3model/XBuilder.h"
 
+#include <glog/logging.h>
+
 #include <sstream>
 
 namespace cpim::common {
@@ -39,7 +41,7 @@ bool XBuilder::initial(const std::string& s) {
   if (s.empty()) {
     return false;
   } else {
-    std::cout << "current bm file: " << s << std::endl;
+    LOG(INFO) << "current bm file: " << s;
   }
 
   try {

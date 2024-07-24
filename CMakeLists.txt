@@ -99,6 +99,18 @@ add_executable(cpim samples/main.cu
         include/Timer.h
         include/cuSAC.cuh
         src/cuSAC.cu
+        src/MAC.cpp
+        src/AC.cpp
+        src/AC3.cpp
+        src/AC3bit.cpp
+        src/AC3rm.cpp
+        src/AC3rm.cpp
+        src/FC.cpp
+        src/lMaxRPC.cpp
+        src/NSAC.cpp
+        src/RPC3.cpp
+        src/SAC1.cpp
+        src/SAC3.cpp
 )
 
 set_target_properties(cpim PROPERTIES

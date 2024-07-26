@@ -28,12 +28,13 @@ void AC3::insert(IntVar* v) {
 //						bool aa = false;
 //						for (auto z : c->scope)
 //							if ((z != x) &&
-//stamp_var_[z->id()] > stamp_tab_[c->id()]) 								aa = true;
+// stamp_var_[z->id()] > stamp_tab_[c->id()])
+// aa = true;
 //
 //						if ((y != x) || aa) {
 //							if (revise(arc(c, y))) {
 //								if (y->size() ==
-//0) { 									return false;
+// 0) { return false;
 //								}
 //								insert(y);
 //							}
@@ -67,15 +68,20 @@ void AC3::insert(IntVar* v) {
 //						bool aa = false;
 //						for (auto z : c->scope)
 //							if ((z != x) &&
-//stamp_var_[z->id()] > stamp_tab_[c->id()]) 								aa = true;
+// stamp_var_[z->id()] > stamp_tab_[c->id()])
+// aa = true;
 //
 //						if ((y != x) || aa)
 //							if (revise(arc(c, y))) {
 //								if (y->faild())
-//{ 									cs.tab = c; 									cs.var = y;
+//{ 									cs.tab =
+//c; 									cs.var =
+//y;
 //									++(c->weight);
 //									//cout
-//<< c->id()<<": weight = "<<c->weight << endl; 									cs.state = false; 									return cs;
+//<< c->id()<<": weight = "<<c->weight << endl;
+//cs.state = false;
+//return cs;
 //								}
 //								insert(y);
 //							}
@@ -156,14 +162,14 @@ ConsistencyState AC3::enforce(vector<IntVar*>& x_evt, const int level) {
 //				cs.state = false;
 //				++(c_x.c()->weight);
 //				//cout << c_x.c()->id() << ": weight = " <<
-//c_x.c()->weight << endl; 				return cs;
+// c_x.c()->weight << endl; 				return cs;
 //			}
 //
 //			for (Tabular* c : m_->subscription[c_x.v()])
 //				if (c != c_x.c())
 //					for (IntVar* v : c->scope)
 //						if ((v != c_x.v()) &&
-//(!v->assigned())) 							Q.push(arc(c, v));
+//(!v->assigned())) Q.push(arc(c, v));
 //		}
 //	}
 //	cs.state = true;
@@ -177,7 +183,7 @@ bool AC3::revise(const arc& c_x, const int p) {
   while (a != Limits::INDEX_OVERFLOW) {
     if (!seek_support(IntConVal(c_x, a), p)) {
       c_x.v()->RemoveValue(a, p);
-      // cout << "remove: (" << c_x.v_id() << ", " << a << ")" << endl;
+      cout << "remove: (" << c_x.v_id() << ", " << a << ")" << endl;
       ++cs.num_delete;
       ++delete_;
     }

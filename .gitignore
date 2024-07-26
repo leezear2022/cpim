@@ -5,3 +5,4 @@
 /xcsp3parser/cmake-build-debug/
 /xcsp3parser/cmake-build-release/
 /xcsp3parser/samples/samplesXcsp3
+/xcsp3parser/lib/libxcsp3parser.a

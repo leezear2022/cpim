@@ -31,7 +31,8 @@ int main(int argc, char* argv[]) {
   // ac_.enforce(n->vars, 0);
   // n->show(0);
 
-  MAC mac(n, CA_RPC3, Heuristic::VRH_DOM_MIN, Heuristic::VLH_MIN);
+  // MAC mac(n, CA_RPC3, Heuristic::VRH_DOM_MIN, Heuristic::VLH_MIN);
+  MAC mac(n, AC_3bit, Heuristic::VRH_DOM_MIN, Heuristic::VLH_MIN);
 
   const SearchStatistics statistics = mac.enforce(TimeLimit);
   cout << mac.sol_str << endl;

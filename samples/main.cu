@@ -18,23 +18,31 @@ using namespace cpim::common;
 //     "/home/lee/CLionProjects/cpim/samples/bench/BMPath.xml";
 const std::string X_PATH = "../samples/bench/BMPath.xml";
 
-// constexpr long TimeLimit = 1800000000000;
+constexpr long TimeLimit = 900000;
 int main(int argc, char* argv[]) {
   const XBuilder builder(X_PATH, XRT_BM_PATH);
   const HModel hm = HModelNode::Make();
   builder.GenerateHModel(hm);
-  hm->show();
-  // auto* n = new Network(hm);
+  // hm->show();
+  auto* n = new Network(hm);
   // n->show(0);
   //
   // AC3bit ac_(n);
   // ac_.enforce(n->vars, 0);
   // n->show(0);
-  // delete n;
 
-  // MAC mac(n, AC_3, Heuristic::VRH_DOM_MIN, Heuristic::VLH_MIN);
-  CModel cm(hm);
-  cm.enforceGAC();
+  MAC mac(n, CA_RPC3, Heuristic::VRH_DOM_MIN, Heuristic::VLH_MIN);
+
+  const SearchStatistics statistics = mac.enforce(TimeLimit);
+  cout << mac.sol_str << endl;
+  cout << "is solution = " << mac.solution_check() << endl;
+  cout << "time = " << statistics.solve_time << endl;
+  cout << "positive = " << statistics.num_positive << endl;
+  cout << "negative = " << statistics.num_negative << endl;
+
+  delete n;
+  // CModel cm(hm);
+  // cm.enforceGAC();
   // cm.BuildBitModel(hm);
   // cm.DelGPUModel();
   // BuildBitModel(hm);

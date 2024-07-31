@@ -36,14 +36,14 @@ int main(int argc, char* argv[]) {
 
   const SearchStatistics statistics = mac.enforce(TimeLimit);
   cout << mac.sol_str << endl;
-  cout << "is solution = " << mac.solution_check() << endl;
+  // cout << "is solution = " << mac.solution_check() << endl;
   cout << "time = " << statistics.solve_time << endl;
   cout << "positive = " << statistics.num_positive << endl;
   cout << "negative = " << statistics.num_negative << endl;
 
   delete n;
-  // CModel cm(hm);
-  // cm.enforceGAC();
+  CModel cm(hm);
+  cm.enforceGAC();
   // cm.BuildBitModel(hm);
   // cm.DelGPUModel();
   // BuildBitModel(hm);

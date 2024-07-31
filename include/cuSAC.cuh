@@ -88,7 +88,11 @@ const u32 U32_MASK0[32] = {
     0xFFFFFF7F, 0xFFFFFFBF, 0xFFFFFFDF, 0xFFFFFFEF, 0xFFFFFFF7, 0xFFFFFFFB,
     0xFFFFFFFD, 0xFFFFFFFE,
 };
+
  */
+// 定义一些全局常量
+const int kMaxNumVars = 512;
+
 // 一个bitDom[x]的长度
 extern __constant__ int kDeviceBitDomIntSize;
 // 整个bitDom的长度
@@ -101,6 +105,7 @@ extern __constant__ int* kDeviceDomSize;
 extern __constant__ int kDeviceBitSupIntSize;
 extern __constant__ int kDeviceBitSupsIntSize;
 extern __constant__ int kDeviceBitSubDomsIntSize;
+extern __constant__ inline int kDeg[kMaxNumVars];
 
 // constexpr int num_threads = 32;
 constexpr int U32_SIZE = sizeof(u32);  ///< 4
@@ -232,17 +237,35 @@ class CModel {
  public:
   const int kNumVars;
   const int kNumTabs;
+  const int kDepth;
   const int kMaxDomSize;
   const int kBitDomIntSize;
   const int kBitDomsIntSize;
+  const int kAllBitDomsIntSize;
   const int kBitSupIntSize;
   const int kBitSupsIntSize;
   const int kBitSubDomsIntSize;
+  const int kSharedMemSize;
+
   // num_threads
   // 以后很有可能会放到纹理内存里
   // uint2* d_bitSup{};
   // 约束和约束的相邻关系
   i32* d_ConNeighbor{};
+  // 长度具有搜索树深度，dom等于1的变量默认它已赋值
+  i32* h_current_domain_size;
+  i32* d_current_domain_size;
+  u32* h_bitDom;
+  u32* d_bitDom;
+  // 标记赋值堆栈，相当于dense set
+  i32x2* h_assigned;
+  i32x2* d_assigned;
+
+  // 记录解：索引是变量，值是解
+  i32* d_solution;
+  i32x2* assigned;
+  thrust::host_vector<int> h_Deg;
+  thrust::device_vector<int> d_Deg;
 
   cudaArray_t cuArray_MCon{};
   cudaTextureObject_t texObj_MCon{};
@@ -257,8 +280,15 @@ class CModel {
   thrust::device_vector<uint3> d_MCon;
   thrust::device_vector<uint3> d_MConEvt;
   thrust::device_vector<int> d_ConPre;
-  thrust::host_vector<int> dom_size;
+  thrust::host_vector<int> h_dom_size;
+  thrust::host_vector<int> h_cur_dom_size;
+  thrust::device_vector<int> d_cur_dom_size;
+  thrust::device_vector<float> d_ratio();
+  // thrust::host_vector<int> d_dom_size;
+  // thrust::host_vector<int> dom_size;
 
+  // i32* h_current_domain_size;
+  // i32* d_current_domain_size;
   //
   //   __device__ __managed__ ushort4* subVar;
   ////标记子问题发生改动的变量id，初始化全部为0
@@ -287,6 +317,13 @@ class CModel {
   // 通过值(x,ith)拿到(x,ith)所在的word
   __host__ __device__ int GetBitDomByIndex(const int x, const int i) const {
     return x * GetConstantValue(kBitDomIntSize, kDeviceBitDomIntSize) + i;
+  }
+
+  // 通过值(x,ith)拿到(x,ith)所在的word
+  __host__ __device__ int GetBitDomByIndexAndLevel(const int x, const int i,
+                                                   const int level) const {
+    return level * GetConstantValue(kBitDomsIntSize, kDeviceBitDomsIntSize) +
+           x * GetConstantValue(kBitDomIntSize, kDeviceBitDomIntSize) + i;
   }
 
   // 通过值(x,a)拿到(x,a)所在的word
@@ -346,16 +383,24 @@ class CModel {
 
   int compress_Main();
 
+
+
   void BuildBitModel(const HModel& xm);
+
+  int CreateNewLevel();
+  int BackLevel() { return --current_level_; }
 
   void initialGPUConstant();
   bool enforceGAC();
   void enforceSAC();
   void solve();
-
+  int heuristic();
   void DelGPUModel() const;
 
   ~CModel();
+
+private:
+  int current_level_=0;
 };
 
 }  // namespace cpim

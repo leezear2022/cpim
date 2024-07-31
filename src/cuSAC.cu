@@ -33,6 +33,10 @@ __managed__ int* S_ConPre;
 __managed__ int3* S_ConEvt;
 __managed__ int3* S_Con;
 
+// 刚刚用于赋值的变量值设备上的
+__device__ int assigned_var;
+__device__ int assigned_val;
+
 int intsizeof(const int nbits) {
   return ((nbits + kBitsPerWord - 1) / kBitsPerWord);
 }
@@ -50,7 +54,7 @@ CModel::CModel(const HModel& xm)
       kBitSupIntSize(kMaxDomSize * kBitDomIntSize),
       kBitSupsIntSize(kMaxDomSize * kBitDomIntSize * kNumTabs),
       kBitSubDomsIntSize(kNumVars * kMaxDomSize * kBitDomsIntSize),
-      kSharedMemSize((2 * kBitDomIntSize + 1) * sizeof(u32)) {
+      kSharedMemSize((2 * kBitDomIntSize + 2) * sizeof(u32)) {
   // 检查问题不要大于kMaxNumVars
   CHECK_LE(kNumVars, kMaxNumVars)
       << "Number of variables exceeds the maximum limit of " << kMaxNumVars;
@@ -125,10 +129,16 @@ __inline__ __device__ int DeviceGetBitDomByValue(const int x, const int a) {
 __inline__ __device__ int DeviceGetBitDomByIndex(const int x, const int i) {
   return x * kDeviceBitDomIntSize + i;
 }
+// struct calculate_ratio {
+//   __host__ __device__ float operator()(const thrust::tuple<int, int>& t)
+//   const {
+//     int dom_size = thrust::get<0>(t);
+//     int deg = thrust::get<1>(t);
+//     return (dom_size != 1) ? static_cast<float>(dom_size) / deg : FLT_MAX;
+//   }
+// };
 struct calculate_ratio {
-  __host__ __device__ float operator()(const thrust::tuple<int, int>& t) const {
-    int dom_size = thrust::get<0>(t);
-    int deg = thrust::get<1>(t);
+  __host__ __device__ float operator()(int dom_size, int deg) const {
     return (dom_size != 1) ? static_cast<float>(dom_size) / deg : FLT_MAX;
   }
 };
@@ -138,13 +148,23 @@ int CModel::heuristic() {
   // 创建一个用于存储比值的设备向量
   thrust::device_vector<float> d_ratio(d_cur_dom_size.size());
 
-  // 计算比值
-  thrust::transform(thrust::make_zip_iterator(thrust::make_tuple(
-                        d_cur_dom_size.begin(), d_Deg.begin())),
-                    thrust::make_zip_iterator(
-                        thrust::make_tuple(d_cur_dom_size.end(), d_Deg.end())),
-                    d_ratio.begin(), calculate_ratio());
-
+  // // 计算比值
+  // thrust::transform(thrust::make_zip_iterator(thrust::make_tuple(
+  //                       d_cur_dom_size.begin(), d_Deg.begin())),
+  //                   thrust::make_zip_iterator(
+  //                       thrust::make_tuple(d_cur_dom_size.end(),
+  //                       d_Deg.end())),
+  //                   d_ratio.begin(), calculate_ratio());
+  //
+  // // 计算比值，从d_cur_dom_size[level * kNumVars]开始
+  // thrust::transform(d_cur_dom_size.begin() + current_level_ * kNumVars,
+  //                   d_cur_dom_size.begin() + (current_level_ + 1) * kNumVars,
+  //                   d_Deg.begin(), d_ratio.begin(), calculate_ratio());
+  //
+  // // 找到最小比值及其索引
+  // thrust::device_vector<float>::iterator min_element_iter =
+  //     thrust::min_element(d_ratio.begin(), d_ratio.end());
+  // int min_index = min_element_iter - d_ratio.begin();
   // 计算比值，从d_cur_dom_size[level * kNumVars]开始
   thrust::transform(d_cur_dom_size.begin() + current_level_ * kNumVars,
                     d_cur_dom_size.begin() + (current_level_ + 1) * kNumVars,
@@ -157,33 +177,98 @@ int CModel::heuristic() {
 
   return min_index;
 }
+//
+// // cuda版本的
+// __global__ void calculateRatiosAndFindMinIndex(const int* d_cur_dom_size,
+//                                                int deg, u32* bitDom,
+//                                                i32* assigned_at_level,
+//                                                float* d_ratio, int*
+//                                                d_min_index, int kNumVars, int
+//                                                level) {
+//   extern __shared__ float shared_data[];
+//   int tid = threadIdx.x;
+//   int idx = level * kNumVars + blockIdx.x * blockDim.x + tid;
+//
+//   if (tid < kNumVars) {
+//     d_ratio[tid] = (d_cur_dom_size[idx] != 1)
+//                        ? static_cast<float>(d_cur_dom_size[idx]) / deg
+//                        : FLT_MAX;
+//     shared_data[tid] = d_ratio[tid];
+//   } else {
+//     shared_data[tid] = FLT_MAX;
+//   }
+//   __syncthreads();
+//
+//   for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+//     if (tid < s && (tid + s) < kNumVars) {
+//       if (shared_data[tid + s] < shared_data[tid]) {
+//         shared_data[tid] = shared_data[tid + s];
+//         d_min_index[blockIdx.x] = tid + s;
+//       }
+//     }
+//     __syncthreads();
+//   }
+//
+//   if (tid == 0) {
+//     d_min_index[blockIdx.x] = shared_data[0];
+//   }
+// }
 
-// cuda版本的
-__global__ void calculateRatiosAndFindMinIndex(const int* d_cur_dom_size, int deg, float* d_ratio, int* d_min_index, int kNumVars, int level) {
-  extern __shared__ float shared_data[];
-  int tid = threadIdx.x;
-  int idx = level * kNumVars + blockIdx.x * blockDim.x + tid;
-
-  if (tid < kNumVars) {
-    d_ratio[tid] = (d_cur_dom_size[idx] != 1) ? static_cast<float>(d_cur_dom_size[idx]) / deg : FLT_MAX;
-    shared_data[tid] = d_ratio[tid];
-  } else {
-    shared_data[tid] = FLT_MAX;
+__inline__ __device__ float warpReduceMin(float val, int& idx, int& minIdx) {
+  for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+    float otherVal = __shfl_down_sync(0xFFFFFFFF, val, offset);
+    int otherIdx = __shfl_down_sync(0xFFFFFFFF, idx, offset);
+    if (otherVal < val) {
+      val = otherVal;
+      minIdx = otherIdx;
+    }
   }
+  return val;
+}
+
+__inline__ __device__ float blockReduceMin(float val, int& idx, int& minIdx) {
+  static __shared__ float shared[32];
+  static __shared__ int sharedIdx[32];
+
+  int lane = threadIdx.x % warpSize;
+  int warpId = threadIdx.x / warpSize;
+
+  val = warpReduceMin(val, idx, minIdx);
+
+  if (lane == 0) {
+    shared[warpId] = val;
+    sharedIdx[warpId] = minIdx;
+  }
+
   __syncthreads();
 
-  for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-    if (tid < s && (tid + s) < kNumVars) {
-      if (shared_data[tid + s] < shared_data[tid]) {
-        shared_data[tid] = shared_data[tid + s];
-        d_min_index[blockIdx.x] = tid + s;
-      }
-    }
-    __syncthreads();
+  val = (threadIdx.x < blockDim.x / warpSize) ? shared[lane] : FLT_MAX;
+  idx = (threadIdx.x < blockDim.x / warpSize) ? sharedIdx[lane] : -1;
+
+  if (warpId == 0) {
+    val = warpReduceMin(val, idx, minIdx);
   }
 
+  return val;
+}
+
+__global__ void calculateRatiosAndFindMinIndex(const int* d_cur_dom_size,
+                                               int deg, float* d_ratio,
+                                               int* d_min_index, int kNumVars,
+                                               int level) {
+  int idx = level * kNumVars + blockIdx.x * blockDim.x + threadIdx.x;
+  int tid = threadIdx.x;
+
+  float ratio = (d_cur_dom_size[idx] != 1)
+                    ? static_cast<float>(d_cur_dom_size[idx]) / deg
+                    : FLT_MAX;
+
+  int minIdx = idx;
+  float minValue = blockReduceMin(ratio, idx, minIdx);
+
   if (tid == 0) {
-    d_min_index[blockIdx.x] = shared_data[0];
+    d_ratio[blockIdx.x] = minValue;
+    d_min_index[blockIdx.x] = minIdx;
   }
 }
 
@@ -362,7 +447,7 @@ __global__ void CsCheckMainAfterSigned(i32* mConPre, const u32x3* mCon,
                                        u32* bitDom, const i32* dom_size,
                                        cudaTextureObject_t bitSup,
                                        cudaTextureObject_t neiCon,
-                                       int num_ConEvt, int varid, int a,
+                                       int num_ConEvt, int varid, int val_a,
                                        int action, int current_level) {
   // mCon索引ID
   const int bid = blockIdx.x;
@@ -393,15 +478,18 @@ __global__ void CsCheckMainAfterSigned(i32* mConPre, const u32x3* mCon,
   u32* s_bitDom_x = shared_mem;
   u32* s_bitDom_y = &shared_mem[kDeviceBitDomIntSize];
   u32* empty_dom = &shared_mem[2 * kDeviceBitDomIntSize];
+  u32* minValue = &shared_mem[2 * kDeviceBitDomIntSize + 1];
   if (a_0 == 0 && a_1 == 0) empty_dom[0] = 1;
 
   // 把bitDom写入两段共享内存
   // 这里把要原变量dom通过赋值，删值计算写到共享内存,再将这个值写回全局
   // 这里的a_0bitvector 的一个 int
   if (a_0 < kDeviceBitDomIntSize && a_1 == 0) {
+    // 对于删值任务，是从全局内存写入赋值的
+    assigned_var = varid;
+    const int a = assigned_val;
     if (action == 0) {
-      // 删值
-      int wordIndex = WORD_INDEX(a);
+      const int wordIndex = WORD_INDEX(a);
       if (varid == c.x && a_0 == wordIndex) {
         s_bitDom_x[a_0] =
             bitDom[level_offset + DeviceGetBitDomByIndex(xid, a_0)] &
@@ -417,10 +505,23 @@ __global__ void CsCheckMainAfterSigned(i32* mConPre, const u32x3* mCon,
       }
       // s_bitDom_x[a_0] =
     } else if (action == 1) {
-      // 赋值
-      int wordIndex = WORD_INDEX(a);
-      s_bitDom_x[a_0] = 0;
+      // 赋值,需要先找到最小值
+      // 对于赋值任务，赋值是写入全局内存的
+      // 对于删值任务，是从全局内存写入赋值的
+      assigned_var = varid;
+
+      // s_bitDom_x[a_0] = 0;
       if (varid == c.x) {
+        // 先写入局部内存a中
+        const int a = bitDom[level_offset + DeviceGetBitDomByIndex(xid, a_0)];
+        // 再计算得到最小值=a_0是dom的偏移量×32+ffs
+        // 共享内中原子写回得到最小值，
+        const int b =
+            (__ffs(a) != 0) ? a_0 * U32_BIT + (__ffs(a) - 1) : FLT_MAX;
+        atomicMin(minValue, b);
+
+        int wordIndex = WORD_INDEX(minValue[0]);
+
         s_bitDom_x[a_0] = 0;
         bitDom[level_offset + DeviceGetBitDomByIndex(xid, a_0)] = 0;
         if (a_0 == wordIndex) {
@@ -429,6 +530,16 @@ __global__ void CsCheckMainAfterSigned(i32* mConPre, const u32x3* mCon,
           bitDom[level_offset + DeviceGetBitDomByIndex(xid, a_0)] = tmp_mask;
         }
       } else if (varid == c.y) {
+        // 先写入局部内存a中
+        const int a = bitDom[level_offset + DeviceGetBitDomByIndex(yid, a_0)];
+        // 再计算得到最小值=a_0是dom的偏移量×32+ffs
+        // 共享内中原子写回得到最小值，
+        const int b =
+            (__ffs(a) != 0) ? a_0 * U32_BIT + (__ffs(a) - 1) : FLT_MAX;
+        atomicMin(minValue, b);
+
+        int wordIndex = WORD_INDEX(minValue[0]);
+
         s_bitDom_y[a_0] = 0;
         bitDom[level_offset + DeviceGetBitDomByIndex(yid, a_0)] = 0;
         if (a_0 == wordIndex) {
@@ -441,14 +552,15 @@ __global__ void CsCheckMainAfterSigned(i32* mConPre, const u32x3* mCon,
     }
   }
 
-  if (a_0 < kDeviceBitDomIntSize && a_1 == 0) {
-    s_bitDom_x[a_0] = bitDom[level_offset + DeviceGetBitDomByIndex(xid, a_0)];
-    s_bitDom_y[a_0] = bitDom[level_offset + DeviceGetBitDomByIndex(yid, a_0)];
-    // printf(
-    //     "----cid: %d, a_0: %d, a_1: %d, mConPre: %d, s_bitDom_x: %x, "
-    //     "s_bitDom_y: %x\n",
-    //     cid, a_0, a_1, mConPre[cid], s_bitDom_x[a_0], s_bitDom_y[a_0]);
-  }
+  // if (a_0 < kDeviceBitDomIntSize && a_1 == 0) {
+  //   s_bitDom_x[a_0] = bitDom[level_offset + DeviceGetBitDomByIndex(xid,
+  //   a_0)]; s_bitDom_y[a_0] = bitDom[level_offset +
+  //   DeviceGetBitDomByIndex(yid, a_0)];
+  //   // printf(
+  //   //     "----cid: %d, a_0: %d, a_1: %d, mConPre: %d, s_bitDom_x: %x, "
+  //   //     "s_bitDom_y: %x\n",
+  //   //     cid, a_0, a_1, mConPre[cid], s_bitDom_x[a_0], s_bitDom_y[a_0]);
+  // }
   __syncthreads();
 
   // 取当前值(x, a_0)是否有效
@@ -689,6 +801,7 @@ void CModel::BuildBitModel(const HModel& xm) {
   d_assigned = (i32x2*)malloc(sizeof(i32x2) * kNumVars);
   // cudaMallocManaged(&d_bitDom, sizeof(u32) * kAllBitDomsIntSize);
   // cudaMallocManaged(&M_VarPre, sizeof(int) * kNumVars);
+  d_assigned_at_level = (i32*)malloc(sizeof(i32) * kNumVars);
 
   // 初始化第0层h_bitDom和h_current_domain_size
   for (int i = 0; i < kNumVars; ++i) {
@@ -1099,6 +1212,7 @@ CModel::~CModel() {
   free (h_current_domain_size);
   cudaFree(d_assigned);
   cudaFree(d_solution);
+  cudaFree(d_assigned_at_level);
 
   cudaFree(bitSubDom);
   // cudaFree(bitSup);

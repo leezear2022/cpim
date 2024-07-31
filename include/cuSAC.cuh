@@ -260,6 +260,8 @@ class CModel {
   // 标记赋值堆栈，相当于dense set
   i32x2* h_assigned;
   i32x2* d_assigned;
+  // 变量在第几级被赋值了
+  i32* d_assigned_at_level;
 
   // 记录解：索引是变量，值是解
   i32* d_solution;
@@ -283,7 +285,8 @@ class CModel {
   thrust::host_vector<int> h_dom_size;
   thrust::host_vector<int> h_cur_dom_size;
   thrust::device_vector<int> d_cur_dom_size;
-  thrust::device_vector<float> d_ratio();
+  thrust::device_vector<float> d_ratio;
+
   // thrust::host_vector<int> d_dom_size;
   // thrust::host_vector<int> dom_size;
 

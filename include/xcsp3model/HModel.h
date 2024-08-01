@@ -235,6 +235,7 @@ class HTabNode : public Object {
   void GetORITuple(std::vector<int> &std_tuple, std::vector<int> &ori_tuple);
   bool SAT(std::vector<int> &t);
   bool SAT_STD(std::vector<int> &t);
+  int Id() const { return id; };
 
   void show();
 

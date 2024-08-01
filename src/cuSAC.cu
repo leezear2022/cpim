@@ -54,7 +54,7 @@ CModel::CModel(const HModel& xm)
       kBitSupIntSize(kMaxDomSize * kBitDomIntSize),
       kBitSupsIntSize(kMaxDomSize * kBitDomIntSize * kNumTabs),
       kBitSubDomsIntSize(kNumVars * kMaxDomSize * kBitDomsIntSize),
-      kSharedMemSize((2 * kBitDomIntSize + 2) * sizeof(u32)) {
+      kSharedMemSize((2 * kBitDomIntSize) * sizeof(u32)) {
   printf("===============build===============\n");
   // 检查问题不要大于kMaxNumVars
   CHECK_LE(kNumVars, kMaxNumVars)
@@ -74,9 +74,11 @@ CModel::CModel(const HModel& xm)
     h_Deg[i] = xm->subscriptions[v].size();
     printf("%d ", h_Deg[i]);
   }
+  printf("\n");
 
   d_Deg = h_Deg;
-  printf("\n");
+  d_ratio.resize(kNumVars);
+
   // 初始化GPU常量
   initialGPUConstant();
   // 初始化GPU数据
@@ -147,29 +149,17 @@ struct calculate_ratio {
 // 寻找dom/deg最小变量
 int CModel::heuristic() {
   // 创建一个用于存储比值的设备向量
-  thrust::device_vector<float> d_ratio(d_cur_dom_size.size());
 
-  // // 计算比值
-  // thrust::transform(thrust::make_zip_iterator(thrust::make_tuple(
-  //                       d_cur_dom_size.begin(), d_Deg.begin())),
-  //                   thrust::make_zip_iterator(
-  //                       thrust::make_tuple(d_cur_dom_size.end(),
-  //                       d_Deg.end())),
-  //                   d_ratio.begin(), calculate_ratio());
-  //
-  // // 计算比值，从d_cur_dom_size[level * kNumVars]开始
-  // thrust::transform(d_cur_dom_size.begin() + current_level_ * kNumVars,
-  //                   d_cur_dom_size.begin() + (current_level_ + 1) * kNumVars,
-  //                   d_Deg.begin(), d_ratio.begin(), calculate_ratio());
-  //
-  // // 找到最小比值及其索引
-  // thrust::device_vector<float>::iterator min_element_iter =
-  //     thrust::min_element(d_ratio.begin(), d_ratio.end());
-  // int min_index = min_element_iter - d_ratio.begin();
-  // 计算比值，从d_cur_dom_size[level * kNumVars]开始
   thrust::transform(d_cur_dom_size.begin() + current_level_ * kNumVars,
                     d_cur_dom_size.begin() + (current_level_ + 1) * kNumVars,
                     d_Deg.begin(), d_ratio.begin(), calculate_ratio());
+
+  thrust::host_vector<float> h_ratio = d_ratio;
+
+  for (int i = 0; i < h_ratio.size(); ++i) {
+    printf("h_ratio[%d] = %f\n", i, h_ratio[i]);
+  }
+  printf("\n");
 
   // 找到最小比值及其索引
   thrust::device_vector<float>::iterator min_element_iter =
@@ -254,25 +244,38 @@ __inline__ __device__ float blockReduceMin(float val, int& idx, int& minIdx) {
 }
 
 __global__ void calculateRatiosAndFindMinIndex(const int* d_cur_dom_size,
-                                               int deg, float* d_ratio,
-                                               int* d_min_index, int kNumVars,
+                                               int* deg, int kNumVars,
                                                int level) {
-  int idx = level * kNumVars + blockIdx.x * blockDim.x + threadIdx.x;
-  int tid = threadIdx.x;
+  extern __shared__ float shared_ratio[];
+  extern __shared__ int shared_index[];
 
-  float ratio = (d_cur_dom_size[idx] != 1)
-                    ? static_cast<float>(d_cur_dom_size[idx]) / deg
+  int tid = threadIdx.x;
+  int idx = level * kNumVars + tid;
+
+  float ratio = (tid < kNumVars && d_cur_dom_size[idx] != 1)
+                    ? static_cast<float>(d_cur_dom_size[idx]) / deg[idx]
                     : FLT_MAX;
 
-  int minIdx = idx;
-  float minValue = blockReduceMin(ratio, idx, minIdx);
+  shared_ratio[tid] = ratio;
+  shared_index[tid] = tid;
+
+  __syncthreads();
+
+  // Perform reduction in shared memory
+  for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s && shared_ratio[tid + s] < shared_ratio[tid]) {
+      shared_ratio[tid] = shared_ratio[tid + s];
+      shared_index[tid] = shared_index[tid + s];
+    }
+    __syncthreads();
+  }
 
   if (tid == 0) {
-    d_ratio[blockIdx.x] = minValue;
-    d_min_index[blockIdx.x] = minIdx;
+    // d_ratio[0] = shared_ratio[0];
+    // d_min_index[0] = shared_index[0];
+    printf("d_min_index[%d] = %f\n", tid, shared_index[0]);
   }
 }
-
 // 定义结构体用于计算dom/deg
 
 // 每个线程对应一个论域
@@ -396,7 +399,7 @@ __global__ void CsCheckMain(i32* mConPre, const u32x3* mCon, u32* bitDom,
         if (!(old_domian_size - delete_num_values)) GAC_success = false;
         // if (oldVal & vote_x != 0) empty_dom[0] = 0;
         printf(
-            "x_v: %d, bitDom = %x, ori = %x, now = %x, changey = %d, "
+            "x_v: %d, bitDom = %x, ori = %x, now = %x, changex = %d, "
             "delete_num_values = %d\n",
             xid, vote_x, oldVal,
             bitDom[level_offset + DeviceGetBitDomByIndex(xid, bitIdx)], changex,
@@ -450,24 +453,20 @@ __global__ void CsCheckMain(i32* mConPre, const u32x3* mCon, u32* bitDom,
   // TODO::两次可以合到一起
   if (GAC_success && changex) {
     for (int idx = tid; idx < kDeviceNumTabs; idx += blockDim.x * blockDim.y) {
-      if (idx < kDeviceNumTabs) {
-        auto val = tex2D<int>(neiCon, idx, xid);
-        printf("xid: %d, tid: %d = %d\n", xid, tid, val);
-        if (val != 0) {
-          mConPre[idx] = 1;
-        }
+      auto val = tex2D<int>(neiCon, idx, xid);
+      printf("xid: %d, tid: %d = %d\n", xid, tid, val);
+      if (val != 0) {
+        mConPre[idx] = 1;
       }
     }
   }
 
   if (GAC_success && changey) {
     for (int idx = tid; idx < kDeviceNumTabs; idx += blockDim.x * blockDim.y) {
-      if (idx < kDeviceNumTabs) {
-        auto val = tex2D<int>(neiCon, idx, yid);
-        printf("yid: %d, tid: %d = %d\n", yid, tid, val);
-        if (val != 0) {
-          mConPre[idx] = 1;
-        }
+      auto val = tex2D<int>(neiCon, idx, yid);
+      printf("yid: %d, tid: %d = %d\n", yid, tid, val);
+      if (val != 0) {
+        mConPre[idx] = 1;
       }
     }
   }
@@ -1211,16 +1210,17 @@ bool CModel::enforceGAC() {
       return false;
     }
     printf("-----------end iteration-----------\n");
-    std::cout << "h_ConPre: ";
-    thrust::host_vector<int> h_ConPre = d_ConPre;
-    for (size_t i = 0; i < h_ConPre.size(); ++i) {
-      std::cout << h_ConPre[i] << " ";
-    }
-    std::cout << std::endl;
+    // std::cout << "h_ConPre: ";
+    // thrust::host_vector<int> h_ConPre = d_ConPre;
+    // for (size_t i = 0; i < h_ConPre.size(); ++i) {
+    //   std::cout << h_ConPre[i] << " ";
+    // }
+    // std::cout << std::endl;
 
     num_ConEvt = compress_Main();
     // return true;
   }
+
   return true;
 }
 
@@ -1290,7 +1290,14 @@ bool CModel::enforceGAC() {
 
 void CModel::enforceSAC() {}
 
-void CModel::solve() {}
+void CModel::solve() {
+  enforceGAC();
+  auto varid = heuristic();
+  calculateRatiosAndFindMinIndex<<<1, kNumVars>>>(
+      d_current_domain_size, thrust::raw_pointer_cast(d_Deg.data()), kNumVars,
+      current_level_);
+  // printf("varid = %d\n", varid);
+}
 
 CModel::~CModel() {
   LOG(INFO) << "CModel析构函数";

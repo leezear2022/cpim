@@ -43,7 +43,8 @@ int main(int argc, char* argv[]) {
 
   delete n;
   CModel cm(hm);
-  cm.enforceGAC();
+  // cm.solve();
+  // cm.enforceGAC();
   // cm.BuildBitModel(hm);
   // cm.DelGPUModel();
   // BuildBitModel(hm);

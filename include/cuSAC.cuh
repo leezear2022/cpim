@@ -286,7 +286,7 @@ class CModel {
   thrust::host_vector<int> h_cur_dom_size;
   thrust::device_vector<int> d_cur_dom_size;
   thrust::device_vector<float> d_ratio;
-
+  
   // thrust::host_vector<int> d_dom_size;
   // thrust::host_vector<int> dom_size;
 

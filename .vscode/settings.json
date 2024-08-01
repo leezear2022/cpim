@@ -67,6 +67,12 @@
         "semaphore": "cpp",
         "stop_token": "cpp",
         "thread": "cpp",
-        "__nullptr": "cpp"
+        "__nullptr": "cpp",
+        "any": "cpp",
+        "charconv": "cpp",
+        "list": "cpp",
+        "format": "cpp",
+        "span": "cpp",
+        "variant": "cpp"
     }
 }

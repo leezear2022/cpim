@@ -11,6 +11,7 @@
 #include <thrust/host_vector.h>
 
 // #include "cuda_runtime_api.h"
+#include "Solver.h"
 #include "xcsp3model/HModel.h"
 namespace cpim {
 
@@ -257,11 +258,16 @@ class CModel {
   i32* d_current_domain_size;
   u32* h_bitDom;
   u32* d_bitDom;
-  // 标记赋值堆栈，相当于dense set
-  i32x2* h_assigned;
-  i32x2* d_assigned;
+
+
   // 变量在第几级被赋值了
   i32* d_assigned_at_level;
+
+  thrust::device_vector<u32x3> d_subscription;
+  thrust::host_vector<u32x3> h_subscription;
+  // 长度kNumVars+1
+  thrust::device_vector<int> d_subscription_offset;
+  thrust::host_vector<int> h_subscription_offset;
 
   // 记录解：索引是变量，值是解
   i32* d_solution;
@@ -286,7 +292,8 @@ class CModel {
   thrust::host_vector<int> h_cur_dom_size;
   thrust::device_vector<int> d_cur_dom_size;
   thrust::device_vector<float> d_ratio;
-  
+  SearchStatistics statistics_;
+
   // thrust::host_vector<int> d_dom_size;
   // thrust::host_vector<int> dom_size;
 
@@ -373,20 +380,17 @@ class CModel {
   // // t.x = x, a
   // // t.y = y, a
   // // 若维度是[e][d/w][d],因此索引的计算公式如下:
-  __host__ __device__ inline int2 GetBitSupIndexByTuple_C_MDINTS_MDS(const int cid, const int2 t) {
+  __host__ __device__ inline int2 GetBitSupIndexByTuple_C_MDINTS_MDS(
+      const int cid, const int2 t) {
     int bitSupIntSize = GetConstantValue(kBitSupIntSize, kDeviceBitSupIntSize);
     int maxDomSize = GetConstantValue(kMaxDomSize, kDeviceMaxDomSize);
-    return make_int2(
-        cid * bitSupIntSize + (t.y >> U32_POS) * maxDomSize + t.x,
-        cid * bitSupIntSize + (t.x >> U32_POS) * maxDomSize + t.y
-    );
+    return make_int2(cid * bitSupIntSize + (t.y >> U32_POS) * maxDomSize + t.x,
+                     cid * bitSupIntSize + (t.x >> U32_POS) * maxDomSize + t.y);
   }
 
   explicit CModel(const HModel& xm);
 
   int compress_Main();
-
-
 
   void BuildBitModel(const HModel& xm);
 
@@ -395,15 +399,16 @@ class CModel {
 
   void initialGPUConstant();
   bool enforceGAC();
+  bool enforceGAC(int var, int type);
   void enforceSAC();
-  void solve();
+  SearchStatistics solve(const float time_limits);
   int heuristic();
   void DelGPUModel() const;
 
   ~CModel();
 
-private:
-  int current_level_=0;
+ private:
+  int current_level_ = 0;
 };
 
 }  // namespace cpim

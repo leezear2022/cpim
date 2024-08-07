@@ -7,7 +7,7 @@
 #include "cuSAC.cuh"
 
 namespace cpim {
-
+// #define RATO_MAX __FLT_MAX__ - 1;
 // 初始化常量
 __constant__ int kDeviceBitDomIntSize;
 __constant__ int kDeviceMaxDomSize;
@@ -33,9 +33,17 @@ __managed__ int* S_ConPre;
 __managed__ int3* S_ConEvt;
 __managed__ int3* S_Con;
 
-// 刚刚用于赋值的变量值设备上的
-__device__ int assigned_var;
-__device__ int assigned_val;
+// // 刚刚用于赋值的变量值设备上的
+// __device__ int assigned_var;
+// __device__ int assigned_val;
+
+// 赋值栈
+// __device__ int2* assigned;
+// 栈定标记
+// 标记赋值堆栈,及栈顶
+// i32x2* h_assigned;
+i32x2* d_assigned;
+__device__ int d_assigned_size = 0;
 
 int intsizeof(const int nbits) {
   return ((nbits + kBitsPerWord - 1) / kBitsPerWord);
@@ -59,6 +67,8 @@ CModel::CModel(const HModel& xm)
   // 检查问题不要大于kMaxNumVars
   CHECK_LE(kNumVars, kMaxNumVars)
       << "Number of variables exceeds the maximum limit of " << kMaxNumVars;
+  // 初始化GPU常量
+  initialGPUConstant();
 
   h_dom_size.resize(kNumVars);
   for (int i = 0; i < kNumVars; ++i) {
@@ -77,10 +87,9 @@ CModel::CModel(const HModel& xm)
   printf("\n");
 
   d_Deg = h_Deg;
-  d_ratio.resize(kNumVars);
+  d_ratio.resize(kNumVars + 1);
+  d_ratio[kNumVars] = FLT_MAX;
 
-  // 初始化GPU常量
-  initialGPUConstant();
   // 初始化GPU数据
   BuildBitModel(xm);
 }
@@ -142,14 +151,13 @@ __inline__ __device__ int DeviceGetBitDomByIndex(const int x, const int i) {
 // };
 struct calculate_ratio {
   __host__ __device__ float operator()(int dom_size, int deg) const {
-    return (dom_size != 1) ? static_cast<float>(dom_size) / deg : FLT_MAX;
+    return (dom_size != 1) ? static_cast<float>(dom_size) / deg : FLT_MAX - 1;
   }
 };
 
 // 寻找dom/deg最小变量
 int CModel::heuristic() {
   // 创建一个用于存储比值的设备向量
-
   thrust::transform(d_cur_dom_size.begin() + current_level_ * kNumVars,
                     d_cur_dom_size.begin() + (current_level_ + 1) * kNumVars,
                     d_Deg.begin(), d_ratio.begin(), calculate_ratio());
@@ -205,8 +213,11 @@ int CModel::heuristic() {
 //   }
 // }
 
+// 线程束级别归约函数
 __inline__ __device__ float warpReduceMin(float val, int& idx, int& minIdx) {
+  printf("val = %f, idx = %d\n", val, idx);
   for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+    printf("---------------\n");
     float otherVal = __shfl_down_sync(0xFFFFFFFF, val, offset);
     int otherIdx = __shfl_down_sync(0xFFFFFFFF, idx, offset);
     if (otherVal < val) {
@@ -217,66 +228,186 @@ __inline__ __device__ float warpReduceMin(float val, int& idx, int& minIdx) {
   return val;
 }
 
+// 块级别归约函数，使用共享内存
 __inline__ __device__ float blockReduceMin(float val, int& idx, int& minIdx) {
-  static __shared__ float shared[32];
-  static __shared__ int sharedIdx[32];
+  extern __shared__ float shared[];
+  float* sharedVals = shared;
+  int* sharedIdxs = (int*)&shared[blockDim.x];
 
-  int lane = threadIdx.x % warpSize;
-  int warpId = threadIdx.x / warpSize;
-
-  val = warpReduceMin(val, idx, minIdx);
-
-  if (lane == 0) {
-    shared[warpId] = val;
-    sharedIdx[warpId] = minIdx;
-  }
-
+  int tid = threadIdx.x;
+  sharedVals[tid] = val;
+  sharedIdxs[tid] = idx;
+  printf("sharedVals[%d] = %f, sharedIdxs[%d] = %d\n", tid, sharedVals[tid],
+         tid, sharedIdxs[tid]);
   __syncthreads();
 
-  val = (threadIdx.x < blockDim.x / warpSize) ? shared[lane] : FLT_MAX;
-  idx = (threadIdx.x < blockDim.x / warpSize) ? sharedIdx[lane] : -1;
+  printf("val = %f, idx = %d\n", val, idx);
+  for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+    printf("---------------\n");
+    float otherVal = __shfl_down_sync(0xFFFFFFFF, val, offset);
+    int otherIdx = __shfl_down_sync(0xFFFFFFFF, idx, offset);
+    printf("otherVal = %f, otherIdx = %d\n", otherVal, otherIdx);
+    if (otherVal < val) {
+      val = otherVal;
+      minIdx = otherIdx;
+    }
+  }
+  // 线程束内归约
+  // val = warpReduceMin(val, idx, minIdx);
 
-  if (warpId == 0) {
+  // 将线程束的结果写入共享内存
+  if ((tid % warpSize) == 0) {
+    sharedVals[tid / warpSize] = val;
+    sharedIdxs[tid / warpSize] = minIdx;
+  }
+  __syncthreads();
+
+  // 仅在块内第一个线程束内进行最终归约
+  if (tid < warpSize) {
+    val = (tid < (blockDim.x / warpSize)) ? sharedVals[tid] : FLT_MAX;
+    idx = (tid < (blockDim.x / warpSize)) ? sharedIdxs[tid] : -1;
     val = warpReduceMin(val, idx, minIdx);
   }
 
   return val;
 }
 
+// __global__ void calculateRatiosAndFindMinIndex(const int* d_cur_dom_size,
+//                                                int* deg, int kNumVars,
+//                                                int level) {
+//   extern __shared__ float shared[];
+//   float* shared_ratio = shared;
+//   int* shared_index = (int*)&shared[blockDim.x];
+
+//   int tid = threadIdx.x;
+//   int idx = level * kNumVars + tid;
+//   const int dom_size = d_cur_dom_size[idx];
+//   const int degv = deg[tid];
+//   printf("dom_size[%d] = %d, degv[%d] = %d\n", tid, dom_size, tid, degv);
+//   float ratio = (tid < kNumVars && dom_size != 1 && degv != 0)
+//                     ? static_cast<float>(dom_size) / degv
+//                     : FLT_MAX;
+//   printf("ratio[%d] = %f\n", tid, ratio);
+//   __syncthreads();
+//   shared_ratio[tid] = ratio;
+//   shared_index[tid] = tid;
+//   // __syncthreads();
+//   printf("shared_index[%d] = %d, shared_ratio[%d]=%f\n", tid,
+//   shared_index[tid],
+//          tid, shared_ratio[tid]);
+//   __syncthreads();
+//   int minIdx = tid;
+//   float minValue = blockReduceMin(ratio, minIdx, shared_index[tid]);
+
+//   printf("val = %f, idx = %d\n", val, idx);
+//   for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+//     printf("---------------\n");
+//     float otherVal = __shfl_down_sync(0xFFFFFFFF, val, offset);
+//     int otherIdx = __shfl_down_sync(0xFFFFFFFF, idx, offset);
+//     printf("otherVal = %f, otherIdx = %d\n", otherVal, otherIdx);
+//     if (otherVal < val) {
+//       val = otherVal;
+//       minIdx = otherIdx;
+//     }
+//   }
+
+//   if (tid == 0) {
+//     // d_ratio[0] = minValue;
+//     // d_min_index[0] = shared_index[0];
+//     printf("d_min_index[0] = %d\n", shared_index[0]);
+//   }
+// }
+
+// // CUDA内核函数，用于计算比值并找到最小值的索引
+// __global__ void calculateRatiosAndFindMinIndex(const int* d_cur_dom_size,
+//                                                int deg, float* d_ratio,
+//                                                int* d_min_index, int
+//                                                kNumVars, int level) {
+//   int tid = threadIdx.x;
+//   int idx = level * kNumVars + tid;
+
+//   float ratio = (tid < kNumVars && d_cur_dom_size[idx] != 1)
+//                     ? static_cast<float>(d_cur_dom_size[idx]) / deg
+//                     : FLT_MAX;
+
+//   int minIdx = idx;
+//   float minValue = blockReduceMin(ratio, idx, minIdx);
+
+//   if (tid == 0) {
+//     d_ratio[0] = minValue;
+//     d_min_index[0] = minIdx;
+//   }
+// }
+// 定义结构体用于计算dom/deg
+
+// CUDA内核函数，用于计算比值并找到最小值的索引
 __global__ void calculateRatiosAndFindMinIndex(const int* d_cur_dom_size,
-                                               int* deg, int kNumVars,
+                                               const int* deg, int kNumVars,
                                                int level) {
-  extern __shared__ float shared_ratio[];
-  extern __shared__ int shared_index[];
+  extern __shared__ float shared[];
+  float* shared_ratio = shared;
+  int* shared_index = (int*)&shared[blockDim.x * sizeof(float)];
 
   int tid = threadIdx.x;
   int idx = level * kNumVars + tid;
 
-  float ratio = (tid < kNumVars && d_cur_dom_size[idx] != 1)
-                    ? static_cast<float>(d_cur_dom_size[idx]) / deg[idx]
+  const int dom_size = d_cur_dom_size[idx];
+  const int degv = deg[tid];
+  float ratio = (tid < kNumVars && dom_size != 1 && degv != 0)
+                    ? static_cast<float>(dom_size) / degv
                     : FLT_MAX;
-
+  printf("ratio[%d] = %f\n", tid, ratio);
   shared_ratio[tid] = ratio;
-  shared_index[tid] = tid;
-
+  shared_index[tid] = idx;
   __syncthreads();
 
-  // Perform reduction in shared memory
-  for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-    if (tid < s && shared_ratio[tid + s] < shared_ratio[tid]) {
-      shared_ratio[tid] = shared_ratio[tid + s];
-      shared_index[tid] = shared_index[tid + s];
+  // 线程束级别归约
+  for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+    float otherVal = __shfl_down_sync(0xFFFFFFFF, ratio, offset);
+    int otherIdx = __shfl_down_sync(0xFFFFFFFF, idx, offset);
+
+    if (otherVal < ratio && otherVal > 0) {
+      printf("otherVal = %f, otherIdx = %d, ratio = %f\n", otherVal, otherIdx,
+             ratio);
+      ratio = otherVal;
+      idx = otherIdx;
     }
-    __syncthreads();
+  }
+
+  // 将线程束的结果写入共享内存
+  if ((tid % warpSize) == 0) {
+    shared_ratio[tid / warpSize] = ratio;
+    shared_index[tid / warpSize] = idx;
+    printf("ratio = %f, idx = %d\n", ratio, idx);
+  }
+  __syncthreads();
+
+  // 仅在块内第一个线程束内进行最终归约
+  if (tid < warpSize) {
+    if (tid < (blockDim.x / warpSize)) {
+      ratio = shared_ratio[tid];
+      idx = shared_index[tid];
+    } else {
+      ratio = FLT_MAX;
+      idx = -1;
+    }
+    printf("3ratio = %f, idx = %d\n", ratio, idx);
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+      float otherVal = __shfl_down_sync(0xFFFFFFFF, ratio, offset);
+      int otherIdx = __shfl_down_sync(0xFFFFFFFF, idx, offset);
+      if (otherVal < ratio) {
+        ratio = otherVal;
+        idx = otherIdx;
+      }
+    }
   }
 
   if (tid == 0) {
-    // d_ratio[0] = shared_ratio[0];
-    // d_min_index[0] = shared_index[0];
-    printf("d_min_index[%d] = %f\n", tid, shared_index[0]);
+    // d_ratio[0] = ratio;
+    // d_min_index[0] = idx;
+    printf("d_min_index[0] = %d\n", idx);
   }
 }
-// 定义结构体用于计算dom/deg
 
 // 每个线程对应一个论域
 __global__ void CsCheckMain(i32* mConPre, const u32x3* mCon, u32* bitDom,
@@ -473,13 +604,58 @@ __global__ void CsCheckMain(i32* mConPre, const u32x3* mCon, u32* bitDom,
   // printf("end check\n");
 }
 
-// action = 0 是删值，action=1是赋值
-__global__ void CsCheckMainAfterSigned(i32* mConPre, const u32x3* mCon,
-                                       u32* bitDom, const i32* dom_size,
-                                       cudaTextureObject_t bitSup,
-                                       cudaTextureObject_t neiCon,
-                                       int num_ConEvt, int varid, int val_a,
-                                       int action, int current_level) {
+// 这里只提供值
+__global__ void AssignedValue(int2* assigned, int varid, int current_level) {
+  // 在一个线程束内完成，因为只能改变一个变量论域，它不大于1024，所以是一个里完成
+  int tid = threadIdx.x;
+  u32 bd = 0;
+
+  int level_offset = current_level * kDeviceBitDomsIntSize;
+  u32 bd = 0;
+  if (tid < kDeviceBitDomIntSize) {
+    bd = bitDom[level_offset + DeviceGetBitDomByIndex(varid, tid)];
+    bitDom[level_offset + DeviceGetBitDomByIndex(varid, tid)] = 0;
+  }
+
+  // 每个线程拿到一个bitDom, 一个线程束肯定能拿完该变量所有的bitDom
+  // 检查当前bitdom在u32是否为0，投票取mask，然后取第一个
+  // 看看哪个变量被赋值了
+  // 计算最小值，并赋值
+
+  u32 nonZero_bitdom = __ballot_sync(0xFFFFFFFF, bd != 0);
+  int offset_int_idx = __ffs(nonZero_bitdom) - 1;
+
+  // printf(
+  //     "varid == c.x, cid: %d, c.x: %d, c.y: %d, varid: %d, bd: %x, tid:
+  //     "
+  //     "%d, nonZero_bitdom: %x, offset_int_idx: %d\n",
+  //     cid, c.x, c.y, varid, bd, tid, nonZero_bitdom, offset_int_idx);
+
+  // 计算最小值，修改全局变量和共享内存和bitDom
+  if (tid == offset_int_idx) {
+    int ffs = __ffs(bd) - 1;
+    int min_value = offset_int_idx * U32_BIT + ffs;
+    assigned[current_level].y = min_value;
+    // s_bitDom_x[offset_int_idx] = 1U << WORD_OFFSET(ffs);
+    bitDom[level_offset + DeviceGetBitDomByIndex(varid, tid)] =
+        1U << WORD_OFFSET(ffs);
+    assigned[current_level].x = varid;
+    assigned[current_level].y = min_value;
+    printf("min_value: (%d, %d)\n", varid, min_value);
+  }
+
+  if (tid < kDeviceBitDomIntSize) {
+    u32 xx = bitDom[level_offset + DeviceGetBitDomByIndex(varid, tid)];
+    printf("var: %d, bitDom: %x\n", varid, xx);
+  }
+}
+
+// 每个线程对应一个论域
+__global__ void CsCheckMainAfterDecision(
+    i32* mConPre, const u32x3* mCon, const u32x3* sub, const int* sub_offset,
+    u32* bitDom, i32* dom_size, cudaTextureObject_t bitSup,
+    cudaTextureObject_t neiCon, int num_ConEvt, int2* assigned, int varid,
+    int action, int current_level) {
   // mCon索引ID
   const int bid = blockIdx.x;
   // bitDom索引
@@ -487,112 +663,155 @@ __global__ void CsCheckMainAfterSigned(i32* mConPre, const u32x3* mCon,
   // bitDom索引
   const int a_1 = threadIdx.y;
   // 块内全局线程索引
-  const int tid = threadIdx.x + threadIdx.y * blockDim.x;
+  // const int tid = threadIdx.x + threadIdx.y * blockDim.x;
+  const int tid = threadIdx.y * blockDim.x + threadIdx.x;
   // 计算当前层的偏移量
   int level_offset = current_level * kDeviceBitDomsIntSize;
 
-  // printf("bid: %d, a_0: %d, a_1: %d, num_ConEvt: %d\n", bid, a_0, a_1,
-  //        num_ConEvt);
+  // printf("bid: %d, a_0: %d, a_1: %d\n", bid, a_0, a_1);
+  // auto asg = assigned
 
+  // const auto asg = assigned[d_assigned_size];
   // 每个线程都拿到当前约束信息
-  auto c = mCon[bid];
+  int offs = bid + sub_offset[varid];
+  auto c = sub[offs];
   const int xid = c.x;
   const int yid = c.y;
   const int cid = c.z;
+  if (tid == 0) {
+    printf(
+        "cid: %d, cx: %d, cy: %d, varid: %d, action: %d, current_level: %d\n",
+        cid, c.x, c.y, varid, action, current_level);
+  }
 
+  // return;
   // 动态分配共享内存，共三段：
   // 1. bitDom[x]
   // 2. bitDom[y]
   // 3. empty_dom，用于标记失败，默认值是1，即假设它失败，
   //    在最后检查的时候，如有一段word非空则置为0。
+
   extern __shared__ u32 shared_mem[];
   u32* s_bitDom_x = shared_mem;
   u32* s_bitDom_y = &shared_mem[kDeviceBitDomIntSize];
-  u32* empty_dom = &shared_mem[2 * kDeviceBitDomIntSize];
-  u32* minValue = &shared_mem[2 * kDeviceBitDomIntSize + 1];
-  if (a_0 == 0 && a_1 == 0) empty_dom[0] = 1;
 
-  // 把bitDom写入两段共享内存
-  // 这里把要原变量dom通过赋值，删值计算写到共享内存,再将这个值写回全局
-  // 这里的a_0bitvector 的一个 int
+  __shared__ int min_value;
+  __shared__ int changex;
+  __shared__ int changey;
+  __shared__ int s_assigned_var;
+  // __shared__ int s_assigned_var_idx;
+  __shared__ int s_assigned_val;
+  // int assi_id = xid == varid ? xid : yid;
+
+  // 块内的第一个线程修改下面的值
+  // 刚赋值的变量给全局
+  // 默认xy都改动了
+  if (tid == 0) {
+    changex = 0;
+    changey = 0;
+    s_assigned_var = varid;
+    // 全局赋值堆栈是一个数组
+    assigned[current_level].x = varid;
+    // assigned_var = varid;
+  }
+  // return;
+  // 先把bitDom写入两段共享内存
   if (a_0 < kDeviceBitDomIntSize && a_1 == 0) {
-    // 对于删值任务，是从全局内存写入赋值的
-    assigned_var = varid;
-    const int a = assigned_val;
-    if (action == 0) {
-      const int wordIndex = WORD_INDEX(a);
-      if (varid == c.x && a_0 == wordIndex) {
-        s_bitDom_x[a_0] =
-            bitDom[level_offset + DeviceGetBitDomByIndex(xid, a_0)] &
-            ~(1U << WORD_OFFSET(a));
-        bitDom[level_offset + DeviceGetBitDomByIndex(xid, a_0)] &=
-            ~(1U << WORD_OFFSET(a));
-      } else if (varid == c.y && a_0 == wordIndex) {
-        s_bitDom_y[a_0] =
-            bitDom[level_offset + DeviceGetBitDomByIndex(yid, a_0)] &
-            ~(1U << WORD_OFFSET(a));
-        bitDom[level_offset + DeviceGetBitDomByIndex(yid, a_0)] &=
-            ~(1U << WORD_OFFSET(a));
-      }
-      // s_bitDom_x[a_0] =
-    } else if (action == 1) {
-      // 赋值,需要先找到最小值
-      // 对于赋值任务，赋值是写入全局内存的
-      // 对于删值任务，是从全局内存写入赋值的
-      assigned_var = varid;
+    s_bitDom_x[a_0] = bitDom[level_offset + DeviceGetBitDomByIndex(xid, a_0)];
+    s_bitDom_y[a_0] = bitDom[level_offset + DeviceGetBitDomByIndex(yid, a_0)];
+    printf("cid: %d, s_bitDom: %x, %x\n", cid, s_bitDom_x[a_0],
+           s_bitDom_y[a_0]);
+  }
+  __syncthreads();
+  // 先计算varid的最小值，
 
-      // s_bitDom_x[a_0] = 0;
+  // 仅第一个线程束工作，因为kBitDomIntSize<32
+  // if (tid / warpSize == 0) {
+  // 如果是赋值，我不知道最小值是多少先算最小值赋值给全局变量
+  if (action == 1) {
+    u32 bd = 0;
+    // 每个线程拿到一个bitDom, 一个线程束肯定能拿完该变量所有的bitDom
+    // 检查当前bitdom在u32是否为0，投票取mask，然后取第一个
+    if (tid < kDeviceBitDomIntSize) {
+      // 看看哪个变量被赋值了
       if (varid == c.x) {
-        // 先写入局部内存a中
-        const int a = bitDom[level_offset + DeviceGetBitDomByIndex(xid, a_0)];
-        // 再计算得到最小值=a_0是dom的偏移量×32+ffs
-        // 共享内中原子写回得到最小值，
-        const int b =
-            (__ffs(a) != 0) ? a_0 * U32_BIT + (__ffs(a) - 1) : FLT_MAX;
-        atomicMin(minValue, b);
+        // 计算最小值，并赋值
+        bd = s_bitDom_x[tid];
+        u32 nonZero_bitdom = __ballot_sync(0xFFFFFFFF, bd != 0);
+        int offset_int_idx = __ffs(nonZero_bitdom) - 1;
+        s_bitDom_x[tid] = 0;
+        bitDom[level_offset + DeviceGetBitDomByIndex(xid, tid)] = 0;
+        // printf(
+        //     "varid == c.x, cid: %d, c.x: %d, c.y: %d, varid: %d, bd: %x, tid:
+        //     "
+        //     "%d, nonZero_bitdom: %x, offset_int_idx: %d\n",
+        //     cid, c.x, c.y, varid, bd, tid, nonZero_bitdom, offset_int_idx);
 
-        int wordIndex = WORD_INDEX(minValue[0]);
-
-        s_bitDom_x[a_0] = 0;
-        bitDom[level_offset + DeviceGetBitDomByIndex(xid, a_0)] = 0;
-        if (a_0 == wordIndex) {
-          const u32 tmp_mask = ~(1U << WORD_OFFSET(a));
-          s_bitDom_x[a_0] = tmp_mask;
-          bitDom[level_offset + DeviceGetBitDomByIndex(xid, a_0)] = tmp_mask;
+        // 计算最小值，修改全局变量和共享内存和bitDom
+        if (tid == offset_int_idx) {
+          int ffs = __ffs(bd) - 1;
+          min_value = offset_int_idx * U32_BIT + ffs;
+          assigned[current_level].y = min_value;
+          s_bitDom_x[offset_int_idx] = 1U << WORD_OFFSET(ffs);
+          bitDom[level_offset + DeviceGetBitDomByIndex(xid, tid)] =
+              1U << WORD_OFFSET(ffs);
+          printf("min_value: %d, s_bitDom_y: %d\n", min_value,
+                 s_bitDom_x[offset_int_idx]);
         }
+
       } else if (varid == c.y) {
-        // 先写入局部内存a中
-        const int a = bitDom[level_offset + DeviceGetBitDomByIndex(yid, a_0)];
-        // 再计算得到最小值=a_0是dom的偏移量×32+ffs
-        // 共享内中原子写回得到最小值，
-        const int b =
-            (__ffs(a) != 0) ? a_0 * U32_BIT + (__ffs(a) - 1) : FLT_MAX;
-        atomicMin(minValue, b);
+        // 计算最小值，并赋值
+        bd = s_bitDom_y[tid];
+        u32 nonZero_bitdom = __ballot_sync(0xFFFFFFFF, bd != 0);
+        int offset_int_idx = __ffs(nonZero_bitdom) - 1;
+        s_bitDom_y[tid] = 0;
+        bitDom[level_offset + DeviceGetBitDomByIndex(yid, tid)] = 0;
+        // printf(
+        //     "varid == c.y, cid: %d, c.x: %d, c.y: %d, varid: %d, bd: %x, tid:
+        //     "
+        //     "%d, nonZero_bitdom: %x, offset_int_idx: %d\n",
+        //     cid, c.x, c.y, varid, bd, tid, nonZero_bitdom, offset_int_idx);
+        // 计算最小值，修改全局变量和共享内存和bitDom
+        if (tid == offset_int_idx) {
+          int ffs = __ffs(bd) - 1;
+          min_value = offset_int_idx * U32_BIT + ffs;
+          assigned[current_level].y = min_value;
 
-        int wordIndex = WORD_INDEX(minValue[0]);
+          s_bitDom_y[offset_int_idx] = 1U << WORD_OFFSET(ffs);
+          bitDom[level_offset + DeviceGetBitDomByIndex(yid, tid)] =
+              1U << WORD_OFFSET(ffs);
 
-        s_bitDom_y[a_0] = 0;
-        bitDom[level_offset + DeviceGetBitDomByIndex(yid, a_0)] = 0;
-        if (a_0 == wordIndex) {
-          const u32 tmp_mask = ~(1U << WORD_OFFSET(a));
-          s_bitDom_y[a_0] = tmp_mask;
-          bitDom[level_offset + DeviceGetBitDomByIndex(yid, a_0)] = tmp_mask;
+          printf("min_value: %d, s_bitDom_y: %d\n", min_value,
+                 s_bitDom_y[offset_int_idx]);
         }
       }
-    } else {
     }
   }
 
-  // if (a_0 < kDeviceBitDomIntSize && a_1 == 0) {
-  //   s_bitDom_x[a_0] = bitDom[level_offset + DeviceGetBitDomByIndex(xid,
-  //   a_0)]; s_bitDom_y[a_0] = bitDom[level_offset +
-  //   DeviceGetBitDomByIndex(yid, a_0)];
-  //   // printf(
-  //   //     "----cid: %d, a_0: %d, a_1: %d, mConPre: %d, s_bitDom_x: %x, "
-  //   //     "s_bitDom_y: %x\n",
-  //   //     cid, a_0, a_1, mConPre[cid], s_bitDom_x[a_0], s_bitDom_y[a_0]);
+  if (action == 0) {
+    // 如果是删值，被删的值从全局变量里取出,先存在共享内存
+    s_assigned_val = assigned[current_level].x;
+    int a = assigned[current_level].y;
+    const int wordIndex = WORD_INDEX(a);
+    if (varid == c.x && tid == wordIndex) {
+      s_bitDom_x[a_0] =
+          bitDom[level_offset + DeviceGetBitDomByIndex(xid, a_0)] &
+          ~(1U << WORD_OFFSET(a));
+      bitDom[level_offset + DeviceGetBitDomByIndex(xid, a_0)] &=
+          ~(1U << WORD_OFFSET(a));
+    } else if (varid == c.y && a_0 == wordIndex) {
+      s_bitDom_y[a_0] =
+          bitDom[level_offset + DeviceGetBitDomByIndex(yid, a_0)] &
+          ~(1U << WORD_OFFSET(a));
+      bitDom[level_offset + DeviceGetBitDomByIndex(yid, a_0)] &=
+          ~(1U << WORD_OFFSET(a));
+    }
+  }
+
   // }
-  __syncthreads();
+  // return;
+  // __syncthreads();
+  // __syncthreads();
 
   // 取当前值(x, a_0)是否有效
   // 取当前值(y, a_0)是否有效
@@ -601,7 +820,9 @@ __global__ void CsCheckMainAfterSigned(i32* mConPre, const u32x3* mCon,
 
   u32 val_x = 0;
   u32 val_y = 0;
-
+  printf("xixi\n");
+  return;
+  __syncthreads();
   // 取得cid里支持(x, a_0)的bitDom->bitSup[c][a_1][a_0]->bitSup[c][~][a],
   // TODO:这里有问题，没有进行好块内归约，我需要按threadIdx.y的对数步长归约
   if (kDeviceBitDomIntSize == 1) {
@@ -609,6 +830,7 @@ __global__ void CsCheckMainAfterSigned(i32* mConPre, const u32x3* mCon,
     auto [x, y] = tex3D<uint2>(bitSup, a_0, 0, bid);
     val_x |= l_xa && (x & s_bitDom_y[0]);
     val_y |= l_ya && (y & s_bitDom_x[0]);
+    printf("val[%d]: %x, %x\n", a_0, val_x, val_y);
   } else if (kDeviceBitDomIntSize == 2) {
     // Case 2: MaxDomSize \in (32,64]
     for (int i = 0; i < kDeviceBitDomIntSize; ++i) {
@@ -617,12 +839,14 @@ __global__ void CsCheckMainAfterSigned(i32* mConPre, const u32x3* mCon,
       val_y |= l_ya && (bitSup_cid.y & s_bitDom_x[i]);
     }
   }
+
+  return;
   // Case 3……
   // TODO: 束内归约应该并不用同步
   __syncthreads();
   // // 束内归约
   // // 只有threadIdx.x=0的那一维度归约
-  bool changed = false;
+  // bool changed = false;
   if (a_1 == 0) {
     //   // 线程束内投票
     unsigned int vote_x = __ballot_sync(0xFFFFFFFF, val_x != 0);
@@ -645,50 +869,88 @@ __global__ void CsCheckMainAfterSigned(i32* mConPre, const u32x3* mCon,
     if (a_0 % warpSize == 0) {
       int bitIdx = a_0 / 32;
       if (s_bitDom_x[bitIdx] ^ vote_x) {
-        changed = true;
+        changex = true;
         u32 oldVal = atomicAnd(
             &bitDom[level_offset + DeviceGetBitDomByIndex(xid, bitIdx)],
             vote_x);
+
+        // 重做一次按位与，获得当时做原子运算后，论域个数，再减原论域，
+        // 得到减少的论域值的个数delete_num_value
+        // 全局论域原子减去delete_num_value得到当时的论域情况，这里不会出现重复减的情况
+        int delete_num_values = __popc(oldVal) - __popc(oldVal & vote_x);
+        int old_domian_size = atomicSub(
+            &dom_size[current_level * kDeviceNumVars + xid], delete_num_values);
+        // TODO: 这里可以取消注释验证是否正确。
+        // 或者检验old_domian_size-delete_num_value?=0,直接修改全局变量，退出GAC
+        if (!(old_domian_size - delete_num_values)) GAC_success = false;
         // if (oldVal & vote_x != 0) empty_dom[0] = 0;
-        printf("v: %d, bitDom = %x, now = %x\n", xid, vote_x,
-               bitDom[level_offset + DeviceGetBitDomByIndex(xid, bitIdx)]);
+        printf(
+            "x_v: %d, bitDom = %x, ori = %x, now = %x, changex = %d, "
+            "delete_num_values = %d\n",
+            xid, vote_x, oldVal,
+            bitDom[level_offset + DeviceGetBitDomByIndex(xid, bitIdx)], changex,
+            delete_num_values);
       }
 
       if (s_bitDom_y[bitIdx] ^ vote_y) {
-        changed = true;
+        changey = true;
         auto oldVal = atomicAnd(
             &bitDom[level_offset + DeviceGetBitDomByIndex(yid, bitIdx)],
             vote_y);
+
+        int delete_num_values = __popc(oldVal) - __popc(oldVal & vote_y);
+        int old_domian_size = atomicSub(
+            &dom_size[current_level * kDeviceNumVars + yid], delete_num_values);
+        // TODO: 这里可以取消注释验证是否正确。
+        // 或者检验old_domian_size-delete_num_value?=0,直接修改全局变量，退出GAC
+        if (!(old_domian_size - delete_num_values)) GAC_success = false;
         // if (oldVal & vote_y != 0) empty_dom[0] = 0;
         // printf("a_0: %d, a_1: %d, empty_dom: %d\n", a_0, a_1, empty_dom[0]);
-        printf("v: %d, bitDom = %x, now = %x\n", yid, vote_y,
-               bitDom[level_offset + DeviceGetBitDomByIndex(yid, bitIdx)]);
+        printf(
+            "y_v: %d, bitDom = %x, ori = %x, now = %x, changey = "
+            "%d, delete_num_values = %d\n",
+            yid, vote_y, oldVal,
+            bitDom[level_offset + DeviceGetBitDomByIndex(yid, bitIdx)], changey,
+            delete_num_values);
       }
     }
   }
 
-  __syncthreads();
+  // __syncthreads();
   // printf("changed: %d\n", changed);
   // return;
   // 再load一次检查是否为0
-  if (a_0 < kDeviceBitDomIntSize && a_1 == 0) {
-    if (bitDom[level_offset + DeviceGetBitDomByIndex(xid, a_0)] != 0)
-      empty_dom[0] = 0;
-    if (bitDom[level_offset + DeviceGetBitDomByIndex(yid, a_0)] != 0)
-      empty_dom[0] = 0;
-  }
-  __syncthreads();
-  if (a_0 == 0 && a_1 == 0 && empty_dom[0] == 1) {
-    GAC_success = 0;
-    printf("a_0: %d, a_1: %d, empty_dom: %d\n", a_0, a_1, empty_dom[0]);
-  }
+  // 这里要计算论域大小，方法为
+  // if (a_0 < kDeviceBitDomIntSize && a_1 == 0) {
+  //   if (bitDom[level_offset + DeviceGetBitDomByIndex(xid, a_0)] != 0)
+  //     empty_dom[0] = 0;
+  //   if (bitDom[level_offset + DeviceGetBitDomByIndex(yid, a_0)] != 0)
+  //     empty_dom[0] = 0;
+  // }
+  // __syncthreads();
+  // if (a_0 == 0 && a_1 == 0 && empty_dom[0] == 1) {
+  //   GAC_success = 0;
+  //   printf("a_0: %d, a_1: %d, empty_dom: %d\n", a_0, a_1, empty_dom[0]);
+  // }
   __syncthreads();
   // printf("GAC_success: %d\n", GAC_success);
   // propagate changed to neighbour constraints
-  if (GAC_success && changed) {
+  // 每个线程一个约束，如果约束个数大于线程块长度，要用for循环,
+  // TODO::两次可以合到一起
+  if (GAC_success && changex) {
     for (int idx = tid; idx < kDeviceNumTabs; idx += blockDim.x * blockDim.y) {
-      auto val = tex2D<int>(neiCon, idx, cid);
-      printf("cid: %d, tid: %d = %d\n", cid, tid, val);
+      auto val = tex2D<int>(neiCon, idx, xid);
+      printf("xid: %d, tid: %d = %d\n", xid, tid, val);
+      if (val != 0) {
+        mConPre[idx] = 1;
+      }
+    }
+  }
+
+  if (GAC_success && changey) {
+    for (int idx = tid; idx < kDeviceNumTabs; idx += blockDim.x * blockDim.y) {
+      auto val = tex2D<int>(neiCon, idx, yid);
+      printf("yid: %d, tid: %d = %d\n", yid, tid, val);
       if (val != 0) {
         mConPre[idx] = 1;
       }
@@ -696,6 +958,238 @@ __global__ void CsCheckMainAfterSigned(i32* mConPre, const u32x3* mCon,
   }
   // printf("end check\n");
 }
+
+// // action = 0 是删值，action=1是赋值
+// __global__ void CsCheckMainAfterSigned(i32* mConPre, const u32x3* mCon,
+//                                        u32* bitDom, const i32* dom_size,
+//                                        cudaTextureObject_t bitSup,
+//                                        cudaTextureObject_t neiCon,
+//                                        int num_ConEvt, int varid, int val_a,
+//                                        int action, int current_level) {
+//   // mCon索引ID
+//   const int bid = blockIdx.x;
+//   // bitDom索引
+//   const int a_0 = threadIdx.x;
+//   // bitDom索引
+//   const int a_1 = threadIdx.y;
+//   // 块内全局线程索引
+//   const int tid = threadIdx.x + threadIdx.y * blockDim.x;
+//   // 计算当前层的偏移量
+//   int level_offset = current_level * kDeviceBitDomsIntSize;
+
+//   // printf("bid: %d, a_0: %d, a_1: %d, num_ConEvt: %d\n", bid, a_0, a_1,
+//   //        num_ConEvt);
+
+//   // 每个线程都拿到当前约束信息
+//   auto c = mCon[bid];
+//   const int xid = c.x;
+//   const int yid = c.y;
+//   const int cid = c.z;
+
+//   // 动态分配共享内存，共三段：
+//   // 1. bitDom[x]
+//   // 2. bitDom[y]
+//   // 3. empty_dom，用于标记失败，默认值是1，即假设它失败，
+//   //    在最后检查的时候，如有一段word非空则置为0。
+//   extern __shared__ u32 shared_mem[];
+//   u32* s_bitDom_x = shared_mem;
+//   u32* s_bitDom_y = &shared_mem[kDeviceBitDomIntSize];
+//   u32* empty_dom = &shared_mem[2 * kDeviceBitDomIntSize];
+//   u32* minValue = &shared_mem[2 * kDeviceBitDomIntSize + 1];
+//   if (a_0 == 0 && a_1 == 0) empty_dom[0] = 1;
+
+//   // 把bitDom写入两段共享内存
+//   // 这里把要原变量dom通过赋值，删值计算写到共享内存,再将这个值写回全局
+//   // 这里的a_0bitvector 的一个 int
+//   if (a_0 < kDeviceBitDomIntSize && a_1 == 0) {
+//     // 对于删值任务，是从全局内存写入赋值的
+//     assigned_var = varid;
+//     const int a = assigned_val;
+//     if (action == 0) {
+//       const int wordIndex = WORD_INDEX(a);
+//       if (varid == c.x && a_0 == wordIndex) {
+//         s_bitDom_x[a_0] =
+//             bitDom[level_offset + DeviceGetBitDomByIndex(xid, a_0)] &
+//             ~(1U << WORD_OFFSET(a));
+//         bitDom[level_offset + DeviceGetBitDomByIndex(xid, a_0)] &=
+//             ~(1U << WORD_OFFSET(a));
+//       } else if (varid == c.y && a_0 == wordIndex) {
+//         s_bitDom_y[a_0] =
+//             bitDom[level_offset + DeviceGetBitDomByIndex(yid, a_0)] &
+//             ~(1U << WORD_OFFSET(a));
+//         bitDom[level_offset + DeviceGetBitDomByIndex(yid, a_0)] &=
+//             ~(1U << WORD_OFFSET(a));
+//       }
+//       // s_bitDom_x[a_0] =
+//     } else if (action == 1) {
+//       // 赋值,需要先找到最小值
+//       // 对于赋值任务，赋值是写入全局内存的
+//       // 对于删值任务，是从全局内存写入赋值的
+//       assigned_var = varid;
+
+//       // s_bitDom_x[a_0] = 0;
+//       if (varid == c.x) {
+//         // 先写入局部内存a中
+//         const int a = bitDom[level_offset + DeviceGetBitDomByIndex(xid,
+//         a_0)];
+//         // 再计算得到最小值=a_0是dom的偏移量×32+ffs
+//         // 共享内中原子写回得到最小值，
+//         const int b =
+//             (__ffs(a) != 0) ? a_0 * U32_BIT + (__ffs(a) - 1) : FLT_MAX;
+//         atomicMin(minValue, b);
+
+//         int wordIndex = WORD_INDEX(minValue[0]);
+
+//         s_bitDom_x[a_0] = 0;
+//         bitDom[level_offset + DeviceGetBitDomByIndex(xid, a_0)] = 0;
+//         if (a_0 == wordIndex) {
+//           const u32 tmp_mask = ~(1U << WORD_OFFSET(a));
+//           s_bitDom_x[a_0] = tmp_mask;
+//           bitDom[level_offset + DeviceGetBitDomByIndex(xid, a_0)] = tmp_mask;
+//         }
+//       } else if (varid == c.y) {
+//         // 先写入局部内存a中
+//         const int a = bitDom[level_offset + DeviceGetBitDomByIndex(yid,
+//         a_0)];
+//         // 再计算得到最小值=a_0是dom的偏移量×32+ffs
+//         // 共享内中原子写回得到最小值，
+//         const int b =
+//             (__ffs(a) != 0) ? a_0 * U32_BIT + (__ffs(a) - 1) : FLT_MAX;
+//         atomicMin(minValue, b);
+
+//         int wordIndex = WORD_INDEX(minValue[0]);
+
+//         s_bitDom_y[a_0] = 0;
+//         bitDom[level_offset + DeviceGetBitDomByIndex(yid, a_0)] = 0;
+//         if (a_0 == wordIndex) {
+//           const u32 tmp_mask = ~(1U << WORD_OFFSET(a));
+//           s_bitDom_y[a_0] = tmp_mask;
+//           bitDom[level_offset + DeviceGetBitDomByIndex(yid, a_0)] = tmp_mask;
+//         }
+//       }
+//     } else {
+//     }
+//   }
+
+//   // if (a_0 < kDeviceBitDomIntSize && a_1 == 0) {
+//   //   s_bitDom_x[a_0] = bitDom[level_offset + DeviceGetBitDomByIndex(xid,
+//   //   a_0)]; s_bitDom_y[a_0] = bitDom[level_offset +
+//   //   DeviceGetBitDomByIndex(yid, a_0)];
+//   //   // printf(
+//   //   //     "----cid: %d, a_0: %d, a_1: %d, mConPre: %d, s_bitDom_x: %x, "
+//   //   //     "s_bitDom_y: %x\n",
+//   //   //     cid, a_0, a_1, mConPre[cid], s_bitDom_x[a_0], s_bitDom_y[a_0]);
+//   // }
+//   __syncthreads();
+
+//   // 取当前值(x, a_0)是否有效
+//   // 取当前值(y, a_0)是否有效
+//   const int l_xa = BITSET_GET(s_bitDom_x, a_0);
+//   const int l_ya = BITSET_GET(s_bitDom_y, a_0);
+
+//   u32 val_x = 0;
+//   u32 val_y = 0;
+
+//   // 取得cid里支持(x, a_0)的bitDom->bitSup[c][a_1][a_0]->bitSup[c][~][a],
+//   // TODO:这里有问题，没有进行好块内归约，我需要按threadIdx.y的对数步长归约
+//   if (kDeviceBitDomIntSize == 1) {
+//     // Case 1: MaxDomSize \in (0,32]
+//     auto [x, y] = tex3D<uint2>(bitSup, a_0, 0, bid);
+//     val_x |= l_xa && (x & s_bitDom_y[0]);
+//     val_y |= l_ya && (y & s_bitDom_x[0]);
+//   } else if (kDeviceBitDomIntSize == 2) {
+//     // Case 2: MaxDomSize \in (32,64]
+//     for (int i = 0; i < kDeviceBitDomIntSize; ++i) {
+//       auto bitSup_cid = tex3D<uint2>(bitSup, a_0, i, bid);
+//       val_x |= l_xa && (bitSup_cid.x & s_bitDom_y[i]);
+//       val_y |= l_ya && (bitSup_cid.y & s_bitDom_x[i]);
+//     }
+//   }
+//   // Case 3……
+//   // TODO: 束内归约应该并不用同步
+//   __syncthreads();
+//   // // 束内归约
+//   // // 只有threadIdx.x=0的那一维度归约
+//   bool changed = false;
+//   if (a_1 == 0) {
+//     //   // 线程束内投票
+//     unsigned int vote_x = __ballot_sync(0xFFFFFFFF, val_x != 0);
+//     unsigned int vote_y = __ballot_sync(0xFFFFFFFF, val_y != 0);
+
+//     // printf(
+//     //     "----cid: %d, a_0: %d, a_1: %d, s_bitDom_x: %x, s_bitDom_y: %x,
+//     l_xa:
+//     //     "
+//     //     "%d, l_ya: %d, vote_x:%x, vote_y :%x\n",
+//     //     cid, a_0, a_1, s_bitDom_x[a_0 / 32], s_bitDom_y[a_0 / 32], l_xa,
+//     //     l_ya, vote_x, vote_y);
+
+//     // 只是线程束里的第一个线程做如下操作：
+//     // 只写回自己那块bitDom
+//     // 先获取bitDom的分块索引
+//     // 先与共享内存里的bitDom比较有改变才写回
+//     //
+//     TODO:写回后能拿到写前的原值，这个值再与vote值与一下能拿到那一个bitdom的分块，
+//     //
+//     TODO:如果这个果为0那么就是空的，这个时候就可以设置empty_dom为0，这个想法需要验证
+//     //
+//     TODO:这里的写回操作应该是原子操作，如果可行，则可以省略一个检查是否为0的过程。
+//     if (a_0 % warpSize == 0) {
+//       int bitIdx = a_0 / 32;
+//       if (s_bitDom_x[bitIdx] ^ vote_x) {
+//         changed = true;
+//         u32 oldVal = atomicAnd(
+//             &bitDom[level_offset + DeviceGetBitDomByIndex(xid, bitIdx)],
+//             vote_x);
+//         // if (oldVal & vote_x != 0) empty_dom[0] = 0;
+//         printf("v: %d, bitDom = %x, now = %x\n", xid, vote_x,
+//                bitDom[level_offset + DeviceGetBitDomByIndex(xid, bitIdx)]);
+//       }
+
+//       if (s_bitDom_y[bitIdx] ^ vote_y) {
+//         changed = true;
+//         auto oldVal = atomicAnd(
+//             &bitDom[level_offset + DeviceGetBitDomByIndex(yid, bitIdx)],
+//             vote_y);
+//         // if (oldVal & vote_y != 0) empty_dom[0] = 0;
+//         // printf("a_0: %d, a_1: %d, empty_dom: %d\n", a_0, a_1,
+//         empty_dom[0]); printf("v: %d, bitDom = %x, now = %x\n", yid, vote_y,
+//                bitDom[level_offset + DeviceGetBitDomByIndex(yid, bitIdx)]);
+//       }
+//     }
+//   }
+
+//   __syncthreads();
+//   // printf("changed: %d\n", changed);
+//   // return;
+//   // 再load一次检查是否为0
+//   if (a_0 < kDeviceBitDomIntSize && a_1 == 0) {
+//     if (bitDom[level_offset + DeviceGetBitDomByIndex(xid, a_0)] != 0)
+//       empty_dom[0] = 0;
+//     if (bitDom[level_offset + DeviceGetBitDomByIndex(yid, a_0)] != 0)
+//       empty_dom[0] = 0;
+//   }
+//   __syncthreads();
+//   if (a_0 == 0 && a_1 == 0 && empty_dom[0] == 1) {
+//     GAC_success = 0;
+//     printf("a_0: %d, a_1: %d, empty_dom: %d\n", a_0, a_1, empty_dom[0]);
+//   }
+//   __syncthreads();
+//   // printf("GAC_success: %d\n", GAC_success);
+//   // propagate changed to neighbour constraints
+//   if (GAC_success && changed) {
+//     for (int idx = tid; idx < kDeviceNumTabs; idx += blockDim.x * blockDim.y)
+//     {
+//       auto val = tex2D<int>(neiCon, idx, cid);
+//       printf("cid: %d, tid: %d = %d\n", cid, tid, val);
+//       if (val != 0) {
+//         mConPre[idx] = 1;
+//       }
+//     }
+//   }
+//   // printf("end check\n");
+// }
+
 // 定义一个判断条件的谓词
 struct is_one {
   __host__ __device__ bool operator()(const int x) const { return x == 1; }
@@ -862,7 +1356,7 @@ void CModel::BuildBitModel(const HModel& xm) {
   LOG(INFO) << "-----texture-----";
 #pragma endregion 约束网络信息
 
-#pragma region 拷贝bitDom
+#pragma region 拷贝bitDom和Assigned
   LOG(INFO) << "-----bitDom-----";
   // 现在少了一个回溯维度，所以不需要考虑回溯的问题
   // cudaMallocManaged(&bitDom, sizeof(u32) * BITDOMS_INTSIZE);
@@ -872,11 +1366,11 @@ void CModel::BuildBitModel(const HModel& xm) {
   if (h_bitDom != nullptr) {
     memset(h_bitDom, 0u, sizeof(u32) * kAllBitDomsIntSize);
   }
-  h_current_domain_size = (int*)malloc(sizeof(int) * kDepth * kNumVars);
-  d_assigned = (i32x2*)malloc(sizeof(i32x2) * kNumVars);
-  if (h_current_domain_size != nullptr) {
-    memset(h_current_domain_size, 0, sizeof(int) * kDepth * kNumVars);
-  }
+  // h_current_domain_size = (int*)malloc(sizeof(int) * kDepth * kNumVars);
+  // d_assigned = (i32x2*)malloc(sizeof(i32x2) * kNumVars);
+  // if (h_current_domain_size != nullptr) {
+  //   memset(h_current_domain_size, 0, sizeof(int) * kDepth * kNumVars);
+  // }
 
   h_cur_dom_size.resize(kNumVars);
 
@@ -884,16 +1378,17 @@ void CModel::BuildBitModel(const HModel& xm) {
   if (d_solution != nullptr) {
     memset(d_solution, -1, sizeof(i32) * kNumVars);
   }
-  d_assigned = (i32x2*)malloc(sizeof(i32x2) * kNumVars);
+  // d_assigned = (i32x2*)malloc(sizeof(i32x2) * kNumVars);
+  cudaMalloc((void**)&d_assigned, sizeof(i32x2) * kNumVars);
   // cudaMallocManaged(&d_bitDom, sizeof(u32) * kAllBitDomsIntSize);
   // cudaMallocManaged(&M_VarPre, sizeof(int) * kNumVars);
-  d_assigned_at_level = (i32*)malloc(sizeof(i32) * kNumVars);
+  // d_assigned_at_level = (i32*)malloc(sizeof(i32) * kNumVars);
 
   // 初始化第0层h_bitDom和h_current_domain_size
   for (int i = 0; i < kNumVars; ++i) {
     const HVar v = xm->Vars(i);
     const int dom_size = static_cast<int>(v->vals.size());
-    h_current_domain_size[i] = dom_size;
+    // h_current_domain_size[i] = dom_size;
     h_cur_dom_size[i] = dom_size;
     const int dom_int_size = intsizeof(dom_size);
 
@@ -910,13 +1405,14 @@ void CModel::BuildBitModel(const HModel& xm) {
 
   // 在设备上分配d_bitDom
   cudaMalloc((void**)&d_bitDom, sizeof(u32) * kAllBitDomsIntSize);
-  cudaMalloc((void**)&d_current_domain_size, sizeof(int) * kDepth * kNumVars);
+  // cudaMalloc((void**)&d_current_domain_size, sizeof(int) * kDepth *
+  // kNumVars);
 
   // 将h_bitDom复制到d_bitDom
   cudaMemcpy(d_bitDom, h_bitDom, sizeof(u32) * kAllBitDomsIntSize,
              cudaMemcpyHostToDevice);
-  cudaMemcpy(d_current_domain_size, h_current_domain_size,
-             sizeof(int) * kDepth * kNumVars, cudaMemcpyHostToDevice);
+  // cudaMemcpy(d_current_domain_size, h_current_domain_size,
+  //            sizeof(int) * kDepth * kNumVars, cudaMemcpyHostToDevice);
 
   d_cur_dom_size = h_cur_dom_size;
   // d
@@ -1079,7 +1575,8 @@ void CModel::BuildBitModel(const HModel& xm) {
 
 #pragma region 生成约束
   // 初始化h_MCon信息
-  thrust::host_vector<uint3> h_MCon(kNumTabs);
+  thrust::host_vector<u32x3> h_MCon(kNumTabs);
+
   for (int i = 0; i < kNumTabs; ++i) {
     auto c = xm->Tabs(i);
     h_MCon[i] = make_uint3(xm->Tabs(i)->scope[0]->id, xm->Tabs(i)->scope[1]->id,
@@ -1090,6 +1587,33 @@ void CModel::BuildBitModel(const HModel& xm) {
   d_MCon = h_MCon;
   d_MConEvt.reserve(kNumTabs);
   d_ConPre.resize(kNumTabs, 1);
+  h_subscription_offset.resize(kNumVars + 1, 0);
+  int offset = 0;
+  for (size_t i = 0; i < kNumVars; i++) {
+    auto v = xm->Vars(i);
+    h_subscription_offset[i] = offset;
+    offset += xm->subscriptions[v].size();
+    // h_subscription_offset[i] = xm->subscriptions[v].size();
+    for (const auto& c : xm->subscriptions[v]) {
+      h_subscription.push_back(
+          make_uint3(c->scope[0]->id, c->scope[1]->id, c->id));
+      printf("c_id = %d, v1_id = %d, v2_id = %d\n", c->id, c->scope[0]->id,
+             c->scope[1]->id);
+    }
+    printf("-------------------\n");
+    // offset += h_subscription.size();
+  }
+  // 填充最后一个标记位
+  h_subscription_offset[kNumVars] = offset;
+  d_subscription_offset = h_subscription_offset;
+  d_subscription = h_subscription;
+
+  // // 验证数据是否正确拷贝
+  // for (int i = 0; i < kNumTabs; ++i) {
+  //   uint3 val = d_MCon[i];
+  //   std::cout << "d_MCon[" << i << "] = (" << val.x << ", " << val.y << ", "
+  //             << val.z << "): " << d_ConPre[i] << "\n";
+  // }
 
   // // 验证数据是否正确拷贝
   // for (int i = 0; i < kNumTabs; ++i) {
@@ -1224,6 +1748,67 @@ bool CModel::enforceGAC() {
   return true;
 }
 
+bool CModel::enforceGAC(int var, int type) {
+  printf("-----------enforeGAC for disicion-----------\n");
+  int num_ConEvt = h_subscription_offset[var + 1] - h_subscription_offset[var];
+  // 填充最后一个标记位
+  h_subscription_offset[kNumVars] = h_subscription.size();
+  printf("h_subscription_offset: ");
+  for (auto i : h_subscription_offset) {
+    std::cout << i << " ";
+  }
+  std::cout << std::endl;
+
+  for (int i = h_subscription_offset[var]; i < h_subscription_offset[var + 1];
+       ++i) {
+    int c_id = h_subscription[i].z;
+    int v1_id = h_subscription[i].x;
+    int v2_id = h_subscription[i].y;
+    printf("c_id = %d, v1_id = %d, v2_id = %d\n", c_id, v1_id, v2_id);
+  }
+
+  printf("num_ConEvt = %d\n", num_ConEvt);
+  // return false;
+  CsCheckMainAfterDecision<<<num_ConEvt, dim3(kBitDomIntSize * 32, 1, 1),
+                             kSharedMemSize>>>(
+      thrust::raw_pointer_cast(d_ConPre.data()),
+      thrust::raw_pointer_cast(d_MCon.data()),
+      thrust::raw_pointer_cast(d_subscription.data()),
+      thrust::raw_pointer_cast(d_subscription_offset.data()), d_bitDom,
+      thrust::raw_pointer_cast(d_cur_dom_size.data()), texObj_BitSup,
+      texObj_MCon, num_ConEvt, d_assigned, var, type, current_level_);
+  cudaDeviceSynchronize();
+  cout << "GAC_success = " << GAC_success << endl;
+  return false;
+  num_ConEvt = compress_Main();
+  cudaDeviceSynchronize();
+  while (num_ConEvt != 0) {
+    printf("-----------iteration-----------\n");
+    CsCheckMain<<<num_ConEvt, dim3(kBitDomIntSize * 32, 1, 1),
+                  kSharedMemSize>>>(
+        thrust::raw_pointer_cast(d_ConPre.data()),
+        thrust::raw_pointer_cast(d_MCon.data()), d_bitDom,
+        thrust::raw_pointer_cast(d_cur_dom_size.data()), texObj_BitSup,
+        texObj_MCon, num_ConEvt, current_level_);
+    cudaDeviceSynchronize();
+    if (!GAC_success) {
+      return false;
+    }
+    printf("-----------end iteration-----------\n");
+    // std::cout << "h_ConPre: ";
+    // thrust::host_vector<int> h_ConPre = d_ConPre;
+    // for (size_t i = 0; i < h_ConPre.size(); ++i) {
+    //   std::cout << h_ConPre[i] << " ";
+    // }
+    // std::cout << std::endl;
+
+    num_ConEvt = compress_Main();
+    // return true;
+  }
+
+  return true;
+}
+
 //
 //
 // bool CModel::enforceGAC() {
@@ -1290,13 +1875,23 @@ bool CModel::enforceGAC() {
 
 void CModel::enforceSAC() {}
 
-void CModel::solve() {
+SearchStatistics CModel::solve(const float time_limit) {
+  SearchStatistics stats;
   enforceGAC();
   auto varid = heuristic();
-  calculateRatiosAndFindMinIndex<<<1, kNumVars>>>(
-      d_current_domain_size, thrust::raw_pointer_cast(d_Deg.data()), kNumVars,
-      current_level_);
-  // printf("varid = %d\n", varid);
+  cudaDeviceSynchronize();
+  AssignedValue<<<1, kBitDomIntSize * 32>>>(d_assigned, varid, current_level_);
+  printf("varid = %d\n", varid);
+  enforceGAC(varid, 1);
+  // calculateRatiosAndFindMinIndex<<<1, kNumVars, kNumVars * sizeof(int) *
+  // 2>>>(
+  //     thrust::raw_pointer_cast(d_cur_dom_size.data()),
+  //     thrust::raw_pointer_cast(d_Deg.data()), kNumVars, current_level_);
+  // 表示赋值
+  // int type = 1;
+  // changeBitDom<<<1, kBitDomIntSize>>>(d_bitDom, varid, current_level_, type);
+  // cudaDeviceSynchronize();
+  return stats;
 }
 
 CModel::~CModel() {
@@ -1306,11 +1901,11 @@ CModel::~CModel() {
   cudaFree(d_bitDom);
   free(h_bitDom);
   // cudaFree(M_VarPre);
-  cudaFree(d_current_domain_size);
-  free(h_current_domain_size);
+  // cudaFree(d_current_domain_size);
+  // free(h_current_domain_size);
   cudaFree(d_assigned);
   cudaFree(d_solution);
-  cudaFree(d_assigned_at_level);
+  // cudaFree(d_assigned_at_level);
 
   cudaFree(bitSubDom);
   // cudaFree(bitSup);

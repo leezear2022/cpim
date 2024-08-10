@@ -73,6 +73,7 @@
         "list": "cpp",
         "format": "cpp",
         "span": "cpp",
-        "variant": "cpp"
+        "variant": "cpp",
+        "__config": "cpp"
     }
 }

@@ -259,7 +259,6 @@ class CModel {
   u32* h_bitDom;
   u32* d_bitDom;
 
-
   // 变量在第几级被赋值了
   i32* d_assigned_at_level;
 
@@ -390,6 +389,8 @@ class CModel {
 
   explicit CModel(const HModel& xm);
 
+  void bitDomCopy();
+
   int compress_Main();
 
   void BuildBitModel(const HModel& xm);
@@ -401,7 +402,7 @@ class CModel {
   bool enforceGAC();
   bool enforceGAC(int var, int type);
   void enforceSAC();
-  SearchStatistics solve(const float time_limits);
+  SearchStatistics solve(float time_limits);
   int heuristic();
   void DelGPUModel() const;
 

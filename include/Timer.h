@@ -67,49 +67,51 @@ class Timer {
 
 
 // CUDA error checking macro
-#define CUDA_CHECK(call)                                            \
-  {                                                                 \
-    const cudaError_t error = call;                                 \
-    if (error != cudaSuccess) {                                     \
-      std::cerr << "Error: " << __FILE__ << ":" << __LINE__ << ", " \
-                << cudaGetErrorString(error) << std::endl;          \
-      exit(1);                                                      \
-    }                                                               \
-  }
 
 class CudaTimer {
- public:
-  CudaTimer() {
-    CUDA_CHECK(cudaEventCreate(&startEvent));
-    CUDA_CHECK(cudaEventCreate(&stopEvent));
-  }
+public:
+    CudaTimer() {
+        cudaEventCreate(&start);
+        cudaEventCreate(&stop);
+        reset();
+    }
 
-  ~CudaTimer() {
-    CUDA_CHECK(cudaEventDestroy(startEvent));
-    CUDA_CHECK(cudaEventDestroy(stopEvent));
-  }
+    ~CudaTimer() {
+        cudaEventDestroy(start);
+        cudaEventDestroy(stop);
+    }
 
-  void start() { CUDA_CHECK(cudaEventRecord(startEvent, 0)); }
+    void reset() {
+        cudaEventRecord(start, 0);
+    }
 
-  void stop() {
-    CUDA_CHECK(cudaEventRecord(stopEvent, 0));
-    CUDA_CHECK(cudaEventSynchronize(stopEvent));
-  }
+    // 默认输出毫秒
+    float elapsed() {
+        cudaEventRecord(stop, 0);
+        cudaEventSynchronize(stop);
+        float milliseconds = 0.0f;
+        cudaEventElapsedTime(&milliseconds, start, stop);
+        cudaEventRecord(start, 0); // 重新设置start以便下次调用elapsed可以记录新的时间段
+        return milliseconds;
+    }
 
-  float elapsedMilliseconds() {
-    float milliseconds = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&milliseconds, startEvent, stopEvent));
-    return milliseconds;
-  }
+    // 微秒
+    float elapsed_micro() {
+        return elapsed() * 1000.0f;
+    }
 
-  float elapsedSeconds() { return elapsedMilliseconds() / 1000.0f; }
+    // 纳秒
+    float elapsed_nano() {
+        return elapsed_micro() * 1000.0f;
+    }
 
-  float elapsedMicroseconds() { return elapsedMilliseconds() * 1000.0f; }
+    // 秒
+    float elapsed_seconds() {
+        return elapsed() / 1000.0f;
+    }
 
-  float elapsedNanoseconds() { return elapsedMilliseconds() * 1000000.0f; }
-
- private:
-  cudaEvent_t startEvent, stopEvent;
+private:
+    cudaEvent_t start, stop;
 };
 
 }

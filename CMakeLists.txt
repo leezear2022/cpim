@@ -50,7 +50,9 @@ cmake_minimum_required(VERSION 3.18)
 project(cpim LANGUAGES CXX CUDA)
 
 #set(CMAKE_CUDA_COMPILER /usr/local/cuda/bin/nvcc)
-set(CMAKE_CUDA_STANDARD 20)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_STANDARD 17)
 
 # 设置 CUDA 架构
 set(CMAKE_CUDA_ARCHITECTURES 60 70 80)
@@ -62,26 +64,48 @@ include_directories(${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 # 添加库文件路径
 link_directories(/usr/local/cuda/lib64)
 
+# ============================================================================
+# Abseil 依赖配置 (使用 FetchContent)
+# ============================================================================
+include(FetchContent)
+
+FetchContent_Declare(
+  absl
+  GIT_REPOSITORY https://github.com/abseil/abseil-cpp.git
+  GIT_TAG        20240722.0  # LTS 20240722
+  GIT_SHALLOW    TRUE
+)
+
+set(ABSL_PROPAGATE_CXX_STD ON)
+set(ABSL_ENABLE_INSTALL ON)
+set(BUILD_TESTING OFF)  # 不构建 Abseil 的测试
+
+message(STATUS "Fetching Abseil C++...")
+FetchContent_MakeAvailable(absl)
+message(STATUS "Abseil C++ fetched successfully")
+
+# ============================================================================
+# 其他依赖库
+# ============================================================================
 find_package(LibXml2 REQUIRED)
 include_directories(${LIBXML2_INCLUDE_DIR})
 
-find_package(XercesC REQUIRED)
-include_directories(${XercesC_INCLUDE_DIRS})
+# Xerces-C 已弃用，使用 libxml2 替代
+# find_package(XercesC REQUIRED)
+# include_directories(${XercesC_INCLUDE_DIRS})
 
-# 查找依赖库
-find_package(GTest REQUIRED)
-find_package(gflags REQUIRED)
+# 查找依赖库 (GTest 和 gflags 改为可选)
+find_package(GTest)
+find_package(gflags)
 find_package(glog REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(Unwind REQUIRED libunwind)
-find_package(absl REQUIRED)
 
 # 包含目录
 include_directories(${GTEST_INCLUDE_DIRS})
 include_directories(${GFLAGS_INCLUDE_DIRS})
 include_directories(${GLOG_INCLUDE_DIRS})
 include_directories(${Unwind_INCLUDE_DIRS})
-include_directories(${ABSL_INCLUDE_DIRS})
 
 # 添加头文件目录
 include_directories(include)
@@ -89,39 +113,99 @@ include_directories(include)
 # 添加子目录
 add_subdirectory(xcsp3parser)
 
-add_executable(cpim samples/main.cu
-        src/HModel.cpp
-        src/XBuilder.cpp
-        include/NaiveBitSet.h
-        include/CPIMBase.h
-        src/Network.cpp
-        src/Solver.cpp
-        include/Timer.h
-        include/cuSAC.cuh
-        src/cuSAC.cu
-        src/MAC.cpp
-        src/AC.cpp
-        src/AC3.cpp
-        src/AC3bit.cpp
-        src/AC3rm.cpp
-        src/AC3rm.cpp
-        src/FC.cpp
-        src/lMaxRPC.cpp
-        src/NSAC.cpp
-        src/RPC3.cpp
-        src/SAC1.cpp
-        src/SAC3.cpp
+# ============================================================================
+# 新模块: cpim_model (XCSP3 解析和中间模型)
+# ============================================================================
+add_library(cpim_model STATIC
+  src/model/types.cpp
+  src/model/xcsp_parser.cpp
+  src/model/libxml2_parser.cpp
+  src/model/model_builder.cpp
+  src/model/intermediate_model.cpp
 )
 
-set_target_properties(cpim PROPERTIES
-        CUDA_SEPARABLE_COMPILATION ON)
+target_include_directories(cpim_model PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${LIBXML2_INCLUDE_DIR}
+)
 
-# 链接 xcsp3parser 静态库和 CUDA 相关库
-target_link_libraries(cpim PRIVATE xcsp3parser ${XercesC_LIBRARIES} ${LIBXML2_LIBRARIES}
-        cuda cudart cudadevrt cudart_static)
+target_link_libraries(cpim_model PUBLIC
+  # Abseil 核心库
+  absl::flat_hash_map
+  absl::flat_hash_set
+  absl::inlined_vector
+  absl::span
+  absl::status
+  absl::statusor
+  absl::strings
+  absl::str_format
+  absl::time
+  absl::variant
+  absl::optional
 
-# 确保 CUDA 链接器标志被设置
-set_target_properties(cpim PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+  # libxml2
+  ${LIBXML2_LIBRARIES}
+
+  # 日志
+  glog::glog
+)
+
+target_compile_options(cpim_model PRIVATE
+  -Wall -Wextra
+  $<$<CONFIG:Release>:-O3 -march=native>
+)
+
+# ============================================================================
+# 新解析器测试程序 (纯 C++ 程序，不含 CUDA 代码)
+# ============================================================================
+add_executable(cpim_test_parser samples/main_new_parser.cpp)
+
+target_link_libraries(cpim_test_parser PRIVATE
+  cpim_model
+  glog::glog
+)
+
+# ============================================================================
+# 原始主程序 (已弃用，依赖旧的 XBuilder)
+# 请使用新的 cpim_test_parser 程序代替
+# ============================================================================
+# add_executable(cpim samples/main.cu
+#         src/HModel.cpp
+#         # src/XBuilder.cpp  # 已弃用，使用新的 LibXml2Parser 替代
+#         include/NaiveBitSet.h
+#         include/CPIMBase.h
+#         src/Network.cpp
+#         src/Solver.cpp
+#         include/Timer.h
+#         include/cuSAC.cuh
+#         src/cuSAC.cu
+#         src/MAC.cpp
+#         src/AC.cpp
+#         src/AC3.cpp
+#         src/AC3bit.cpp
+#         src/AC3rm.cpp
+#         src/AC3rm.cpp
+#         src/FC.cpp
+#         src/lMaxRPC.cpp
+#         src/NSAC.cpp
+#         src/RPC3.cpp
+#         src/SAC1.cpp
+#         src/SAC3.cpp
+# )
+#
+# set_target_properties(cpim PROPERTIES
+#         CUDA_SEPARABLE_COMPILATION ON)
+#
+# # 链接库
+# target_link_libraries(cpim PRIVATE
+#         cpim_model          # 新的模型解析模块（已包含 libxml2）
+#         xcsp3parser
+#         # ${XercesC_LIBRARIES}  # 已弃用
+#         ${LIBXML2_LIBRARIES}
+#         cuda cudart cudadevrt cudart_static)
+#
+# # 确保 CUDA 链接器标志被设置
+# set_target_properties(cpim PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
 # 添加 CUDA 相关的路径
 include_directories(${CUDA_INCLUDE_DIRS})

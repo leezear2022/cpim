@@ -4,7 +4,7 @@
 #include <vector>
 
 #include "xcsp3model/HModel.h"
-#include "xcsp3model/XBuilder.h"
+// #include "xcsp3model/XBuilder.h"  // 已弃用，使用新的 LibXml2Parser 替代
 
 using namespace std;
 namespace cpim {

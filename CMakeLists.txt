@@ -163,6 +163,8 @@ add_executable(cpim_test_parser samples/main_new_parser.cpp)
 target_link_libraries(cpim_test_parser PRIVATE
   cpim_model
   glog::glog
+  absl::flags
+  absl::flags_parse
 )
 
 # ============================================================================

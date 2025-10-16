@@ -1,10 +1,13 @@
 #include "model/libxml2_parser.h"
 
 #include <sstream>
+#include <system_error>
 
+#include "absl/strings/ascii.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_split.h"
+#include "absl/strings/strip.h"
 #include "glog/logging.h"
 
 namespace cpim::model {
@@ -62,7 +65,7 @@ xmlNodePtr LibXml2Parser::XmlDocGuard::root() const {
 
 absl::StatusOr<IntermediateModel> LibXml2Parser::Parse(
     std::filesystem::path path) {
-  LOG(INFO) << "Parsing XCSP3 file: " << path;
+  LOG(INFO) << "Parsing XCSP file: " << path;
 
   // 检查文件是否存在
   if (!std::filesystem::exists(path)) {
@@ -82,20 +85,34 @@ absl::StatusOr<IntermediateModel> LibXml2Parser::Parse(
     return absl::InvalidArgumentError("XML document has no root element");
   }
 
-  // 检查是否是 BMPath.xml（间接引用文件）
+  // 检查是否是 bench manifest（例如 BMPath.xml）
   xmlNodePtr bmfile_node = FindChildNode(root, "BMFile");
   if (bmfile_node) {
-    // 这是一个 BMPath.xml，需要读取实际的 benchmark 文件
-    auto bm_path_or = GetBenchmarkPath(root);
-    if (!bm_path_or.ok()) {
-      return bm_path_or.status();
+    auto entries_or = LoadBenchManifest(path);
+    if (!entries_or.ok()) {
+      return entries_or.status();
+    }
+    if (entries_or->empty()) {
+      return absl::InvalidArgumentError(
+          "No BMFile entries found in manifest");
     }
 
-    std::filesystem::path actual_path = path.parent_path() / *bm_path_or;
-    LOG(INFO) << "Redirecting to actual benchmark file: " << actual_path;
+    const BenchEntry* first_entry_with_file = nullptr;
+    for (const auto& entry : *entries_or) {
+      if (!entry.files.empty()) {
+        first_entry_with_file = &entry;
+        break;
+      }
+    }
+    if (!first_entry_with_file) {
+      return absl::InvalidArgumentError(
+          "Manifest did not resolve to any XML files");
+    }
 
-    // 递归解析实际文件
-    return Parse(actual_path);
+    const auto& first_file = first_entry_with_file->files.front().path;
+    LOG(INFO) << "Redirecting to actual benchmark file: " << first_file;
+
+    return Parse(first_file);
   }
 
   // 创建 ModelBuilder
@@ -136,22 +153,260 @@ absl::StatusOr<IntermediateModel> LibXml2Parser::Parse(
   return std::move(*model_or);
 }
 
-// ============================================================================
-// 获取 BMPath
-// ============================================================================
+absl::StatusOr<BenchEntry> LibXml2Parser::DescribeBenchPath(
+    std::filesystem::path path) {
+  std::filesystem::path resolved = path;
+  if (resolved.is_relative()) {
+    resolved = std::filesystem::absolute(resolved);
+  }
+  return BuildBenchEntry(path, resolved);
+}
 
-absl::StatusOr<std::string> LibXml2Parser::GetBenchmarkPath(xmlNodePtr root) {
-  xmlNodePtr bmfile_node = FindChildNode(root, "BMFile");
-  if (!bmfile_node) {
-    return absl::NotFoundError("BMFile node not found");
+absl::StatusOr<std::vector<BenchEntry>> LibXml2Parser::LoadBenchManifest(
+    std::filesystem::path manifest_path) {
+  std::filesystem::path resolved_manifest = manifest_path;
+  std::vector<std::filesystem::path> candidates;
+
+  if (resolved_manifest.is_absolute()) {
+    candidates.push_back(resolved_manifest);
+  } else {
+    candidates.push_back(std::filesystem::absolute(resolved_manifest));
+    std::filesystem::path parent_candidate =
+        std::filesystem::current_path().parent_path() / resolved_manifest;
+    candidates.push_back(std::filesystem::absolute(parent_candidate));
   }
 
-  auto content_or = GetNodeContent(bmfile_node);
-  if (!content_or.ok()) {
-    return content_or.status();
+  std::filesystem::path manifest_to_use;
+  std::error_code ec;
+  for (const auto& candidate : candidates) {
+    ec.clear();
+    if (candidate.empty()) {
+      continue;
+    }
+    if (std::filesystem::exists(candidate, ec)) {
+      manifest_to_use = candidate;
+      break;
+    }
+    if (ec) {
+      return absl::InternalError(absl::StrFormat(
+          "Failed to check manifest existence %s: %s", candidate.string(),
+          ec.message()));
+    }
   }
 
-  return *content_or;
+  if (manifest_to_use.empty()) {
+    return absl::NotFoundError(absl::StrFormat(
+        "Bench manifest not found: %s",
+        candidates.empty() ? manifest_path.string()
+                            : candidates.front().string()));
+  }
+
+  resolved_manifest = manifest_to_use;
+
+  XmlDocGuard doc_guard(resolved_manifest);
+  if (!doc_guard.IsValid()) {
+    return absl::InvalidArgumentError(absl::StrFormat(
+        "Failed to parse XML file: %s", resolved_manifest.string()));
+  }
+
+  xmlNodePtr root = doc_guard.root();
+  if (!root) {
+    return absl::InvalidArgumentError(
+        "Bench manifest has no root element");
+  }
+
+  xmlNodePtr bmfiles_node = FindChildNode(root, "BMFiles");
+  if (!bmfiles_node) {
+    return absl::InvalidArgumentError(
+        "Bench manifest missing <BMFiles> section");
+  }
+
+  auto bm_nodes = FindChildNodes(bmfiles_node, "BMFile");
+  std::vector<BenchEntry> entries;
+  entries.reserve(bm_nodes.size());
+
+  for (xmlNodePtr node : bm_nodes) {
+    auto content_or = GetNodeContent(node);
+    if (!content_or.ok()) {
+      return content_or.status();
+    }
+
+    std::string raw_path = std::string(absl::StripAsciiWhitespace(*content_or));
+    if (raw_path.empty()) {
+      continue;
+    }
+
+    std::filesystem::path original = raw_path;
+
+    std::vector<std::filesystem::path> child_candidates;
+    child_candidates.push_back(resolved_manifest.parent_path() / original);
+    if (!original.is_absolute()) {
+      child_candidates.push_back(std::filesystem::absolute(original));
+      child_candidates.push_back(std::filesystem::absolute(
+          resolved_manifest.parent_path().parent_path() / original));
+    }
+
+    absl::StatusOr<BenchEntry> entry_or;
+    for (const auto& candidate : child_candidates) {
+      entry_or = BuildBenchEntry(original, candidate);
+      if (entry_or.ok()) {
+        break;
+      }
+      if (!absl::IsNotFound(entry_or.status())) {
+        return entry_or.status();
+      }
+    }
+
+    if (!entry_or.ok()) {
+      return entry_or.status();
+    }
+
+    auto type_attr_or = GetAttribute(node, "type");
+    if (type_attr_or.ok()) {
+      std::string type_lower = absl::AsciiStrToLower(*type_attr_or);
+      BenchPathKind expected =
+          (type_lower == "dir" || type_lower == "directory" ||
+           type_lower == "folder")
+              ? BenchPathKind::kDirectory
+              : BenchPathKind::kFile;
+      if (entry_or->kind != expected) {
+        return absl::FailedPreconditionError(absl::StrFormat(
+            "Manifest entry %s expected %s but resolved to %s",
+            raw_path,
+            expected == BenchPathKind::kDirectory ? "directory" : "file",
+            entry_or->kind == BenchPathKind::kDirectory ? "directory"
+                                                         : "file"));
+      }
+    }
+
+    entries.push_back(std::move(*entry_or));
+  }
+
+  if (entries.empty()) {
+    return absl::InvalidArgumentError(
+        "Bench manifest did not contain usable BMFile entries");
+  }
+
+  return entries;
+}
+
+absl::StatusOr<BenchEntry> LibXml2Parser::BuildBenchEntry(
+    const std::filesystem::path& original,
+    const std::filesystem::path& resolved) {
+  BenchEntry entry;
+  entry.original_path = original;
+  std::filesystem::path resolved_abs = resolved;
+  if (resolved_abs.is_relative()) {
+    resolved_abs = std::filesystem::absolute(resolved_abs);
+  }
+  std::error_code norm_ec;
+  auto normalized = std::filesystem::weakly_canonical(resolved_abs, norm_ec);
+  if (!norm_ec) {
+    resolved_abs = std::move(normalized);
+  }
+  entry.resolved_path = resolved_abs;
+
+  std::error_code ec;
+  if (!std::filesystem::exists(resolved_abs, ec)) {
+    if (ec) {
+      return absl::InternalError(absl::StrFormat(
+          "Failed to check path existence %s: %s", resolved_abs.string(),
+          ec.message()));
+    }
+    return absl::NotFoundError(absl::StrFormat(
+        "Bench path not found: %s", resolved_abs.string()));
+  }
+
+  if (std::filesystem::is_directory(resolved_abs, ec)) {
+    if (ec) {
+      return absl::InternalError(absl::StrFormat(
+          "Failed to inspect directory %s: %s", resolved_abs.string(),
+          ec.message()));
+    }
+    entry.kind = BenchPathKind::kDirectory;
+    if (auto status = CollectDirectoryFiles(resolved_abs, entry); !status.ok()) {
+      return status;
+    }
+    return entry;
+  }
+
+  if (std::filesystem::is_regular_file(resolved_abs, ec)) {
+    if (ec) {
+      return absl::InternalError(absl::StrFormat(
+          "Failed to inspect file %s: %s", resolved_abs.string(),
+          ec.message()));
+    }
+    entry.kind = BenchPathKind::kFile;
+    auto format_or = DetectFormatVersion(resolved_abs);
+    if (!format_or.ok()) {
+      return format_or.status();
+    }
+    entry.files.push_back({resolved_abs, *format_or});
+    return entry;
+  }
+
+  return absl::InvalidArgumentError(absl::StrFormat(
+      "Bench path is neither file nor directory: %s", resolved_abs.string()));
+}
+
+absl::Status LibXml2Parser::CollectDirectoryFiles(
+    const std::filesystem::path& dir, BenchEntry& entry) {
+  std::vector<BenchFileInfo> files;
+  std::error_code ec;
+  for (std::filesystem::recursive_directory_iterator it(dir, ec), end;
+       it != end && !ec; it.increment(ec)) {
+    if (!it->is_regular_file(ec)) {
+      continue;
+    }
+    if (it->path().extension() != ".xml") {
+      continue;
+    }
+    auto format_or = DetectFormatVersion(it->path());
+    if (!format_or.ok()) {
+      return format_or.status();
+    }
+    files.push_back({std::filesystem::absolute(it->path()), *format_or});
+  }
+
+  if (ec) {
+    return absl::InternalError(absl::StrFormat(
+        "Failed to iterate directory %s: %s", dir.string(), ec.message()));
+  }
+
+  if (files.empty()) {
+    return absl::NotFoundError(absl::StrFormat(
+        "No XML benchmarks found under %s", dir.string()));
+  }
+
+  entry.files = std::move(files);
+  return absl::OkStatus();
+}
+
+absl::StatusOr<std::string> LibXml2Parser::DetectFormatVersion(
+    const std::filesystem::path& file) {
+  XmlDocGuard doc_guard(file);
+  if (!doc_guard.IsValid()) {
+    return absl::InvalidArgumentError(absl::StrFormat(
+        "Failed to parse XML file: %s", file.string()));
+  }
+
+  xmlNodePtr root = doc_guard.root();
+  if (!root) {
+    return absl::InvalidArgumentError(
+        "XML document has no root element");
+  }
+
+  xmlNodePtr presentation = FindChildNode(root, "presentation");
+  if (!presentation) {
+    return std::string();
+  }
+
+  auto format_attr = GetAttribute(presentation, "format");
+  if (!format_attr.ok()) {
+    return std::string();
+  }
+
+  return *format_attr;
 }
 
 // ============================================================================

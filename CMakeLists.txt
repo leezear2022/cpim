@@ -156,6 +156,49 @@ target_compile_options(cpim_model PRIVATE
   $<$<CONFIG:Release>:-O3 -march=native>
 )
 
+
+
+add_library(cpim_solver_cpu STATIC
+  src/AC.cpp
+  src/AC3.cpp
+  src/AC3bit.cpp
+  src/AC3rm.cpp
+  src/FC.cpp
+  src/MAC.cpp
+  src/Network.cpp
+  src/NSAC.cpp
+  src/RNSQ.cpp
+  src/RPC3.cpp
+  src/SAC1.cpp
+  src/SAC3.cpp
+  src/Solver.cpp
+  src/lMaxRPC.cpp
+)
+
+target_include_directories(cpim_solver_cpu PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_BINARY_DIR}/_deps/absl-src
+)
+
+target_link_libraries(cpim_solver_cpu PUBLIC
+  absl::flat_hash_map
+  absl::flat_hash_set
+  absl::inlined_vector
+  absl::span
+  absl::status
+  absl::statusor
+  absl::strings
+  absl::str_format
+  absl::time
+  absl::variant
+  absl::optional
+)
+
+target_compile_options(cpim_solver_cpu PRIVATE
+  -Wall -Wextra
+  $<$<CONFIG:Release>:-O3 -march=native>
+)
+
 # ============================================================================
 # 新解析器测试程序 (纯 C++ 程序，不含 CUDA 代码)
 # ============================================================================
@@ -163,6 +206,7 @@ add_executable(cpim_test_parser samples/main_new_parser.cpp)
 
 target_link_libraries(cpim_test_parser PRIVATE
   cpim_model
+  cpim_solver_cpu
   glog::glog
   absl::flags
   absl::flags_parse
@@ -213,4 +257,3 @@ target_link_libraries(cpim_test_parser PRIVATE
 # 添加 CUDA 相关的路径
 include_directories(${CUDA_INCLUDE_DIRS})
 link_directories(${CUDA_TOOLKIT_ROOT_DIR}/lib64)
-

@@ -3,7 +3,7 @@
 #include <climits>
 #include <vector>
 
-#include "xcsp3model/HModel.h"
+#include "model/intermediate_model.h"
 // #include "xcsp3model/XBuilder.h"  // 已弃用，使用新的 LibXml2Parser 替代
 
 using namespace std;
@@ -138,11 +138,10 @@ inline uint64_t FirstOne(const uint64_t UseMask) {
   return index;
 }
 using namespace cpim;
-using namespace cpim::common;
 
 class IntVar {
  public:
-  IntVar(const HVar& v, int vs_size);
+  IntVar(int id, int domain_size, int num_vars);
   // IntVar(const int id, vector<int>& v);
   ~IntVar(){};
   void RemoveValue(const int a, const int p = 0);
@@ -227,9 +226,8 @@ static const IntVal Nil_Val(nullptr, -1);
 
 class Tabular {
  public:
-  Tabular(const HTab& t, const vector<IntVar*>& scp);
-  // Tabular(const int id, const std::vector<IntVar *>& scope,
-  // vector<vector<int>>& ts, const int len);
+  Tabular(int id, std::vector<IntVar*> scope,
+          std::vector<std::vector<int>> tuples);
   bool sat(const vector<int>& t) const;
   ~Tabular() {}
   void GetFirstValidTuple(const IntVal& v_a, vector<int>& t, int p);
@@ -244,7 +242,7 @@ class Tabular {
   const vector<vector<int>>& tuples() const { return tuples_; }
   float weight;
   int id_;
-  vector<vector<int>>& tuples_;
+  vector<vector<int>> tuples_;
   uint64_t stamp_ = 0;
 
  private:
@@ -331,7 +329,7 @@ class Network {
   unordered_map<IntVar*, vector<IntVar*>> neighborhood;
   vector<vector<IntVar*>> nei_;
   // unordered_map<IntVar*, vector<IntVar*>> neighborhood;
-  Network(const HModel& h);
+  explicit Network(const model::IntermediateModel& model);
   static void GetFirstValidTuple(const IntConVal& c_val, vector<int>& t, const int p);
   static void GetNextValidTuple(const IntConVal& c_val, vector<int>& t, const int p);
 
@@ -372,16 +370,13 @@ class Network {
   ~Network();
 
  private:
-  vector<IntVar*> get_scope(const HTab& t);
-  void get_scope(const HTab &t, vector<IntVar*> scp);
-	HModel hm_;
-	const int max_arity_;
-	const int max_dom_size_;
-	const int max_bitDom_size_;
-	const int num_vars_;
-	const int num_tabs_;
-	int top_ = 0;
-	int tmp_ = 0;
+  int max_arity_;
+  int max_dom_size_;
+  int max_bitDom_size_;
+  int num_vars_;
+  int num_tabs_;
+  int top_ = 0;
+  int tmp_ = 0;
 };
 
 }

@@ -1,5 +1,7 @@
 ﻿#include "Network.h"
 
+#include <algorithm>
+#include <cmath>
 #include <unordered_set>
 
 namespace cpim {
@@ -57,16 +59,29 @@ namespace cpim {
 //	return a;
 //}
 
-IntVar::IntVar(const HVar& v, const int num_vars)
-    : id_(v->id),
-      init_size_(v->vals.size()),
-      limit_(v->vals.size() % BITSIZE),
-      num_bit_(ceil(static_cast<float>(v->vals.size()) / BITSIZE)),
-      vals_(v->vals) {
+IntVar::IntVar(int id, int domain_size, int num_vars)
+    : id_(id),
+      init_size_(domain_size),
+      limit_(domain_size % BITSIZE),
+      num_bit_(domain_size == 0
+                   ? 0
+                   : static_cast<int>(std::ceil(static_cast<float>(domain_size) /
+                                               BITSIZE))),
+      vals_(domain_size) {
+  if (num_bit_ == 0 && init_size_ > 0) {
+    num_bit_ = 1;
+  }
   bit_tmp_.resize(num_bit_, ULLONG_MAX);
-  if (limit_ != BITSIZE) bit_tmp_.back() >>= BITSIZE - limit_;
+  if (!bit_tmp_.empty() && limit_ != BITSIZE && limit_ != 0) {
+    bit_tmp_.back() >>= (BITSIZE - limit_);
+  }
   bit_doms_.resize(num_vars + 3, bit_tmp_);
   assigned_.resize(num_vars + 3, false);
+  for (int i = 0; i < init_size_; ++i) {
+    vals_[i] = i;
+  }
+  top_ = 0;
+  top_size = init_size_;
 }
 
 // IntVar::IntVar(const int id, vector<int>& v) :
@@ -280,13 +295,16 @@ ostream& operator<<(ostream& os, const IntVal& v_val) {
 }
 ////////////////////////////////////////////////////////////////////////////
 
-Tabular::Tabular(const HTab& t, const vector<IntVar*>& scp)
+Tabular::Tabular(int id, std::vector<IntVar*> scp,
+                         std::vector<std::vector<int>> tuples)
     : arity(scp.size()),
-      scope(scp),
+      scope(std::move(scp)),
       weight(1),
-      id_(t->id),
-      tuples_(t->tuples),
-      stamp_(0) {}
+      id_(id),
+      tuples_(std::move(tuples)),
+      stamp_(0) {
+  std::sort(tuples_.begin(), tuples_.end());
+}
 
 bool Tabular::sat(const vector<int>& t) const {
   return binary_search(tuples_.begin(), tuples_.end(), t);
@@ -336,35 +354,59 @@ bool Tabular::IsValidTuple(vector<int>& t, const int p) {
 ///////////////////////////////////////////////////////////////////////////
 
 ///////////////////////////////////////////////////////////////////////////
-Network::Network(const HModel& h)
-    : hm_(h),
-      max_arity_(h->max_arity()),
-      max_dom_size_(h->max_domain_size()),
-      max_bitDom_size_(ceil(float(h->max_domain_size()) / BITSIZE)),
-      num_vars_(h->Vars().size()),
-      num_tabs_(h->Tabs().size()) {
+Network::Network(const model::IntermediateModel& intermediate)
+    : max_arity_(0),
+      max_dom_size_(0),
+      max_bitDom_size_(0),
+      num_vars_(intermediate.num_variables()),
+      num_tabs_(0) {
   vars.reserve(num_vars_);
-  tabs.reserve(num_tabs_);
+  tabs.reserve(intermediate.num_constraints());
   nei_.resize(num_vars_);
-  for (const auto& hv : hm_->Vars()) {
-    IntVar* v = new IntVar(hv, num_vars_);
+
+  for (const auto& var : intermediate.variables()) {
+    const auto& domain = intermediate.GetDomain(var.domain);
+    const int domain_size = domain.Size();
+    max_dom_size_ = std::max(max_dom_size_, domain_size);
+    auto* v = new IntVar(var.id.value, domain_size, num_vars_);
     vars.push_back(v);
   }
 
-  for (auto ht : hm_->Tabs()) {
-    Tabular* t = new Tabular(ht, get_scope(ht));
+  max_bitDom_size_ = max_dom_size_ == 0
+                         ? 0
+                         : static_cast<int>(std::ceil(static_cast<float>(max_dom_size_) /
+                                                       BITSIZE));
+
+  for (const auto& constraint : intermediate.constraints()) {
+    const auto* ext = std::get_if<model::ExtensionConstraint>(&constraint.data);
+    if (!ext) {
+      continue;
+    }
+    if (ext->semantics != model::ExtensionConstraint::Semantics::kSupports) {
+      continue;
+    }
+    std::vector<IntVar*> scope;
+    scope.reserve(ext->scope.size());
+    for (model::VariableId vid : ext->scope) {
+      scope.push_back(vars[vid.value]);
+    }
+    max_arity_ = std::max<int>(max_arity_, scope.size());
+    auto tuples = ext->tuples;
+    auto* t = new Tabular(constraint.id.value, std::move(scope), std::move(tuples));
     tabs.push_back(t);
   }
 
-  for (auto t : tabs)
-    for (auto v : t->scope) subscription[v].push_back(t);
+  num_tabs_ = static_cast<int>(tabs.size());
 
-  for (auto v : vars) {
+  for (auto* t : tabs)
+    for (auto* v : t->scope) subscription[v].push_back(t);
+
+  for (auto* v : vars) {
     neighborhood[v] = get_neighbor(v);
     nei_[v->id()] = neighborhood[v];
   }
 
-  tmp_ = vars.size() + 2;
+  tmp_ = static_cast<int>(vars.size()) + 2;
 }
 
 void Network::GetFirstValidTuple(const IntConVal& c_val, vector<int>& t,
@@ -441,16 +483,6 @@ Network::~Network() {
   for (const auto t : tabs) delete t;
   vars.clear();
   tabs.clear();
-}
-
-vector<IntVar*> Network::get_scope(const HTab& t) {
-  vector<IntVar*> tt(t->scope.size());
-  for (int i = 0; i < t->scope.size(); ++i) tt[i] = vars[t->scope[i]->id];
-  return tt;
-}
-
-void Network::get_scope(const HTab& t, vector<IntVar*> scp) {
-  for (int i = 0; i < t->scope.size(); ++i) scp[i] = vars[t->scope[i]->id];
 }
 
 const IntConVal& IntConVal::operator=(const IntConVal& rhs) {

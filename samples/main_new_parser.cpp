@@ -4,6 +4,7 @@
 //
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <utility>
 #include <variant>
@@ -17,9 +18,10 @@
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 
-#include "model/xcsp_parser.h"
+#include "Solver.h"
 #include "model/intermediate_model.h"
 #include "model/model_normalizer.h"
+#include "model/xcsp_parser.h"
 
 
 // -----------------------------------------------------------------------------
@@ -164,6 +166,52 @@ void TestNewParser(const BenchFileInfo& bench_file) {
       break;
     }
   }
+
+  // 将中间模型直接接入旧版 CPU 求解器并运行 MAC+AC3bit。
+  LOG(INFO) << "\n========== CPU MAC Solver ==========";
+  cpim::Network network(model);
+  cpim::MAC mac(&network, cpim::AC_3bit, cpim::Heuristic::VRH_DOM_MIN,
+                cpim::Heuristic::VLH_MIN);
+  constexpr int kCpuSolverTimeLimitMs = 900000;
+  cpim::SearchStatistics solve_stats = mac.enforce(kCpuSolverTimeLimitMs);
+  mac.get_solution();
+
+  std::vector<const DomainRemap*> remap_lookup(model.num_domains(), nullptr);
+  for (const DomainRemap& remap : normalizer.domain_remaps()) {
+    if (remap.normalized_id.IsValid() &&
+        remap.normalized_id.value < static_cast<int>(remap_lookup.size())) {
+      remap_lookup[remap.normalized_id.value] = &remap;
+    }
+  }
+
+  if (!mac.solution.empty()) {
+    std::vector<int> original_solution;
+    original_solution.reserve(mac.solution.size());
+    for (size_t idx = 0; idx < mac.solution.size(); ++idx) {
+      const auto& var = model.GetVariable(VariableId{static_cast<int>(idx)});
+      const DomainRemap* remap = remap_lookup[var.domain.value];
+      int canonical_value = mac.solution[idx];
+      int original_value = canonical_value;
+      if (remap && canonical_value >= 0 &&
+          canonical_value < static_cast<int>(remap->canonical_to_original.size())) {
+        original_value = remap->canonical_to_original[canonical_value];
+      }
+      original_solution.push_back(original_value);
+    }
+    LOG(INFO) << "MAC solution (canonical indices): " << mac.sol_str;
+    LOG(INFO) << "MAC solution (original values): "
+              << absl::StrJoin(original_solution, " ");
+  } else if (solve_stats.time_out) {
+    LOG(WARNING) << "MAC search timed out before finding a solution.";
+  } else {
+    LOG(WARNING) << "MAC search did not find a solution.";
+  }
+
+  LOG(INFO) << absl::StrFormat(
+      "MAC stats: time=%d ms, positives=%d, negatives=%d, nodes=%d, timeout=%s",
+      static_cast<int>(solve_stats.solve_time), solve_stats.num_positive,
+      solve_stats.num_negative, solve_stats.nodes,
+      solve_stats.time_out ? "true" : "false");
 
   // 示例：查询拓扑关系
   if (model.num_variables() > 0) {

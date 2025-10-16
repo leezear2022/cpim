@@ -5,9 +5,9 @@
          会自动逐个解析并检测 <presentation format="..."> 获取版本。 -->
     <!-- <BMFile id="dir-demo" type="dir">benchmarks/xcspsuite</BMFile> -->
     <!--<BMFile id ="0">E:/Projects/benchmarks/queen_ext/queens_020.xml</BMFile>-->
-   <BMFile id="0">../samples/bench/queens-4_ext.xml</BMFile>
+   <!-- <BMFile id="0">../samples/bench/queens-4_ext.xml</BMFile> -->
     <!-- <BMFile id="0">../samples/bench/test.xml</BMFile> -->
-    <!--    <BMFile id="0">../samples/bench/queens-12_ext.xml</BMFile>-->
+       <BMFile id="0">../samples/bench/queens-12_ext.xml</BMFile>
     <!--    <BMFile id="0">/home/lee/benchmarks/composed-25-1-2/composed-25-1-2-2_ext.xml</BMFile>-->
     <!--<BMFile id ="0">E:\Projects\benchmarks\tightness0.8\rand-2-40-80-103-800-55_ext.xml</BMFile>-->
     <!--<BMFile id ="0">E:/Projects/benchmarks/geom/geo50-20-d4-75-2_ext.xml</BMFile>-->

@@ -6,7 +6,7 @@
 
 CPIM 是一个高性能约束满足问题（CSP）求解器，支持 CPU 和 GPU 并行求解，实现了多种弧一致性算法（AC3, SAC, RPC 等）。
 
-> **CPIM** = **C**onstraint **P**rogramming with **I**ntelligent **M**ethods (使用智能方法的约束编程)
+> **CPIM** = **C**onstraint **P**rogramming **I**n **M**emory computing (存算一体约束编程求解器)
 
 ## ✨ 主要特性
 

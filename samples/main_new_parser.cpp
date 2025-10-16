@@ -19,6 +19,7 @@
 
 #include "model/xcsp_parser.h"
 #include "model/intermediate_model.h"
+#include "model/model_normalizer.h"
 
 
 // -----------------------------------------------------------------------------
@@ -71,9 +72,25 @@ void TestNewParser(const BenchFileInfo& bench_file) {
   LOG(INFO) << absl::StrFormat("Parse completed in %s",
                                absl::FormatDuration(parse_duration));
 
-  // IntermediateModel 此时已经持有 domains/variables/constraints/relations
-  // 及其索引，供解析阶段和求解阶段共享使用。
-  const auto& model = *model_or;
+  // 对解析结果执行模型归一化：域索引从 0 开始，约束语义统一为 supports。
+  ModelNormalizer normalizer;
+  auto normalized_or = normalizer.Normalize(*model_or);
+  if (!normalized_or.ok()) {
+    LOG(ERROR) << "Normalization failed: " << normalized_or.status();
+    return;
+  }
+  const auto& model = *normalized_or;
+
+  // 展示归一化后的域映射，帮助理解取值如何被重标记。
+  for (const DomainRemap& remap : normalizer.domain_remaps()) {
+    const auto& normalized_domain = model.GetDomain(remap.normalized_id);
+    LOG(INFO) << absl::StrFormat(
+        "Domain %s -> [0, %d): %s", normalized_domain.name,
+        static_cast<int>(remap.canonical_to_original.size()),
+        absl::StrJoin(remap.canonical_to_original, ", "));
+  }
+
+  // 中间模型现已归一化，可直接供后续求解或调试。
 
   // 打印基本信息
   LOG(INFO) << "\n" << model.ToString();

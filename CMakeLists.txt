@@ -122,6 +122,7 @@ add_library(cpim_model STATIC
   src/model/libxml2_parser.cpp
   src/model/model_builder.cpp
   src/model/intermediate_model.cpp
+  src/model/model_normalizer.cpp
 )
 
 target_include_directories(cpim_model PUBLIC

@@ -332,6 +332,8 @@ samples/bench/
 - **[MODERNIZATION_PLAN_V2.md](MODERNIZATION_PLAN_V2.md)** - 现代化详细计划
 - **[MODERNIZATION_MEMO.md](MODERNIZATION_MEMO.md)** - 快速参考和行动清单
 - **[deprecated/README.md](deprecated/README.md)** - 旧代码迁移指南
+- **[GPU_JETSON_ADAPTATION.md](aig_docs/GPU_JETSON_ADAPTATION.md)** - Jetson (CUDA 12) 适配与优化规划
+- **[GPU_ALGORITHM_OVERVIEW.md](aig_docs/GPU_ALGORITHM_OVERVIEW.md)** - GPU 求解器算法与数据结构概览
 
 ## 🤝 贡献
 

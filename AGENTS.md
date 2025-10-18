@@ -20,3 +20,21 @@ Keep commit subjects concise (≤60 characters) and action oriented; Mandarin ph
 
 ## Documentation & Collaboration
 Refer to `CHANGES_ZH.md` for the latest中文修改清单，并在该文件中持续更新新增改动。全程用中文交流。
+
+优化文档入口：面向 Jetson Orin 的 GPU 侧优化与迁移方案以 `aig_docs/GPU_JETSON_ADAPTATION.md` 为总入口，内含推荐方案与各专题链接（如 `aig_docs/GPU_GAC_PERSISTENT_STATE_MACHINE.md`、`aig_docs/GPU_GAC_PIPELINE_PLAN.md`）。
+
+## 环境信息（Jetson Orin Nano Super 8G）
+- 操作系统：Ubuntu 22.04.5 LTS（内核 `5.15.148-tegra`，`uname -a`）
+- CPU：ARM Cortex-A78AE 六核（单线程/核，最高 1.73 GHz，`lscpu`）
+- GPU：NVIDIA Orin (nvgpu)，驱动 540.4.0，CUDA 12.6（`nvidia-smi`）
+- 内存：7.4 GiB 总计，约 2.9 GiB 已用（`free -h`）
+- 系统盘：/dev/nvme0n1p1，约 937 GB 可用 854 GB（`df -h /`）
+
+## GPU Solver Overview
+- GPU 代码集中于 `include/cuSAC.cuh`, `src/cuSAC.cu`，入口类为 `cpim::CModel`，通过 `CModel::CModel(const HModel&)` 从 HModel 导入变量、约束。
+- `BuildBitModel` 将 HModel 的域与表约束编码成 GPU bitset/纹理，初始化订阅结构与设备常量（变量度、域尺寸、约束邻接）。
+- `solve()` 先执行 `enforceGAC()` 在 GPU 上做全局弧一致性，随后使用 dom/deg 启发式选择变量，借助 `AssignValue`/`RemoveValue` 等 CUDA kernel 做赋值与回溯，整个传播通过 `CsCheckMain` 系列 kernel 实现。
+- 内核关键概念：`bitDom` 表示变量域的位图、`bitSup` 存储约束支持集合、`subscription` 记录变量参与的约束；所有结构通过 `thrust::device_vector` 与 `__managed__` 内存管理。
+- 当前实现紧耦合 HModel：仍依赖 HModel 提供的变量映射、约束列表与订阅信息；若要换用 IntermediateModel，需要补全这些派生数据并重写 `CModel` 构造流程。
+- Jetson 适配与优化规划见：`aig_docs/GPU_JETSON_ADAPTATION.md`。
+- 算法与数据结构详情：`aig_docs/GPU_ALGORITHM_OVERVIEW.md`。

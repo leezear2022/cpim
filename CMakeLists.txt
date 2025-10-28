@@ -55,7 +55,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
 
 # 设置 CUDA 架构
-set(CMAKE_CUDA_ARCHITECTURES 60 70 80)
+set(CMAKE_CUDA_ARCHITECTURES 80 87)
 
 # 添加 CUDA Toolkit 的 include 路径
 include_directories(/usr/local/cuda/include)
@@ -122,6 +122,7 @@ add_library(cpim_model STATIC
   src/model/libxml2_parser.cpp
   src/model/model_builder.cpp
   src/model/intermediate_model.cpp
+  src/model/cmodel_adapter.cpp
   src/model/model_normalizer.cpp
 )
 
@@ -207,6 +208,85 @@ add_executable(cpim_test_parser samples/main_new_parser.cpp)
 target_link_libraries(cpim_test_parser PRIVATE
   cpim_model
   cpim_solver_cpu
+  glog::glog
+  absl::flags
+  absl::flags_parse
+)
+
+# ============================================================================
+# GPU CModel dump utility (parses XML -> IntermediateModel -> CModel)
+# ============================================================================
+add_executable(cpim_dump
+  samples/dump_cmodel.cpp
+  src/cuSAC.cu
+)
+
+set_target_properties(cpim_dump PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON
+)
+
+target_link_libraries(cpim_dump PRIVATE
+  cpim_model
+  cpim_solver_cpu
+  glog::glog
+  absl::flags
+  absl::flags_parse
+  cuda
+  cudart
+)
+
+# ARM 平台上 NVCC 需要禁用 NEON intrinsics，因为 CUDA 编译器不支持 ARM NEON 扩展
+# 使用 -U 来取消内置的宏定义
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm")
+  target_compile_options(cpim_dump PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=-U__ARM_NEON>
+    $<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=-U__ARM_NEON__>
+    $<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=-DABSL_HAVE_NEON=0>
+  )
+endif()
+
+# ============================================================================
+# GModel dump utility (simplified GPU model with unified memory)
+# ============================================================================
+add_executable(dump_gmodel
+  samples/dump_gmodel.cpp
+  src/GModel.cu
+  src/model/gmodel_adapter.cu
+  src/model/gmodel_validator.cu
+)
+
+set_target_properties(dump_gmodel PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON
+)
+
+target_link_libraries(dump_gmodel PRIVATE
+  cpim_model
+  glog::glog
+  absl::flags
+  absl::flags_parse
+  cuda
+  cudart
+)
+
+# ARM 平台 NEON 禁用
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm")
+  target_compile_options(dump_gmodel PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=-U__ARM_NEON>
+    $<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=-U__ARM_NEON__>
+    $<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=-DABSL_HAVE_NEON=0>
+  )
+endif()
+
+# ============================================================================
+# CPU GAC baseline utility (serial event queue + propagation)
+# ============================================================================
+add_executable(cpim_gac_cpu
+  samples/run_gac_cpu.cpp
+  src/model/gac_cpu.cpp
+)
+
+target_link_libraries(cpim_gac_cpu PRIVATE
+  cpim_model
   glog::glog
   absl::flags
   absl::flags_parse

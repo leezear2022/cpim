@@ -306,7 +306,13 @@ absl::StatusOr<IntermediateModel> ModelNormalizer::Normalize(
     }
   }
 
-  return std::move(builder).Build();
+  auto model_or = std::move(builder).Build();
+  if (!model_or.ok()) {
+    return model_or.status();
+  }
+  IntermediateModel normalized = std::move(*model_or);
+  normalized.normalized_ = true;
+  return normalized;
 }
 
 }  // namespace cpim::model

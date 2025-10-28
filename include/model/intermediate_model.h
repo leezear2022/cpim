@@ -11,6 +11,8 @@
 
 namespace cpim::model {
 
+class ModelNormalizer;
+
 // ============================================================================
 // IntermediateModel - 求解器无关的中间模型表示
 //
@@ -33,6 +35,9 @@ class IntermediateModel {
   ~IntermediateModel() = default;
 
   // ==========================================================================
+
+  bool is_normalized() const { return normalized_; }
+
   // 基本查询接口
   // ==========================================================================
 
@@ -108,6 +113,9 @@ class IntermediateModel {
 
  private:
   friend class ModelBuilder;
+  friend class ModelNormalizer;
+
+  bool normalized_ = false;
 
   // 私有构造函数，只能由 ModelBuilder 调用
   explicit IntermediateModel(std::string name, std::vector<Domain> domains,

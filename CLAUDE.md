@@ -69,20 +69,29 @@ The project uses CMake with CUDA support. Key build settings:
    - Supports multiple value heuristics: `VLH_MIN`, etc.
    - Tracks search statistics (nodes, time, solutions)
 
-5. **GPU Solver** - `include/cuSAC.cuh`, `src/cuSAC.cu`
-   - `CModel`: CUDA-based constraint model
+5. **GPU Solver (CModel)** - `include/cuSAC.cuh`, `src/cuSAC.cu`
+   - `CModel`: Traditional CUDA-based constraint model (tightly coupled with HModel)
    - GPU-accelerated GAC (Generalized Arc Consistency) enforcement
    - Uses texture memory for constraint storage
    - Bitset representation for domains on GPU
    - Multi-level support for backtracking on GPU
 
-6. **XCSP3 Parser** - `xcsp3parser/` subdirectory
+6. **Simplified GPU Model (GModel)** - `include/GModel.cuh`, `src/GModel.cu`
+   - Lightweight GPU model built from IntermediateModel (no HModel dependency)
+   - Uses CUDA Unified Memory (`cudaMallocManaged`) for zero-copy access
+   - Only contains core data structures: `bitDom` (domain bitsets) and `bitSup` (support bitsets)
+   - Optimized for Jetson Orin's integrated unified memory architecture
+   - GPU verification kernel (`VerifyOnGPU()`) validates CPU/GPU data consistency
+   - Test tool: `dump_gmodel` parses XCSP files and dumps GModel structure
+
+7. **XCSP3 Parser** - `xcsp3parser/` subdirectory
    - Third-party parser for XCSP3 XML format
    - Integrated as a static library
    - `XBuilder` class (in `include/xcsp3model/XBuilder.h`) bridges parser to HModel
 
 ### Data Flow
 
+#### Traditional Pipeline (via HModel)
 ```
 XCSP3 XML file
   → XBuilder (parses and builds HModel)
@@ -91,6 +100,19 @@ XCSP3 XML file
   → MAC search with AC algorithm
     ├→ CPU: AC3/AC3bit/FC/SAC/RPC/NSAC
     └→ GPU: CModel (parallel GAC enforcement)
+  → Solution or statistics
+```
+
+#### Modern Pipeline (via IntermediateModel)
+```
+XCSP3 XML file
+  → XcspParser (parses to ModelBuilder)
+  → ModelBuilder (builds initial model)
+  → ModelNormalizer (normalizes constraints)
+  → IntermediateModel (normalized, indexed model)
+  ├→ GModel (simplified GPU model with unified memory)
+  │   └→ GPU kernels (constraint propagation, verification)
+  └→ Future: Modern CPU solver
   → Solution or statistics
 ```
 
@@ -135,9 +157,38 @@ MAC mac(n, AC_3bit, Heuristic::VRH_DOM_MIN, Heuristic::VLH_MIN);
 
 Sample benchmarks are in `samples/bench/`:
 - Queens problems: `queens-4_ext.xml`, `queens-12_ext.xml`
-- Other instances: `haystacks-11_ext.xml`, `BMPath.xml`
+- Other instances: `haystacks-11_ext.xml`, `BMPath.xml`, `test.xml`
 
 To use a different benchmark, modify `X_PATH` in `samples/main.cu`.
+
+### Testing GModel (Simplified GPU Model)
+
+The `dump_gmodel` tool builds and verifies the GModel structure:
+
+```bash
+# Build the tool
+cd build
+make dump_gmodel
+
+# Test with a small instance
+./dump_gmodel --input=/home/lee/Codes/cpim/samples/bench/test.xml
+
+# Test with queens-4 and show more entries
+./dump_gmodel --input=/home/lee/Codes/cpim/samples/bench/queens-4_ext.xml --max_print=16
+```
+
+The tool will:
+1. Parse the XCSP XML file to ModelBuilder
+2. Normalize the model to IntermediateModel
+3. Build GModel with unified memory
+4. Print bitDom and bitSup data structures (CPU side)
+5. Launch GPU kernel to verify data accessibility (GPU side)
+
+Expected output includes:
+- Device information (e.g., "GPU device 0: Orin (compute 8.7)")
+- Unified memory properties (e.g., "Concurrent managed access: No")
+- CPU-side data dump (hexadecimal bitDom and bitSup values)
+- GPU kernel output showing the same data read from GPU threads
 
 ## Important Implementation Details
 
@@ -158,31 +209,53 @@ To use a different benchmark, modify `X_PATH` in `samples/main.cu`.
 
 ### GPU Architecture
 
+#### CModel (Traditional)
 - Constants in device memory: `kDeviceBitDomIntSize`, `kDeviceMaxDomSize`, etc.
 - Texture memory used for constraint tables (read-only)
 - Unified memory (`__managed__`) for some data structures
 - CUDA kernels in `src/cuSAC.cu`
+
+#### GModel (Simplified, Unified Memory)
+- **Memory Model**: All data allocated with `cudaMallocManaged` for CPU/GPU shared access
+- **Bitset Layout**: 32-bit words (compatible with `uint32_t`)
+  - `bitDom[var_id * bit_dom_int_size + word_idx]`: Variable domain bitset
+  - Each bit represents one domain value (bit set = value in domain)
+- **Support Layout**: Binary constraint supports stored in `uint2` arrays
+  - For constraint `c` between variables `(x, y)`:
+  - `bitSup[c * bitsup_per_constraint + (0 * max_dom_size + a_x) * bit_dom_int_size].x`: supports in y's domain when x=a_x
+  - `bitSup[c * bitsup_per_constraint + (1 * max_dom_size + a_y) * bit_dom_int_size].y`: supports in x's domain when y=a_y
+- **Jetson Optimization**:
+  - Detects `concurrentManagedAccess == 0` (integrated unified memory)
+  - Skips unsupported `cudaMemPrefetchAsync` calls
+  - Zero-copy access: CPU and GPU share physical memory
+- **Verification Kernel**: `VerifyGModelKernel` reads bitDom/bitSup from GPU and prints via `printf`
 
 ### Constraint Representation
 
 - Extension constraints stored as tables (`Tabular`)
 - Intension constraints converted to tables via `HModel` expression evaluation
 - Binary constraints optimized with bitset supports
+- In GModel: Only binary extension constraints supported (stored in `bitSup`)
 
 ## File Organization
 
 - `include/`: All header files
   - `xcsp3model/`: High-level model classes (HModel, HVar, HTab, XBuilder)
   - `xcsp3parser/`: Parser headers (copied from submodule)
-  - Root headers: Network, Solver, Timer, utility headers
+  - `model/`: Modern model stack (types.h, model_builder.h, intermediate_model.h, cmodel_adapter.h)
+  - Root headers: Network, Solver, Timer, cuSAC.cuh, GModel.cuh, utility headers
 - `src/`: Implementation files
   - AC algorithm implementations: `AC.cpp`, `AC3.cpp`, `AC3bit.cpp`, `AC3rm.cpp`, `FC.cpp`
   - SAC implementations: `SAC1.cpp`, `SAC3.cpp`, `NSAC.cpp`
   - Path consistency: `lMaxRPC.cpp`, `RPC3.cpp`
   - Search: `MAC.cpp`, `Solver.cpp`
   - Model building: `HModel.cpp`, `XBuilder.cpp`, `Network.cpp`
-  - GPU: `cuSAC.cu`
+  - Modern model: `model/xcsp_parser.cpp`, `model/model_builder.cpp`, `model/intermediate_model.cpp`, `model/model_normalizer.cpp`, `model/cmodel_adapter.cpp`
+  - GPU solvers: `cuSAC.cu` (traditional CModel), `GModel.cu` (simplified unified memory model)
 - `samples/`: Main entry point and benchmark files
+  - `main.cu`: Traditional solver entry point (HModel → MAC/CModel)
+  - `dump_gmodel.cpp`: GModel testing tool (IntermediateModel → GModel)
+  - `bench/`: XCSP benchmark instances (test.xml, queens-4_ext.xml, etc.)
 - `xcsp3parser/`: Submodule for XCSP3 parsing
 
 ## Modernization Plans

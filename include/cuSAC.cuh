@@ -10,10 +10,42 @@
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
 
+#include <cstdio>
+#include <cstdlib>
+
 // #include "cuda_runtime_api.h"
 #include "Solver.h"
 #include "xcsp3model/HModel.h"
 namespace cpim {
+
+namespace model {
+class CModelAdapter;
+}
+
+#define CUDA_CHECK(call)                                                    \
+  do {                                                                      \
+    cudaError_t cuda_check_status = (call);                                 \
+    if (cuda_check_status != cudaSuccess) {                                 \
+      fprintf(stderr, "CUDA error %s at %s:%d\n",                       \
+              cudaGetErrorString(cuda_check_status), __FILE__, __LINE__);   \
+      std::abort();                                                         \
+    }                                                                       \
+  } while (0)
+
+#ifdef CPIM_GPU_DEBUG
+#define GPU_PRINTF(...) printf(__VA_ARGS__)
+#define GPU_DEBUG_SYNC() CUDA_CHECK(cudaDeviceSynchronize())
+#else
+#define GPU_PRINTF(...) do {} while (0)
+#define GPU_DEBUG_SYNC() do {} while (0)
+#endif
+
+struct DeviceStats {
+  unsigned long long deletions;
+  unsigned int gac_iterations;
+};
+
+extern __managed__ DeviceStats g_device_stats;
 
 using u32x2 = uint2;
 using u32x3 = uint3;
@@ -252,15 +284,15 @@ class CModel {
   // 以后很有可能会放到纹理内存里
   // uint2* d_bitSup{};
   // 约束和约束的相邻关系
-  i32* d_ConNeighbor{};
+  i32* d_ConNeighbor = nullptr;
   // 长度具有搜索树深度，dom等于1的变量默认它已赋值
-  i32* h_current_domain_size;
-  i32* d_current_domain_size;
-  u32* h_bitDom;
-  u32* d_bitDom;
+  i32* h_current_domain_size = nullptr;
+  i32* d_current_domain_size = nullptr;
+  u32* h_bitDom = nullptr;
+  u32* d_bitDom = nullptr;
 
   // 变量在第几级被赋值了
-  i32* d_assigned_at_level;
+  i32* d_assigned_at_level = nullptr;
 
   thrust::device_vector<u32x3> d_subscription;
   thrust::host_vector<u32x3> h_subscription;
@@ -269,8 +301,8 @@ class CModel {
   thrust::host_vector<int> h_subscription_offset;
 
   // 记录解：索引是变量，值是解
-  i32* d_solution;
-  i32x2* assigned;
+  i32* d_solution = nullptr;
+  i32x2* assigned = nullptr;
   thrust::host_vector<int> h_Deg;
   thrust::device_vector<int> d_Deg;
 
@@ -388,11 +420,13 @@ class CModel {
   }
 
   explicit CModel(const HModel& xm);
+  explicit CModel(model::CModelAdapter adapter);
 
   void bitDomCopy();
 
   int compress_Main();
 
+  void BuildFromAdapter(const model::CModelAdapter& adapter);
   void BuildBitModel(const HModel& xm);
 
   int CreateNewLevel();

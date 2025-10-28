@@ -74,6 +74,13 @@
         "format": "cpp",
         "span": "cpp",
         "variant": "cpp",
-        "__config": "cpp"
+        "__config": "cpp",
+        "csignal": "cpp",
+        "cfenv": "cpp",
+        "forward_list": "cpp",
+        "future": "cpp",
+        "scoped_allocator": "cpp",
+        "shared_mutex": "cpp",
+        "typeindex": "cpp"
     }
 }

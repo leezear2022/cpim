@@ -4,44 +4,46 @@
 [![C++](https://img.shields.io/badge/C++-17-blue.svg)](https://isocpp.org/)
 [![CUDA](https://img.shields.io/badge/CUDA-11.0+-green.svg)](https://developer.nvidia.com/cuda-toolkit)
 
-CPIM 是一个高性能约束满足问题（CSP）求解器，支持 CPU 和 GPU 并行求解，实现了多种弧一致性算法（AC3, SAC, RPC 等）。
+English | [简体中文](README_ZH.md)
 
-> **CPIM** = **C**onstraint **P**rogramming **I**n **M**emory computing (存算一体约束编程求解器)
+CPIM is a high-performance Constraint Satisfaction Problem (CSP) solver with both CPU and GPU parallel solving capabilities, implementing various arc consistency algorithms (AC3, SAC, RPC, etc.).
 
-## ✨ 主要特性
+> **CPIM** = **C**onstraint **P**rogramming **I**n **M**emory computing
 
-- 🚀 **CPU/GPU 混合求解**：同时支持 CPU (MAC) 和 GPU (CUDA) 加速求解
-- 📊 **多种 AC 算法**：AC3, AC3bit, AC3rm, FC, SAC1, SAC3, RPC3, lMaxRPC, NSAC
-- 📁 **XCSP3 支持**：完整支持 XCSP3 格式约束问题
-- ⚡ **高性能解析**：使用 libxml2 + Abseil，比 Xerces-C 快 10 倍
-- 🎯 **智能启发式**：支持多种变量和值选择启发式
-- 🧩 **模块化设计**：清晰的架构，易于扩展新算法
-- 💾 **位集优化**：使用 64 位位集表示域，高效的回溯机制
+## ✨ Key Features
 
-## 🆕 最近更新 (2025-10-16)
+- 🚀 **Hybrid CPU/GPU Solving**: Supports both CPU (MAC) and GPU (CUDA) accelerated solving
+- 📊 **Multiple AC Algorithms**: AC3, AC3bit, AC3rm, FC, SAC1, SAC3, RPC3, lMaxRPC, NSAC
+- 📁 **XCSP3 Support**: Full support for XCSP3 format constraint problems
+- ⚡ **High-Performance Parsing**: Using libxml2 + Abseil, 10x faster than Xerces-C
+- 🎯 **Smart Heuristics**: Support for multiple variable and value ordering heuristics
+- 🧩 **Modular Design**: Clear architecture, easy to extend with new algorithms
+- 💾 **Bitset Optimization**: 64-bit bitset domain representation with efficient backtracking
 
-### ✅ 现代化 XCSP3 解析器
+## 🆕 Recent Updates (2025-10-16)
 
-我们完成了解析器的全面重构：
+### ✅ Modernized XCSP3 Parser
 
-- **libxml2 替代 Xerces-C**：库体积从 ~10MB 降至 ~1MB
-- **Abseil C++ 集成**：使用 Google 的高性能容器库
-- **现代 C++17**：RAII、智能指针、强类型 ID、absl::Status
-- **流式 API**：ModelBuilder 提供更简洁的模型构建接口
-- **性能提升**：queens-4_ext.xml 解析时间 1.26ms
+We completed a comprehensive parser refactoring:
 
-详见 [MODERNIZATION_PLAN_V2.md](MODERNIZATION_PLAN_V2.md)
+- **libxml2 replaces Xerces-C**: Library size reduced from ~10MB to ~1MB
+- **Abseil C++ Integration**: Using Google's high-performance container library
+- **Modern C++17**: RAII, smart pointers, strong-typed IDs, absl::Status
+- **Fluent API**: ModelBuilder provides cleaner model construction interface
+- **Performance Boost**: queens-4_ext.xml parsing time 1.26ms
 
-## 📋 系统要求
+See [MODERNIZATION_PLAN_V2.md](MODERNIZATION_PLAN_V2.md) for details.
 
-- **操作系统**：Linux (测试于 Ubuntu 20.04+)
-- **编译器**：GCC 9.0+ (支持 C++17)
-- **CUDA**：CUDA Toolkit 11.0+ (GPU 求解)
-- **GPU**：NVIDIA GPU with Compute Capability 6.0+ (Pascal 架构及以上)
+## 📋 System Requirements
 
-## 🔧 依赖项
+- **OS**: Linux (tested on Ubuntu 20.04+)
+- **Compiler**: GCC 9.0+ (C++17 support required)
+- **CUDA**: CUDA Toolkit 11.0+ (for GPU solving)
+- **GPU**: NVIDIA GPU with Compute Capability 6.0+ (Pascal architecture or newer)
 
-### 必需依赖
+## 🔧 Dependencies
+
+### Required Dependencies
 
 ```bash
 # Ubuntu/Debian
@@ -53,65 +55,65 @@ sudo apt-get install -y \
     libunwind-dev \
     pkg-config
 
-# CUDA Toolkit (GPU 求解)
-# 从 https://developer.nvidia.com/cuda-downloads 下载安装
+# CUDA Toolkit (for GPU solving)
+# Download from https://developer.nvidia.com/cuda-downloads
 ```
 
-### 自动下载依赖
+### Auto-Downloaded Dependencies
 
-以下库会在构建时通过 CMake FetchContent 自动下载：
+The following libraries are automatically downloaded via CMake FetchContent during build:
 
-- **Abseil C++** (20240722.0 LTS) - Google 的 C++ 公共库
-- ~~Xerces-C~~ (已移除，使用 libxml2 替代)
+- **Abseil C++** (20240722.0 LTS) - Google's C++ common libraries
+- ~~Xerces-C~~ (removed, replaced with libxml2)
 
-### 可选依赖
+### Optional Dependencies
 
-- **GTest** - 单元测试（可选）
-- **gflags** - 命令行参数解析（可选）
+- **GTest** - Unit testing (optional)
+- **gflags** - Command-line flag parsing (optional)
 
-## 🏗️ 构建说明
+## 🏗️ Build Instructions
 
-### 快速构建
+### Quick Build
 
 ```bash
-# 克隆仓库
-git clone https://gitee.com/leezear/cpim.git
+# Clone repository
+git clone https://github.com/leezear2022/cpim.git
 cd cpim
 
-# 创建构建目录
+# Create build directory
 mkdir build && cd build
 
-# 配置和编译
+# Configure and compile
 cmake ..
 make -j4
 
-# 测试新解析器
+# Test new parser
 ./cpim_test_parser ../samples/bench/queens-4_ext.xml
 ```
 
-### CMake 选项
+### CMake Options
 
 ```bash
-# Release 模式（优化编译）
+# Release mode (optimized build)
 cmake -DCMAKE_BUILD_TYPE=Release ..
 
-# 指定 CUDA 架构
+# Specify CUDA architectures
 cmake -DCMAKE_CUDA_ARCHITECTURES="60;70;80" ..
 
-# 详细构建输出
+# Verbose build output
 make VERBOSE=1
 ```
 
-## 🚀 快速开始
+## 🚀 Quick Start
 
-### 1️⃣ 测试新解析器
+### 1️⃣ Test New Parser
 
 ```bash
 cd build
 ./cpim_test_parser ../samples/bench/queens-4_ext.xml
 ```
 
-输出示例：
+Expected output:
 ```
 I1016 09:15:27.756088 Parse completed in 1.258555ms
 Model: queens-4_ext
@@ -120,7 +122,7 @@ Constraints: 6
 Domains: 1
 ```
 
-### 2️⃣ 使用新解析器（C++ 代码）
+### 2️⃣ Using New Parser (C++ Code)
 
 ```cpp
 #include "model/xcsp_parser.h"
@@ -128,17 +130,17 @@ Domains: 1
 using namespace cpim::model;
 
 int main() {
-  // 创建解析器
+  // Create parser
   auto parser = XcspParser::Create(ParserType::kLibXml2);
 
-  // 解析模型
+  // Parse model
   auto model_or = parser->Parse("benchmark.xml");
   if (!model_or.ok()) {
     LOG(ERROR) << model_or.status();
     return 1;
   }
 
-  // 使用模型
+  // Use model
   const auto& model = *model_or;
   LOG(INFO) << "Variables: " << model.variables().size();
   LOG(INFO) << "Constraints: " << model.constraints().size();
@@ -147,238 +149,243 @@ int main() {
 }
 ```
 
-### 3️⃣ 旧求解器（即将迁移）
+### 3️⃣ Legacy Solver (To Be Migrated)
 
 ```cpp
-// 注意：此代码使用旧架构，将在未来版本中更新
+// Note: This code uses the old architecture and will be updated in future versions
 #include "xcsp3model/HModel.h"
 #include "Network.h"
 #include "Solver.h"
 
 HModel hm = HModelNode::Make();
-// ... 加载模型
+// ... load model
 Network net(hm);
 MAC solver(net, AC_3bit, VRH_DOM_MIN, VLH_MIN);
-solver.solve(900000); // 900秒超时
+solver.solve(900000); // 900-second timeout
 ```
 
-## 🏛️ 架构概览
+## 🏛️ Architecture Overview
 
 ```
-XCSP3 文件
+XCSP3 File
     ↓
 ┌─────────────────────────────────┐
-│  LibXml2Parser (新)             │  ← 使用 libxml2 + Abseil
-│  - ModelBuilder (流式 API)      │
-│  - IntermediateModel (中间表示) │
+│  LibXml2Parser (New)            │  ← Uses libxml2 + Abseil
+│  - ModelBuilder (Fluent API)    │
+│  - IntermediateModel (IR)       │
 └─────────────────────────────────┘
     ↓
 ┌─────────────────────────────────┐
-│  适配器 (计划中)                 │
+│  Adapters (Planned)             │
 │  - NetworkAdapter (CPU)         │
 │  - CModelAdapter (GPU)          │
 └─────────────────────────────────┘
     ↓
 ┌──────────────┬──────────────────┐
 │   Network    │     CModel       │
-│  (CPU 模型)  │   (GPU 模型)     │
+│  (CPU Model) │   (GPU Model)    │
 └──────────────┴──────────────────┘
     ↓                  ↓
 ┌──────────────┬──────────────────┐
 │     MAC      │   GPU Solver     │
-│  (CPU 搜索)  │   (GPU 搜索)     │
+│ (CPU Search) │  (GPU Search)    │
 └──────────────┴──────────────────┘
 ```
 
-### 核心模块
+### Core Modules
 
-#### 📦 model/ (新解析模块)
+#### 📦 model/ (New Parser Module)
 
-- **types.h/cpp** - 强类型 ID 定义（DomainId, VariableId, ConstraintId）
-- **xcsp_parser.h/cpp** - 解析器抽象接口（策略模式）
-- **libxml2_parser.h/cpp** - libxml2 实现（RAII 资源管理）
-- **model_builder.h/cpp** - 流式模型构建器（Builder 模式）
-- **intermediate_model.h/cpp** - 中间模型表示（查询接口）
+- **types.h/cpp** - Strong-typed ID definitions (DomainId, VariableId, ConstraintId)
+- **xcsp_parser.h/cpp** - Parser abstract interface (Strategy pattern)
+- **libxml2_parser.h/cpp** - libxml2 implementation (RAII resource management)
+- **model_builder.h/cpp** - Fluent model builder (Builder pattern)
+- **intermediate_model.h/cpp** - Intermediate model representation (Query interface)
 
-#### 🧠 核心求解器
+#### 🧠 Core Solvers
 
-- **HModel** - 高层约束模型（变量、约束、域）
-- **Network** - 运行时约束网络（多层域管理、回溯）
-- **MAC** - 维持弧一致性搜索（CPU）
-- **CModel** - CUDA 约束模型（GPU 并行）
+- **HModel** - High-level constraint model (variables, constraints, domains)
+- **Network** - Runtime constraint network (multi-level domain management, backtracking)
+- **MAC** - Maintaining Arc Consistency search (CPU)
+- **CModel** - CUDA constraint model (GPU parallel)
 
-#### 🔍 一致性算法
+#### 🔍 Consistency Algorithms
 
-| 算法 | 类型 | 特点 |
-|------|------|------|
-| AC3 | 弧一致性 | 经典算法 |
-| AC3bit | 弧一致性 | 位集优化版本 |
-| AC3rm | 弧一致性 | 残差维护 |
-| FC | 前向检查 | 轻量级过滤 |
-| FCbit | 前向检查 | 位集优化版本 |
-| SAC1 | 单态弧一致性 | 强过滤 |
-| SAC3 | 单态弧一致性 | SAC 优化版本 |
-| RPC3 | 路径一致性 | 更强的一致性 |
-| lMaxRPC | 路径一致性 | 限制 MaxRPC |
-| NSAC | 邻居 SAC | 邻域单态一致性 |
+| Algorithm | Type | Features |
+|-----------|------|----------|
+| AC3 | Arc Consistency | Classic algorithm |
+| AC3bit | Arc Consistency | Bitset-optimized version |
+| AC3rm | Arc Consistency | Residual maintenance |
+| FC | Forward Checking | Lightweight filtering |
+| FCbit | Forward Checking | Bitset-optimized version |
+| SAC1 | Singleton Arc Consistency | Strong filtering |
+| SAC3 | Singleton Arc Consistency | SAC optimized version |
+| RPC3 | Path Consistency | Stronger consistency |
+| lMaxRPC | Path Consistency | Limited MaxRPC |
+| NSAC | Neighborhood SAC | Neighborhood singleton consistency |
 
-## 📂 项目结构
+## 📂 Project Structure
 
 ```
 cpim/
-├── include/              # 头文件
-│   ├── model/           # 新解析模块（现代 C++17）
-│   │   ├── types.h      # 强类型 ID、域、变量、约束
+├── include/              # Header files
+│   ├── model/           # New parser module (Modern C++17)
+│   │   ├── types.h      # Strong-typed IDs, domains, variables, constraints
 │   │   ├── xcsp_parser.h
 │   │   ├── libxml2_parser.h
 │   │   ├── model_builder.h
 │   │   └── intermediate_model.h
-│   ├── xcsp3model/      # 高层模型
+│   ├── xcsp3model/      # High-level model
 │   │   └── HModel.h
-│   ├── Network.h        # 运行时网络
-│   ├── Solver.h         # 求解器和算法
-│   ├── cuSAC.cuh        # GPU 求解器
+│   ├── Network.h        # Runtime network
+│   ├── Solver.h         # Solvers and algorithms
+│   ├── cuSAC.cuh        # GPU solver
 │   └── ...
-├── src/                 # 实现文件
-│   ├── model/          # 新解析模块实现
+├── src/                 # Implementation files
+│   ├── model/          # New parser module implementation
 │   ├── HModel.cpp
 │   ├── Network.cpp
-│   ├── MAC.cpp         # CPU 搜索
-│   ├── AC*.cpp         # 各种 AC 算法
-│   ├── SAC*.cpp        # SAC 算法
-│   ├── RPC*.cpp        # RPC 算法
-│   ├── cuSAC.cu        # GPU 求解器
+│   ├── MAC.cpp         # CPU search
+│   ├── AC*.cpp         # Various AC algorithms
+│   ├── SAC*.cpp        # SAC algorithms
+│   ├── RPC*.cpp        # RPC algorithms
+│   ├── cuSAC.cu        # GPU solver
 │   └── ...
-├── samples/             # 示例程序
-│   ├── main_new_parser.cpp  # 新解析器测试
-│   └── bench/          # 测试基准
+├── samples/             # Sample programs
+│   ├── main_new_parser.cpp  # New parser test
+│   └── bench/          # Test benchmarks
 │       ├── queens-4_ext.xml
 │       ├── queens-12_ext.xml
 │       └── ...
-├── deprecated/          # 已弃用代码
-│   ├── xcsp3model/     # 旧 Xerces-C 解析器
-│   └── README.md       # 迁移指南
-├── xcsp3parser/         # XCSP3 解析器库（子模块）
+├── test/                # Test utilities
+│   ├── test_multilevel.cpp  # Multi-level functionality test
+│   ├── gmodel_solver.cpp    # GModel MAC solver
+│   ├── debug_bitsup.cpp     # Constraint table debugger
+│   └── test_cpu_mac.cpp     # CPU MAC test
+├── deprecated/          # Deprecated code
+│   ├── xcsp3model/     # Old Xerces-C parser
+│   └── README.md       # Migration guide
+├── xcsp3parser/         # XCSP3 parser library (submodule)
 ├── CMakeLists.txt
-├── CLAUDE.md           # Claude Code 项目说明
-├── MODERNIZATION_PLAN_V2.md  # 现代化计划
-└── README.md           # 本文件
+├── CLAUDE.md           # Claude Code project guide
+├── MODERNIZATION_PLAN_V2.md  # Modernization plan
+└── README.md           # This file
 ```
 
-## 🎯 启发式策略
+## 🎯 Heuristic Strategies
 
-### 变量选择启发式
+### Variable Ordering Heuristics
 
-- `VRH_DOM_MIN` - 最小域优先（默认）
-- `VRH_DOM_WDEG_MIN` - 加权度最小域优先
-- `VRH_DOM_DEG_MIN` - 度最小域优先
+- `VRH_DOM_MIN` - Minimum domain first (default)
+- `VRH_DOM_WDEG_MIN` - Minimum weighted-degree/domain ratio
+- `VRH_DOM_DEG_MIN` - Minimum degree/domain ratio
 
-### 值选择启发式
+### Value Ordering Heuristics
 
-- `VLH_MIN` - 最小值优先（默认）
+- `VLH_MIN` - Minimum value first (default)
 
-## 📊 基准测试
+## 📊 Benchmarks
 
-项目包含多个 XCSP3 格式的基准测试：
+The project includes several XCSP3 format benchmarks:
 
 ```bash
 samples/bench/
-├── queens-4_ext.xml       # 4-皇后问题
-├── queens-12_ext.xml      # 12-皇后问题
-├── haystacks-11_ext.xml   # Haystacks 问题
-└── BMPath.xml             # 基准路径（间接引用）
+├── queens-4_ext.xml       # 4-Queens problem
+├── queens-12_ext.xml      # 12-Queens problem
+├── haystacks-11_ext.xml   # Haystacks problem
+└── BMPath.xml             # Benchmark path (indirect reference)
 ```
 
-### 性能示例
+### Performance Examples
 
-| 基准 | 解析时间 | 求解器 | 备注 |
-|------|---------|--------|------|
-| queens-4_ext.xml | 1.26ms | LibXml2Parser | 4个变量, 6个约束 |
+| Benchmark | Parse Time | Solver | Notes |
+|-----------|-----------|--------|-------|
+| queens-4_ext.xml | 1.26ms | LibXml2Parser | 4 variables, 6 constraints |
 
-## 🗺️ 开发路线图
+## 🗺️ Development Roadmap
 
-### ✅ Phase 0: 现代化解析器（已完成）
+### ✅ Phase 0: Modernized Parser (Completed)
 
-- [x] libxml2 替换 Xerces-C
-- [x] Abseil C++ 集成
-- [x] 强类型 ID 系统
-- [x] ModelBuilder 流式 API
-- [x] IntermediateModel 中间表示
-- [x] 测试程序 cpim_test_parser
+- [x] Replace Xerces-C with libxml2
+- [x] Integrate Abseil C++
+- [x] Strong-typed ID system
+- [x] ModelBuilder fluent API
+- [x] IntermediateModel intermediate representation
+- [x] Test program cpim_test_parser
 
-### 🔄 Phase 1: 适配器层（计划中）
+### 🔄 Phase 1: Adapter Layer (Planned)
 
-- [ ] IntermediateModel → Network 适配器（CPU 求解器）
-- [ ] IntermediateModel → CModel 适配器（GPU 求解器）
-- [ ] 集成到 MAC 和 GPU 求解流程
+- [ ] IntermediateModel → Network adapter (CPU solver)
+- [ ] IntermediateModel → CModel adapter (GPU solver)
+- [ ] Integration into MAC and GPU solving pipelines
 
-### 🔮 Phase 2: Trail 回溯系统（计划中）
+### 🔮 Phase 2: Trail Backtracking System (Planned)
 
-- [ ] 替换完整拷贝回溯为增量 trail 系统
-- [ ] 预期性能提升：30-50%
+- [ ] Replace full-copy backtracking with incremental trail system
+- [ ] Expected performance gain: 30-50%
 
-### 🚀 Phase 3: 高级特性（未来）
+### 🚀 Phase 3: Advanced Features (Future)
 
-- [ ] 学习启发式（VSIDS, CHB）
-- [ ] 并行搜索
+- [ ] Learning heuristics (VSIDS, CHB)
+- [ ] Parallel search
 - [ ] Lazy clause generation
-- [ ] 更多全局约束
+- [ ] More global constraints
 
-详见 [MODERNIZATION_PLAN_V2.md](MODERNIZATION_PLAN_V2.md)
+See [MODERNIZATION_PLAN_V2.md](MODERNIZATION_PLAN_V2.md) for details.
 
-## 📚 文档
+## 📚 Documentation
 
-- **[CLAUDE.md](CLAUDE.md)** - 项目概览和开发指南（中文）
-- **[MODERNIZATION_PLAN_V2.md](MODERNIZATION_PLAN_V2.md)** - 现代化详细计划
-- **[MODERNIZATION_MEMO.md](MODERNIZATION_MEMO.md)** - 快速参考和行动清单
-- **[deprecated/README.md](deprecated/README.md)** - 旧代码迁移指南
-- **[GPU_JETSON_ADAPTATION.md](aig_docs/GPU_JETSON_ADAPTATION.md)** - Jetson (CUDA 12) 适配与优化规划
-- **[GPU_ALGORITHM_OVERVIEW.md](aig_docs/GPU_ALGORITHM_OVERVIEW.md)** - GPU 求解器算法与数据结构概览
+- **[CLAUDE.md](CLAUDE.md)** - Project overview and development guide (Chinese)
+- **[MODERNIZATION_PLAN_V2.md](MODERNIZATION_PLAN_V2.md)** - Detailed modernization plan
+- **[MODERNIZATION_MEMO.md](MODERNIZATION_MEMO.md)** - Quick reference and action checklist
+- **[deprecated/README.md](deprecated/README.md)** - Legacy code migration guide
+- **[GPU_JETSON_ADAPTATION.md](aig_docs/GPU_JETSON_ADAPTATION.md)** - Jetson (CUDA 12) adaptation and optimization plan
+- **[GPU_ALGORITHM_OVERVIEW.md](aig_docs/GPU_ALGORITHM_OVERVIEW.md)** - GPU solver algorithm and data structure overview
 
-## 🤝 贡献
+## 🤝 Contributing
 
-欢迎贡献！如果您想为 CPIM 做出贡献：
+Contributions are welcome! If you'd like to contribute to CPIM:
 
-1. Fork 本仓库
-2. 创建特性分支 (`git checkout -b feature/AmazingFeature`)
-3. 提交更改 (`git commit -m 'Add some AmazingFeature'`)
-4. 推送到分支 (`git push origin feature/AmazingFeature`)
-5. 开启 Pull Request
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/AmazingFeature`)
+3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
+4. Push to the branch (`git push origin feature/AmazingFeature`)
+5. Open a Pull Request
 
-### 代码规范
+### Code Standards
 
-- 遵循现有代码风格
-- 新功能需要添加测试
-- 使用现代 C++17 特性
-- 优先使用 Abseil 容器和工具
-- 添加清晰的注释（中英文均可）
+- Follow existing code style
+- Add tests for new features
+- Use modern C++17 features
+- Prefer Abseil containers and utilities
+- Add clear comments (English or Chinese)
 
-## 📄 许可证
+## 📄 License
 
-本项目采用 MIT 许可证 - 详见 [LICENSE](LICENSE) 文件
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-## 👨‍💻 作者
+## 👨‍💻 Author
 
-- **Lee** - [leezear@gitee](https://gitee.com/leezear)
+- **Lee** - [leezear2022@github](https://github.com/leezear2022)
 
-## 🙏 致谢
+## 🙏 Acknowledgments
 
-- **XCSP3** - 约束问题标准格式
-- **Abseil** - Google 的 C++ 公共库
-- **libxml2** - 高性能 XML 解析器
-- **CUDA** - NVIDIA 并行计算平台
-- **Claude Code** - AI 辅助开发工具
+- **XCSP3** - Constraint problem standard format
+- **Abseil** - Google's C++ common libraries
+- **libxml2** - High-performance XML parser
+- **CUDA** - NVIDIA parallel computing platform
+- **Claude Code** - AI-assisted development tool
 
-## 📞 联系方式
+## 📞 Contact
 
-- **Issues**: [https://gitee.com/leezear/cpim/issues](https://gitee.com/leezear/cpim/issues)
-- **Email**: （在此添加您的邮箱）
+- **Issues**: [https://github.com/leezear2022/cpim/issues](https://github.com/leezear2022/cpim/issues)
+- **Email**: leezear@live.cn
 
 ---
 
 <div align="center">
 
-**⭐ 如果这个项目对您有帮助，请给我们一个 Star！⭐**
+**⭐ If this project helps you, please give us a Star! ⭐**
 
 Made with ❤️ by Lee | Powered by CUDA & Modern C++
 

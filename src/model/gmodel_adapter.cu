@@ -57,27 +57,33 @@ GModel GModelAdapter::Build(const IntermediateModel& im_model,
   }
 
   const int bit_dom_int_size = IntSize(max_dom_size);
+  const int bit_doms_int_size = num_vars * bit_dom_int_size;
+  const int max_depth = num_vars + 1;  // 最大搜索深度
 
   std::cout << "[GModelAdapter] Model dimensions:" << std::endl;
   std::cout << "  num_vars=" << num_vars << std::endl;
   std::cout << "  num_constraints=" << num_constraints << std::endl;
   std::cout << "  max_dom_size=" << max_dom_size << std::endl;
   std::cout << "  bit_dom_int_size=" << bit_dom_int_size << std::endl;
+  std::cout << "  bit_doms_int_size=" << bit_doms_int_size << std::endl;
+  std::cout << "  max_depth=" << max_depth << std::endl;
 
   // ========================================================================
-  // 1. 分配 bitDom (使用统一内存)
+  // 1. 分配多层级 bitDom (使用统一内存)
   // ========================================================================
-  const size_t bitdom_size = num_vars * bit_dom_int_size * sizeof(u32);
-  std::cout << "[GModelAdapter] Allocating bitDom: " << bitdom_size << " bytes"
-            << std::endl;
+  const size_t bitdom_size = max_depth * bit_doms_int_size * sizeof(u32);
+  std::cout << "[GModelAdapter] Allocating multi-level bitDom: " << bitdom_size
+            << " bytes (" << max_depth << " levels)" << std::endl;
 
   u32* bitDom = nullptr;
   CUDA_CHECK(cudaMallocManaged(&bitDom, bitdom_size));
 
-  // 初始化 bitDom
-  std::fill(bitDom, bitDom + num_vars * bit_dom_int_size, 0u);
+  // 初始化所有层级为 0
+  std::fill(bitDom, bitDom + max_depth * bit_doms_int_size, 0u);
+
+  // 只初始化第 0 层
   BuildBitDom(im_model, bitDom, num_vars, bit_dom_int_size);
-  std::cout << "[GModelAdapter] bitDom initialized" << std::endl;
+  std::cout << "[GModelAdapter] bitDom level 0 initialized" << std::endl;
 
   // ========================================================================
   // 2. 检查纹理内存限制
@@ -197,12 +203,108 @@ GModel GModelAdapter::Build(const IntermediateModel& im_model,
               num_constraints * sizeof(int2));
 
   // ========================================================================
-  // 7. 构造 GModel（转移所有权）
+  // 7. 分配多层级辅助数据（统一内存）
+  // ========================================================================
+  std::cout << "[GModelAdapter] Allocating multi-level auxiliary data..." << std::endl;
+
+  // 7.1 域大小追踪（每个层级，每个变量）
+  const size_t dom_size_array_size = max_depth * num_vars * sizeof(int);
+  int* d_cur_dom_size = nullptr;
+  CUDA_CHECK(cudaMallocManaged(&d_cur_dom_size, dom_size_array_size));
+  std::cout << "[GModelAdapter]   d_cur_dom_size: " << dom_size_array_size
+            << " bytes (" << max_depth << " × " << num_vars << ")" << std::endl;
+
+  // 初始化第 0 层的域大小
+  for (int var = 0; var < num_vars; ++var) {
+    d_cur_dom_size[var] = initial_dom_sizes[var];
+  }
+  // 其余层级初始化为 0
+  std::fill(d_cur_dom_size + num_vars,
+            d_cur_dom_size + max_depth * num_vars, 0);
+
+  // 7.2 赋值栈
+  const size_t assigned_size = max_depth * sizeof(int2);
+  int2* d_assigned = nullptr;
+  CUDA_CHECK(cudaMallocManaged(&d_assigned, assigned_size));
+  std::fill_n(reinterpret_cast<int*>(d_assigned), max_depth * 2, -1);
+  std::cout << "[GModelAdapter]   d_assigned: " << assigned_size
+            << " bytes (" << max_depth << " levels)" << std::endl;
+
+  // 7.3 Device 端订阅表（CSR 格式）
+  std::cout << "[GModelAdapter] Building device-side subscription table (CSR format)..."
+            << std::endl;
+
+  // 统计每个变量的度数
+  std::vector<int> degrees(num_vars, 0);
+  for (int idx = 0; idx < num_constraints; ++idx) {
+    const auto& constraint = im_model.constraints()[idx];
+    const auto* ext = std::get_if<ExtensionConstraint>(&constraint.data);
+    if (!ext || ext->Arity() != 2) continue;
+    if (ext->semantics != ExtensionConstraint::Semantics::kSupports) continue;
+
+    const int x = ext->scope[0].value;
+    const int y = ext->scope[1].value;
+    ++degrees[x];
+    ++degrees[y];
+  }
+
+  // 构建 CSR 偏移数组（前缀和）
+  std::vector<int> offsets(num_vars + 1, 0);
+  for (int i = 0; i < num_vars; ++i) {
+    offsets[i + 1] = offsets[i] + degrees[i];
+  }
+  const int subscription_size = offsets[num_vars];
+
+  std::cout << "[GModelAdapter]   subscription_size: " << subscription_size
+            << " entries" << std::endl;
+
+  // 填充订阅条目
+  std::vector<uint3> entries(subscription_size);
+  std::vector<int> current_pos = offsets;  // 复制偏移作为当前写入位置
+
+  for (int idx = 0; idx < num_constraints; ++idx) {
+    const auto& constraint = im_model.constraints()[idx];
+    const auto* ext = std::get_if<ExtensionConstraint>(&constraint.data);
+    if (!ext || ext->Arity() != 2) continue;
+    if (ext->semantics != ExtensionConstraint::Semantics::kSupports) continue;
+
+    const int cid = constraint.id.value;
+    const int x = ext->scope[0].value;
+    const int y = ext->scope[1].value;
+
+    // 为变量 x 添加订阅条目
+    entries[current_pos[x]++] = make_uint3(x, y, cid);
+    // 为变量 y 添加订阅条目
+    entries[current_pos[y]++] = make_uint3(x, y, cid);
+  }
+
+  // 分配统一内存并拷贝
+  uint3* d_subscription = nullptr;
+  int* d_subscription_offset = nullptr;
+
+  const size_t entries_size = subscription_size * sizeof(uint3);
+  const size_t offsets_size = (num_vars + 1) * sizeof(int);
+
+  CUDA_CHECK(cudaMallocManaged(&d_subscription, entries_size));
+  CUDA_CHECK(cudaMallocManaged(&d_subscription_offset, offsets_size));
+
+  std::memcpy(d_subscription, entries.data(), entries_size);
+  std::memcpy(d_subscription_offset, offsets.data(), offsets_size);
+
+  std::cout << "[GModelAdapter]   d_subscription: " << entries_size << " bytes"
+            << std::endl;
+  std::cout << "[GModelAdapter]   d_subscription_offset: " << offsets_size
+            << " bytes" << std::endl;
+
+  // ========================================================================
+  // 8. 构造 GModel（转移所有权）
   // ========================================================================
   std::cout << "[GModelAdapter] Building GModel object..." << std::endl;
   GModel gmodel(num_vars, num_constraints, max_dom_size, bit_dom_int_size,
-                bitsup_per_constraint, bitDom, texObj_BitSup, cuArray3D,
-                bitSup_managed, scopes_managed, std::move(var_to_constraints),
+                bit_doms_int_size, max_depth, bitsup_per_constraint, bitDom,
+                d_cur_dom_size, d_assigned, d_subscription, d_subscription_offset,
+                subscription_size, texObj_BitSup, cuArray3D, bitSup_managed,
+                scopes_managed, std::move(var_to_constraints),
                 std::move(initial_dom_sizes));
 
   std::cout << "[GModelAdapter] GModel built successfully!" << std::endl;

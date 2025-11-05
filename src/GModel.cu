@@ -48,7 +48,10 @@ inline int Popcount(u32 value) {
 // Private Constructor (called by GModelAdapter)
 // ============================================================================
 GModel::GModel(int num_vars, int num_constraints, int max_dom_size,
-               int bit_dom_int_size, int bitsup_per_constraint, u32* bitDom,
+               int bit_dom_int_size, int bit_doms_int_size, int max_depth,
+               int bitsup_per_constraint, u32* bitDom, int* d_cur_dom_size,
+               int2* d_assigned, uint3* d_subscription,
+               int* d_subscription_offset, int subscription_size,
                cudaTextureObject_t texObj_BitSup, cudaArray_t cuArray3D_BitSup,
                uint2* bitSupData, int2* constraint_scopes,
                std::vector<std::vector<int>> var_to_constraints,
@@ -57,20 +60,30 @@ GModel::GModel(int num_vars, int num_constraints, int max_dom_size,
       num_constraints(num_constraints),
       max_dom_size(max_dom_size),
       bit_dom_int_size(bit_dom_int_size),
+      bit_doms_int_size(bit_doms_int_size),
+      max_depth(max_depth),
       bitsup_per_constraint(bitsup_per_constraint),
       bitDom(bitDom),
+      d_cur_dom_size(d_cur_dom_size),
+      d_assigned(d_assigned),
+      d_subscription(d_subscription),
+      d_subscription_offset(d_subscription_offset),
+      subscription_size(subscription_size),
       texObj_BitSup(texObj_BitSup),
       bitSupData(bitSupData),
       constraint_scopes(constraint_scopes),
       var_to_constraints(std::move(var_to_constraints)),
       initial_dom_sizes(std::move(initial_dom_sizes)),
       cuArray3D_BitSup(cuArray3D_BitSup) {
-  std::cout << "[GModel] Constructed from pre-allocated memory and texture"
+  std::cout << "[GModel] Constructed with multi-level support and device subscription"
             << std::endl;
   std::cout << "  num_vars=" << num_vars << std::endl;
   std::cout << "  num_constraints=" << num_constraints << std::endl;
   std::cout << "  max_dom_size=" << max_dom_size << std::endl;
   std::cout << "  bit_dom_int_size=" << bit_dom_int_size << std::endl;
+  std::cout << "  bit_doms_int_size=" << bit_doms_int_size << std::endl;
+  std::cout << "  max_depth=" << max_depth << std::endl;
+  std::cout << "  subscription_size=" << subscription_size << std::endl;
   std::cout << "  texObj_BitSup=" << texObj_BitSup << std::endl;
 }
 
@@ -81,7 +94,9 @@ GModel::GModel(const model::IntermediateModel& im_model)
     : num_vars(0),  // Temporary, will be reassigned
       num_constraints(0),
       max_dom_size(0),
-      bit_dom_int_size(0) {
+      bit_dom_int_size(0),
+      bit_doms_int_size(0),
+      max_depth(0) {
   std::cout << "[GModel] WARNING: Using deprecated constructor. Please use "
                "GModelAdapter::Build() instead."
             << std::endl;
@@ -104,26 +119,46 @@ GModel::GModel(GModel&& other) noexcept
       num_constraints(other.num_constraints),
       max_dom_size(other.max_dom_size),
       bit_dom_int_size(other.bit_dom_int_size),
+      bit_doms_int_size(other.bit_doms_int_size),
+      max_depth(other.max_depth),
       bitsup_per_constraint(other.bitsup_per_constraint),
       bitDom(other.bitDom),
+      d_cur_dom_size(other.d_cur_dom_size),
+      d_assigned(other.d_assigned),
+      d_subscription(other.d_subscription),
+      d_subscription_offset(other.d_subscription_offset),
+      subscription_size(other.subscription_size),
       texObj_BitSup(other.texObj_BitSup),
       bitSupData(other.bitSupData),
       constraint_scopes(other.constraint_scopes),
       var_to_constraints(std::move(other.var_to_constraints)),
       initial_dom_sizes(std::move(other.initial_dom_sizes)),
-      cuArray3D_BitSup(other.cuArray3D_BitSup) {
+      cuArray3D_BitSup(other.cuArray3D_BitSup),
+      current_level_(other.current_level_),
+      assigned_size_(other.assigned_size_) {
   // Take ownership of resources
   other.bitDom = nullptr;
+  other.d_cur_dom_size = nullptr;
+  other.d_assigned = nullptr;
+  other.d_subscription = nullptr;
+  other.d_subscription_offset = nullptr;
+  other.subscription_size = 0;
   other.texObj_BitSup = 0;
   other.bitSupData = nullptr;
   other.constraint_scopes = nullptr;
   other.cuArray3D_BitSup = nullptr;
+  other.current_level_ = 0;
+  other.assigned_size_ = 0;
 }
 
 GModel& GModel::operator=(GModel&& other) noexcept {
   if (this != &other) {
     // Free existing resources
     if (bitDom) cudaFree(bitDom);
+    if (d_cur_dom_size) cudaFree(d_cur_dom_size);
+    if (d_assigned) cudaFree(d_assigned);
+    if (d_subscription) cudaFree(d_subscription);
+    if (d_subscription_offset) cudaFree(d_subscription_offset);
     if (texObj_BitSup) cudaDestroyTextureObject(texObj_BitSup);
     if (cuArray3D_BitSup) cudaFreeArray(cuArray3D_BitSup);
     if (bitSupData) cudaFree(bitSupData);
@@ -134,20 +169,36 @@ GModel& GModel::operator=(GModel&& other) noexcept {
     const_cast<int&>(num_constraints) = other.num_constraints;
     const_cast<int&>(max_dom_size) = other.max_dom_size;
     const_cast<int&>(bit_dom_int_size) = other.bit_dom_int_size;
+    const_cast<int&>(bit_doms_int_size) = other.bit_doms_int_size;
+    const_cast<int&>(max_depth) = other.max_depth;
     const_cast<int&>(bitsup_per_constraint) = other.bitsup_per_constraint;
     bitDom = other.bitDom;
+    d_cur_dom_size = other.d_cur_dom_size;
+    d_assigned = other.d_assigned;
+    d_subscription = other.d_subscription;
+    d_subscription_offset = other.d_subscription_offset;
+    subscription_size = other.subscription_size;
     texObj_BitSup = other.texObj_BitSup;
     bitSupData = other.bitSupData;
     constraint_scopes = other.constraint_scopes;
     var_to_constraints = std::move(other.var_to_constraints);
     initial_dom_sizes = std::move(other.initial_dom_sizes);
     cuArray3D_BitSup = other.cuArray3D_BitSup;
+    current_level_ = other.current_level_;
+    assigned_size_ = other.assigned_size_;
 
     other.bitDom = nullptr;
+    other.d_cur_dom_size = nullptr;
+    other.d_assigned = nullptr;
+    other.d_subscription = nullptr;
+    other.d_subscription_offset = nullptr;
+    other.subscription_size = 0;
     other.texObj_BitSup = 0;
     other.bitSupData = nullptr;
     other.constraint_scopes = nullptr;
     other.cuArray3D_BitSup = nullptr;
+    other.current_level_ = 0;
+    other.assigned_size_ = 0;
   }
   return *this;
 }
@@ -156,7 +207,8 @@ GModel& GModel::operator=(GModel&& other) noexcept {
 // Destructor
 // ============================================================================
 GModel::~GModel() {
-  if (bitDom || texObj_BitSup || cuArray3D_BitSup) {
+  if (bitDom || d_cur_dom_size || d_assigned || d_subscription ||
+      d_subscription_offset || texObj_BitSup || cuArray3D_BitSup) {
     std::cout << "[GModel] Destructor: freeing GPU memory and textures"
               << std::endl;
   }
@@ -164,6 +216,26 @@ GModel::~GModel() {
   if (bitDom) {
     cudaFree(bitDom);
     bitDom = nullptr;
+  }
+
+  if (d_cur_dom_size) {
+    cudaFree(d_cur_dom_size);
+    d_cur_dom_size = nullptr;
+  }
+
+  if (d_assigned) {
+    cudaFree(d_assigned);
+    d_assigned = nullptr;
+  }
+
+  if (d_subscription) {
+    cudaFree(d_subscription);
+    d_subscription = nullptr;
+  }
+
+  if (d_subscription_offset) {
+    cudaFree(d_subscription_offset);
+    d_subscription_offset = nullptr;
   }
 
   if (texObj_BitSup) {
@@ -282,12 +354,17 @@ void GModel::VerifyOnGPU() const {
 namespace {
 
 __global__ void CsCheckMainKernel(const int* events, int num_events,
-                                  const u32* bitDom, const uint2* bitSup,
+                                  u32* bitDom, const uint2* bitSup,
                                   const int2* scopes, int bit_dom_int_size,
                                   int max_dom_size, int bitsup_per_constraint,
-                                  u32* removal) {
+                                  u32* removal,
+                                  int current_level,
+                                  int bit_doms_int_size) {
   const int event_idx = blockIdx.x;
   if (event_idx >= num_events) return;
+
+  // Calculate level offset for multi-level bitDom access
+  const int level_offset = current_level * bit_doms_int_size;
 
   const int cid = events[event_idx];
   const int2 scope = scopes[cid];
@@ -295,52 +372,82 @@ __global__ void CsCheckMainKernel(const int* events, int num_events,
 
   const int x = scope.x;
   const int y = scope.y;
-  const u32* dom_x = bitDom + x * bit_dom_int_size;
-  const u32* dom_y = bitDom + y * bit_dom_int_size;
+  u32* dom_x = bitDom + level_offset + x * bit_dom_int_size;
+  u32* dom_y = bitDom + level_offset + y * bit_dom_int_size;
 
-  // 传播 x <- y
-  for (int val = threadIdx.x; val < max_dom_size; val += blockDim.x) {
-    const int word = val / kBitsPerWord;
-    const int bit = val % kBitsPerWord;
-    if (word >= bit_dom_int_size) continue;
-    const u32 dom_word = dom_x[word];
-    if (((dom_word >> bit) & 1u) == 0u) continue;
+  extern __shared__ u32 shared[];
+  u32* s_dom_x = shared;
+  u32* s_dom_y = shared + bit_dom_int_size;
 
-    const int sup_idx_base = cid * bitsup_per_constraint +
-                             (0 * max_dom_size + val) * bit_dom_int_size;
-    bool supported = false;
+  // Load shared memory (only first bit_dom_int_size threads needed)
+  if (threadIdx.x < bit_dom_int_size) {
+    s_dom_x[threadIdx.x] = dom_x[threadIdx.x];
+    s_dom_y[threadIdx.x] = dom_y[threadIdx.x];
+  }
+  __syncthreads();
+
+  // Each thread handles exactly one domain value (cuSAC style)
+  const int val = threadIdx.x;
+  const int word = val / kBitsPerWord;
+  const int bit = val % kBitsPerWord;
+  const u32 mask = 1u << bit;
+  const int lane = threadIdx.x & 31;
+
+  bool keep_x = false;
+  bool keep_y = false;
+
+  // Check if this value is in the domain
+  if (word < bit_dom_int_size) {
+    const bool active_x = (s_dom_x[word] & mask) != 0u;
+    const bool active_y = (s_dom_y[word] & mask) != 0u;
+
+    // Find support for x=val (branch-free version to avoid warp divergence)
+    const int sup_idx_base_x = cid * bitsup_per_constraint +
+                               (0 * max_dom_size + val) * bit_dom_int_size;
+    bool has_support_x = false;
+    #pragma unroll
     for (int w = 0; w < bit_dom_int_size; ++w) {
-      const u32 sup_word = bitSup[sup_idx_base + w].x;
-      if (sup_word & dom_y[w]) {
-        supported = true;
-        break;
-      }
+      has_support_x |= (bitSup[sup_idx_base_x + w].x & s_dom_y[w]) != 0;
     }
-    if (!supported) {
-      atomicOr(&removal[x * bit_dom_int_size + word], 1u << bit);
+    keep_x = active_x && has_support_x;
+
+    // Find support for y=val (branch-free version to avoid warp divergence)
+    const int sup_idx_base_y = cid * bitsup_per_constraint +
+                               (1 * max_dom_size + val) * bit_dom_int_size;
+    bool has_support_y = false;
+    #pragma unroll
+    for (int w = 0; w < bit_dom_int_size; ++w) {
+      has_support_y |= (bitSup[sup_idx_base_y + w].y & s_dom_x[w]) != 0;
     }
+    keep_y = active_y && has_support_y;
   }
 
-  // 传播 y <- x
-  for (int val = threadIdx.x; val < max_dom_size; val += blockDim.x) {
-    const int word = val / kBitsPerWord;
-    const int bit = val % kBitsPerWord;
-    if (word >= bit_dom_int_size) continue;
-    const u32 dom_word = dom_y[word];
-    if (((dom_word >> bit) & 1u) == 0u) continue;
+  // Warp-level voting (all threads participate)
+  const unsigned keep_mask_x = __ballot_sync(0xFFFFFFFF, keep_x);
+  const unsigned keep_mask_y = __ballot_sync(0xFFFFFFFF, keep_y);
 
-    const int sup_idx_base = cid * bitsup_per_constraint +
-                             (1 * max_dom_size + val) * bit_dom_int_size;
-    bool supported = false;
-    for (int w = 0; w < bit_dom_int_size; ++w) {
-      const u32 sup_word = bitSup[sup_idx_base + w].y;
-      if (sup_word & dom_x[w]) {
-        supported = true;
-        break;
-      }
+  // First thread in each warp writes the result
+  if (lane == 0 && word < bit_dom_int_size) {
+    const u32 old_word_x = s_dom_x[word];
+    const u32 new_word_x = old_word_x & keep_mask_x;
+    const u32 removed_x = old_word_x ^ new_word_x;
+    if (removed_x) {
+      s_dom_x[word] = new_word_x;
+      atomicOr(&removal[x * bit_dom_int_size + word], removed_x);
+      atomicAnd(reinterpret_cast<unsigned int*>(
+                    &bitDom[level_offset + x * bit_dom_int_size + word]),
+                ~removed_x);
     }
-    if (!supported) {
-      atomicOr(&removal[y * bit_dom_int_size + word], 1u << bit);
+
+    const u32 old_word_y = s_dom_y[word];
+    const u32 new_word_y = old_word_y & keep_mask_y;
+    const u32 removed_y = old_word_y ^ new_word_y;
+    if (removed_y) {
+      s_dom_y[word] = new_word_y;
+      atomicOr(&removal[y * bit_dom_int_size + word], removed_y);
+      atomicAnd(reinterpret_cast<unsigned int*>(
+                    &bitDom[level_offset + y * bit_dom_int_size + word]),
+                ~removed_y);
     }
   }
 }
@@ -401,10 +508,22 @@ GacStats GModel::EnforceGAC(bool verbose, bool /*use_thrust_queue*/) {
 
     cudaMemset(removal, 0, total_words * sizeof(u32));
 
-    constexpr int kBlockSize = 128;
-    CsCheckMainKernel<<<num_events, kBlockSize>>>(
+    // cuSAC style: each thread handles exactly one domain value
+    // threads_per_block = max_dom_size (must be <= 1024)
+    int threads_per_block = max_dom_size;
+    if (threads_per_block > 1024) {
+      std::cerr << "[GAC] ERROR: max_dom_size=" << max_dom_size
+                << " exceeds CUDA limit of 1024 threads per block!" << std::endl;
+      threads_per_block = 1024;  // Fallback (will not work correctly)
+    }
+
+    size_t shared_mem_bytes =
+        static_cast<size_t>(2 * bit_dom_int_size) * sizeof(u32);
+
+    CsCheckMainKernel<<<num_events, threads_per_block, shared_mem_bytes>>>(
         d_events, num_events, bitDom, bitSupData, constraint_scopes,
-        bit_dom_int_size, max_dom_size, bitsup_per_constraint, removal);
+        bit_dom_int_size, max_dom_size, bitsup_per_constraint, removal,
+        current_level_, bit_doms_int_size);
     cudaError_t err = cudaDeviceSynchronize();
     if (err != cudaSuccess) {
       std::cerr << "[GAC] Kernel failed: " << cudaGetErrorString(err)
@@ -421,12 +540,9 @@ GacStats GModel::EnforceGAC(bool verbose, bool /*use_thrust_queue*/) {
       for (int w = 0; w < bit_dom_int_size; ++w) {
         const u32 mask = removal[base + w];
         if (mask == 0u) continue;
-        const u32 before = bitDom[base + w];
-        const u32 remove_bits = before & mask;
-        if (remove_bits == 0u) continue;
         if (verbose) {
           for (int b = 0; b < kBitsPerWord; ++b) {
-            if ((remove_bits >> b) & 1u) {
+            if ((mask >> b) & 1u) {
               const int value = w * kBitsPerWord + b;
               if (value < max_dom_size) {
                 std::cout << "[GAC] remove var " << var << " value " << value
@@ -435,16 +551,18 @@ GacStats GModel::EnforceGAC(bool verbose, bool /*use_thrust_queue*/) {
             }
           }
         }
-        bitDom[base + w] = before & ~remove_bits;
-        stats.deletions += Popcount(remove_bits);
+        stats.deletions += Popcount(mask);
         changed = true;
       }
       if (changed) {
+        const int level_base = current_level_ * bit_doms_int_size;
         int new_size = 0;
         for (int w = 0; w < bit_dom_int_size; ++w) {
-          new_size += Popcount(bitDom[base + w]);
+          new_size += Popcount(bitDom[level_base + base + w]);
         }
         dom_size[var] = new_size;
+        // Sync to d_cur_dom_size for multi-level support
+        d_cur_dom_size[current_level_ * num_vars + var] = new_size;
         touched_vars.push_back(var);
         if (new_size == 0) {
           stats.inconsistent = true;
@@ -479,6 +597,9 @@ GacStats GModel::EnforceGAC(bool verbose, bool /*use_thrust_queue*/) {
   cudaFree(d_events);
   cudaFree(removal);
 
+  // 确保所有内存写入完成（统一内存同步）
+  cudaDeviceSynchronize();
+
   if (verbose) {
     std::cout << "\n[GAC] iterations=" << stats.iterations
               << " deletions=" << stats.deletions
@@ -487,6 +608,162 @@ GacStats GModel::EnforceGAC(bool verbose, bool /*use_thrust_queue*/) {
   }
 
   return stats;
+}
+
+// ============================================================================
+// Multi-Level Search Support Implementation
+// ============================================================================
+
+int GModel::CreateNewLevel() {
+  if (current_level_ >= max_depth - 1) {
+    throw std::runtime_error(
+        "[GModel::CreateNewLevel] Max depth reached: " + std::to_string(max_depth));
+  }
+
+  ++current_level_;
+
+  // 计算源和目标地址
+  u32* src = bitDom + (current_level_ - 1) * bit_doms_int_size;
+  u32* dst = bitDom + current_level_ * bit_doms_int_size;
+
+  // 复制域（Device to Device，统一内存零拷贝）
+  // 注意：在 Jetson Orin 上，这是内存内拷贝，不需要 PCIe 传输
+  const size_t copy_size = bit_doms_int_size * sizeof(u32);
+  cudaError_t status = cudaMemcpy(dst, src, copy_size, cudaMemcpyDeviceToDevice);
+  if (status != cudaSuccess) {
+    throw std::runtime_error(
+        "[GModel::CreateNewLevel] cudaMemcpy failed: " +
+        std::string(cudaGetErrorString(status)));
+  }
+
+  // 复制域大小
+  std::memcpy(d_cur_dom_size + current_level_ * num_vars,
+              d_cur_dom_size + (current_level_ - 1) * num_vars,
+              num_vars * sizeof(int));
+
+  return current_level_;
+}
+
+void GModel::BackToLevel(int level) {
+  if (level < 0 || level >= max_depth) {
+    throw std::runtime_error(
+        "[GModel::BackToLevel] Invalid level: " + std::to_string(level));
+  }
+
+  if (level > current_level_) {
+    throw std::runtime_error(
+        "[GModel::BackToLevel] Cannot back to future level: " +
+        std::to_string(level) + " (current=" + std::to_string(current_level_) + ")");
+  }
+
+  current_level_ = level;
+
+  // 回溯赋值栈（如果需要）
+  while (assigned_size_ > level) {
+    --assigned_size_;
+  }
+}
+
+int GModel::GetCurrentLevel() const {
+  return current_level_;
+}
+
+bool GModel::AssignValue(int var, int value, int level) {
+  if (var < 0 || var >= num_vars) {
+    throw std::runtime_error(
+        "[GModel::AssignValue] Invalid var: " + std::to_string(var));
+  }
+
+  if (level < 0 || level >= max_depth) {
+    throw std::runtime_error(
+        "[GModel::AssignValue] Invalid level: " + std::to_string(level));
+  }
+
+  if (value < 0 || value >= max_dom_size) {
+    throw std::runtime_error(
+        "[GModel::AssignValue] Invalid value: " + std::to_string(value));
+  }
+
+  // 清空该变量的域
+  const int base_idx = GetBitDomIndex(var, 0, level);
+  for (int word = 0; word < bit_dom_int_size; ++word) {
+    bitDom[base_idx + word] = 0u;
+  }
+
+  // 设置唯一值
+  const int word = value / kBitsPerWord;
+  const int bit = value % kBitsPerWord;
+  bitDom[base_idx + word] = (1u << bit);
+
+  // 更新域大小
+  d_cur_dom_size[level * num_vars + var] = 1;
+
+  // 记录赋值
+  if (level < max_depth) {
+    d_assigned[level] = make_int2(var, value);
+    assigned_size_ = std::max(assigned_size_, level + 1);
+  }
+
+  return true;
+}
+
+bool GModel::RemoveValue(int var, int value, int level) {
+  if (var < 0 || var >= num_vars) {
+    throw std::runtime_error(
+        "[GModel::RemoveValue] Invalid var: " + std::to_string(var));
+  }
+
+  if (level < 0 || level >= max_depth) {
+    throw std::runtime_error(
+        "[GModel::RemoveValue] Invalid level: " + std::to_string(level));
+  }
+
+  if (value < 0 || value >= max_dom_size) {
+    return false;  // Value out of range, nothing to remove
+  }
+
+  // 清除指定位
+  const int word = value / kBitsPerWord;
+  const int bit = value % kBitsPerWord;
+  const int idx = GetBitDomIndex(var, word, level);
+
+  const u32 old_value = bitDom[idx];
+  const u32 new_value = old_value & ~(1u << bit);
+
+  if (old_value == new_value) {
+    return false;  // Value was already removed
+  }
+
+  bitDom[idx] = new_value;
+
+  // 更新域大小（需要重新计算）
+  int dom_size = 0;
+  const int base_idx = GetBitDomIndex(var, 0, level);
+  for (int w = 0; w < bit_dom_int_size; ++w) {
+    dom_size += Popcount(bitDom[base_idx + w]);
+  }
+  d_cur_dom_size[level * num_vars + var] = dom_size;
+
+  return dom_size > 0;  // Return false if domain becomes empty
+}
+
+int GModel::GetDomainSize(int var, int level) const {
+  if (var < 0 || var >= num_vars) {
+    throw std::runtime_error(
+        "[GModel::GetDomainSize] Invalid var: " + std::to_string(var));
+  }
+
+  if (level < 0 || level >= max_depth) {
+    throw std::runtime_error(
+        "[GModel::GetDomainSize] Invalid level: " + std::to_string(level));
+  }
+
+  if (!d_cur_dom_size) {
+    throw std::runtime_error(
+        "[GModel::GetDomainSize] d_cur_dom_size is null!");
+  }
+
+  return d_cur_dom_size[level * num_vars + var];
 }
 
 }  // namespace cpim

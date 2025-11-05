@@ -278,6 +278,68 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm")
 endif()
 
 # ============================================================================
+# test_multilevel: 测试 GModel 多层级功能
+# ============================================================================
+add_executable(test_multilevel
+  test_multilevel.cpp
+  src/GModel.cu
+  src/model/gmodel_adapter.cu
+  src/model/gmodel_validator.cu
+)
+
+set_target_properties(test_multilevel PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON
+)
+
+target_link_libraries(test_multilevel PRIVATE
+  cpim_model
+  glog::glog
+  absl::flags
+  absl::flags_parse
+  cuda
+  cudart
+)
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm")
+  target_compile_options(test_multilevel PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=-U__ARM_NEON>
+    $<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=-U__ARM_NEON__>
+    $<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=-DABSL_HAVE_NEON=0>
+  )
+endif()
+
+# ============================================================================
+# gmodel_solver: 简单的 GModel MAC 求解器
+# ============================================================================
+add_executable(gmodel_solver
+  gmodel_solver.cpp
+  src/GModel.cu
+  src/model/gmodel_adapter.cu
+  src/model/gmodel_validator.cu
+)
+
+set_target_properties(gmodel_solver PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON
+)
+
+target_link_libraries(gmodel_solver PRIVATE
+  cpim_model
+  glog::glog
+  absl::flags
+  absl::flags_parse
+  cuda
+  cudart
+)
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm")
+  target_compile_options(gmodel_solver PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=-U__ARM_NEON>
+    $<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=-U__ARM_NEON__>
+    $<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=-DABSL_HAVE_NEON=0>
+  )
+endif()
+
+# ============================================================================
 # CPU GAC baseline utility (serial event queue + propagation)
 # ============================================================================
 add_executable(cpim_gac_cpu

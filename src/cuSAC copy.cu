@@ -1563,7 +1563,8 @@ void CModel::BuildBitModel(const HModel& xm) {
 
   // // 验证数据是否正确拷贝
   // for (int i = 0; i < kNumTabs; ++i) {
-  //   uint3 val = d_MCon[i];
+  //   uint3 val = d_MC
+  // on[i];
   //   std::cout << "d_MCon[" << i << "] = (" << val.x << ", " << val.y << ", "
   //             << val.z << "): " << d_ConPre[i] << "\n";
   // }

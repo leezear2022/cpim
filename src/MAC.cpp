@@ -115,28 +115,37 @@ SearchStatistics MAC::enforce(const int time_limits) {
     }
 
     IntVal v_a = select_v_value(I.size());
-    // cout << v_a << endl;
+    cout << "[Try] Level " << I.size() << ": var[" << v_a.v()->id()
+         << "] = " << v_a.a() << endl;
     n_->NewLevel(I.size());
     I.push(v_a);
     ++statistics_.num_positive;
     v_a.v()->ReduceTo(v_a.a(), I.size());
     x_evt_.push_back(v_a.v());
-    consistent_ = ac_->enforce(x_evt_, I.size()).state;
+    auto cs = ac_->enforce(x_evt_, I.size());
+    consistent_ = cs.state;
+    cout << "  [GAC] deletions=" << cs.num_delete
+         << ", inconsistent=" << (!consistent_ ? "true" : "false");
     x_evt_.clear();
     // I.update_model_assigned();
     if (consistent_ && I.full()) {
-      // cout << I << endl;
+      cout << " → solution found!" << endl;
       finished_ = true;
       statistics_.solve_time = t.elapsed();
       get_solution();
       return statistics_;
       //++sol_count_;
       // consistent_ = false;
+    } else if (consistent_) {
+      cout << " → continue search" << endl;
+    } else {
+      cout << " → prune" << endl;
     }
 
     while (!consistent_ && !I.empty()) {
       v_a = I.pop();
-      // cout << "!" << v_a << endl;
+      cout << "[Backtrack] Level " << I.size() << ": var[" << v_a.v()->id()
+           << "] = " << v_a.a() << endl;
       n_->BackTo(I.size());
       v_a.v()->RemoveValue(v_a.a(), I.size());
       ++statistics_.num_negative;

@@ -38,11 +38,40 @@ class GModel {
   const int num_constraints;
   const int max_dom_size;
   const int bit_dom_int_size;  // 每个变量域需要多少个 uint32
+  const int bit_doms_int_size;  // 所有变量域需要多少个 uint32 = num_vars * bit_dom_int_size
+  const int max_depth;  // 最大搜索深度（通常为 num_vars + 1）
   const int bitsup_per_constraint = 0;
 
   // 位域表示（统一内存 - CPU/GPU 都可访问，需要读写）
-  // bitDom[var_id * bit_dom_int_size + word_idx]
+  // 多层级布局：bitDom[level * bit_doms_int_size + var_id * bit_dom_int_size + word_idx]
+  // 注意：bitDom 是多层级的，总大小为 max_depth * bit_doms_int_size
   u32* bitDom = nullptr;
+
+  // 域大小追踪（统一内存）
+  // 布局：d_cur_dom_size[level * num_vars + var_id]
+  int* d_cur_dom_size = nullptr;
+
+  // 赋值栈（统一内存）
+  // 布局：d_assigned[level] = (var_id, value)
+  int2* d_assigned = nullptr;
+
+  // ========================================================================
+  // Device 端订阅表（CSR 格式，统一内存）
+  // 用途：高效的事件传播，GPU kernel 可以直接访问变量的邻接约束
+  // ========================================================================
+
+  // 订阅条目数组（统一内存）
+  // 每个条目是 uint3(x, y, constraint_id)，表示约束 c 连接变量 x 和 y
+  uint3* d_subscription = nullptr;
+
+  // 订阅偏移数组（CSR 格式，统一内存）
+  // 大小为 num_vars + 1
+  // d_subscription_offset[var_id] 到 d_subscription_offset[var_id+1] 之间
+  // 是变量 var_id 参与的所有约束
+  int* d_subscription_offset = nullptr;
+
+  // 订阅表总条目数（方便 kernel 使用）
+  int subscription_size = 0;
 
   // 位支持表示（纹理内存 - GPU 专用，只读优化）
   // 3D 纹理索引: tex3D<uint2>(texObj_BitSup, value, word_idx, constraint_id)
@@ -95,16 +124,43 @@ class GModel {
   // 基线 GAC 传播：CPU 队列 + GPU CsCheckMain
   GacStats EnforceGAC(bool verbose = true, bool use_thrust_queue = false);
 
+  // ========================================================================
+  // 多层级搜索支持
+  // ========================================================================
+
+  // 层级管理
+  int CreateNewLevel();                      // 创建新层级（复制上一层域）
+  void BackToLevel(int level);               // 回溯到指定层级
+  int GetCurrentLevel() const;               // 获取当前层级
+
+  // 域操作（在指定层级）
+  bool AssignValue(int var, int value, int level);  // 赋值变量
+  bool RemoveValue(int var, int value, int level);  // 删除域值
+  int GetDomainSize(int var, int level) const;      // 获取域大小
+
+  // 辅助方法：获取位域索引
+  inline int GetBitDomIndex(int var, int word, int level) const {
+    return level * bit_doms_int_size + var * bit_dom_int_size + word;
+  }
+
  private:
   // 纹理后端存储（CUDA Array，对用户不可见）
   cudaArray_t cuArray3D_BitSup = nullptr;
 
+  // 当前搜索层级（从 0 开始）
+  int current_level_ = 0;
+
+  // 赋值栈大小
+  int assigned_size_ = 0;
+
   // 私有构造函数，由 GModelAdapter 调用
   // 接收预分配的内存指针和纹理对象（所有权转移给 GModel）
   GModel(int num_vars, int num_constraints, int max_dom_size,
-         int bit_dom_int_size, int bitsup_per_constraint, u32* bitDom,
-         cudaTextureObject_t texObj_BitSup, cudaArray_t cuArray3D_BitSup,
-         uint2* bitSupData, int2* constraint_scopes,
+         int bit_dom_int_size, int bit_doms_int_size, int max_depth,
+         int bitsup_per_constraint, u32* bitDom, int* d_cur_dom_size,
+         int2* d_assigned, uint3* d_subscription, int* d_subscription_offset,
+         int subscription_size, cudaTextureObject_t texObj_BitSup,
+         cudaArray_t cuArray3D_BitSup, uint2* bitSupData, int2* constraint_scopes,
          std::vector<std::vector<int>> var_to_constraints,
          std::vector<int> initial_dom_sizes);
 

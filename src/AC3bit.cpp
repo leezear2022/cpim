@@ -28,6 +28,7 @@ AC3bit::AC3bit(Network* m) : AC3(m), max_bitDom_size_(m->max_bitDom_size()) {
 
 bool AC3bit::seek_support(const IntConVal& c_val, const int p) {
   const int idx = m_->GetIntConValIndex(c_val);
+
   for (IntVar* y : c_val.c()->scope)
     if (y->id() != c_val.v()->id())
       for (int i = 0; i < y->bitDom(p).size(); ++i)

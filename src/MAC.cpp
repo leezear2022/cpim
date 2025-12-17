@@ -131,6 +131,7 @@ SearchStatistics MAC::enforce(const int time_limits) {
     if (consistent_ && I.full()) {
       cout << " → solution found!" << endl;
       finished_ = true;
+      statistics_.num_sol = 1;  // FIX: Set num_sol when solution found
       statistics_.solve_time = t.elapsed();
       get_solution();
       return statistics_;
@@ -254,8 +255,11 @@ bool MAC::solution_check() const {
 
 void MAC::get_solution() {
   solution.resize(n_->vars.size());
+  // FIX: Get solution from variable domains at current level, not from I[]
+  int level = I.size();
   for (int i = 0; i < n_->vars.size(); ++i) {
-    solution[i] = I[i].a();
+    // Each variable should have exactly one value left in its domain
+    solution[i] = n_->vars[i]->head(level);
   }
 
   stringstream strs;

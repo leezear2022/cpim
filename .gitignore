@@ -1,5 +1,6 @@
 /build/
 /build_orin/
+/benchmarks/
 /cmake-build-debug/
 /cmake-build-release/
 /xcsp3parser/lib/
@@ -10,3 +11,13 @@
 xcsp3parser/lib/libxcsp3parser_dynamic.so
 xcsp3parser/lib/libxcsp3parser.a
 xcsp3parser/samples/samplesXcsp3
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Test results
+*.csv
+nightly_*.log

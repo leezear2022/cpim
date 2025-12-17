@@ -221,26 +221,26 @@ struct PersistentGACControl {
 │                                                                 │
 │  for (iter = 0; iter < max_iterations; ++iter) {                │
 │                                                                 │
-│    // 阶段 1: 重置扫描索引                                       │
+│    // 阶段 1: 重置扫描索引                                      │
 │    if (blockIdx.x == 0 && threadIdx.x == 0)                     │
 │      scanner_index = 0;                                         │
 │    grid.sync();                                                 │
 │                                                                 │
-│    // 阶段 2: 处理当前 frontier                                  │
+│    // 阶段 2: 处理当前 frontier                                 │
 │    while ((cid = FetchNextCid()) >= 0) {                        │
 │      ExecuteConstraintCheck(cid);                               │
 │      PropagateToNextBitmap();                                   │
 │    }                                                            │
-│    grid.sync();  ← GPU 内部全局同步                              │
+│    grid.sync();  ← GPU 内部全局同步                             │
 │                                                                 │
-│    // 阶段 3: 检查收敛                                           │
+│    // 阶段 3: 检查收敛                                          │
 │    if (inconsistent || frontier_B 为空) break;                  │
 │                                                                 │
-│    // 阶段 4: Swap 双缓冲                                        │
+│    // 阶段 4: Swap 双缓冲                                       │
 │    swap(frontier_A, frontier_B);                                │
 │    grid.sync();                                                 │
 │                                                                 │
-│    // 阶段 5: 清空 next frontier                                 │
+│    // 阶段 5: 清空 next frontier                                │
 │    clear(frontier_B);                                           │
 │    grid.sync();                                                 │
 │  }                                                              │
@@ -466,6 +466,267 @@ GModel.cu ────────────────┐
 2. **Warp-level 优化**: 使用 Warp Shuffle 减少共享内存访问
 3. **Stream 并行**: 多 Stream 并发处理不同约束组
 4. **动态负载均衡**: 根据约束复杂度动态调整 block 分配
+
+---
+
+## 11. GAC Bit 编码的数学表示
+
+> 本节从数学角度刻画 `bitDom` / `bitSupData` / frontier bitmap 这套 GAC 编码，与前文的代码结构一一对应，方便之后对齐 CPU/GPU 语义、对比实现。
+
+### 11.1 域的 bit 编码
+
+- 变量集合：\(V = \{X_1, \dots, X_n\}\)
+- 最大域大小：\(M = \texttt{max\_dom\_size}\)
+- 统一值编号集合：\(\mathcal{U} = \{0,1,\dots,M-1\}\)
+
+在搜索层级 \(\ell\) 上，变量 \(X_i\) 的当前域是一个集合：
+
+$$
+D_i^{(\ell)} \subseteq \mathcal{U}
+$$
+
+用 bit 向量编码为：
+
+$$
+\mathbf{d}_i^{(\ell)} \in \{0,1\}^M, \quad
+\mathbf{d}_i^{(\ell)}[v] =
+\begin{cases}
+1, & v \in D_i^{(\ell)} \\
+0, & v \notin D_i^{(\ell)}
+\end{cases}
+$$
+
+与内存布局的关系：
+
+$$
+\mathbf{d}_i^{(\ell)}[v]
+\;\longleftrightarrow\;
+\texttt{bitDom[level = }\ell\texttt{][var = i][word = }\lfloor v/32 \rfloor\texttt{]}
+\text{ 中的第 } (v \bmod 32) \text{ 个 bit}
+$$
+
+删值操作：
+
+$$
+\mathbf{d}_i^{(\ell)}[v] \gets 0
+$$
+
+对应到实现就是：
+
+```cpp
+word &= ~(1u << (v % 32));  // 删除值 v
+```
+
+### 11.2 支持表的 bit 编码
+
+考虑一个二元约束：
+
+$$
+c \in C, \quad \text{scope}(c) = (X_i, X_j)
+$$
+
+它的允许关系为：
+
+$$
+R_c \subseteq \mathcal{U} \times \mathcal{U}
+$$
+
+从 \(i \to j\) 方向，定义支持矩阵：
+
+$$
+S_c^{i \to j} \in \{0,1\}^{M \times M}, \quad
+S_c^{i \to j}(a,b) =
+\begin{cases}
+1, & (a,b) \in R_c \\
+0, & (a,b) \notin R_c
+\end{cases}
+$$
+
+对每个 \(a \in \mathcal{U}\)，取出一行作为「支持集合」的 bit 向量：
+
+$$
+\mathbf{s}_{c,i,a} \in \{0,1\}^M, \quad
+\mathbf{s}_{c,i,a}[b] = S_c^{i \to j}(a,b)
+$$
+
+即：
+
+$$
+\text{Supp}_{c,i}(a)
+  = \{\, b \in \mathcal{U} \mid \mathbf{s}_{c,i,a}[b] = 1 \,\}
+  \subseteq \mathcal{U}
+$$
+
+在实现中，对应关系是：
+
+$$
+\mathbf{s}_{c,i,a}
+\;\longleftrightarrow\;
+\texttt{bitSupData[cid][dir = i→j][val = a][word]}
+$$
+
+从 \(j \to i\) 的方向同理有 \(S_c^{j \to i}\) 与 \(\mathbf{s}_{c,j,b}\)，两组方向打包在 `uint2` 里。
+
+### 11.3 单个约束上的 GAC 更新（bit-AND + 非零判断）
+
+在层级 \(\ell\) 上，当前域 bit 向量为 \(\mathbf{d}_i^{(\ell)}, \mathbf{d}_j^{(\ell)}\)。
+
+对约束 \(c=(X_i,X_j)\)，从 \(i \to j\) 方向，GAC 条件是：
+
+> \(a\) 在 \(X_i\) 的域中可接受，当且仅当它在 \(X_j\) 当前域中存在至少一个支持。
+
+集合形式：
+
+$$
+a \in D_i^{(\ell)} \text{ 在 } c \text{ 下有支持}
+\iff
+\exists b \in D_j^{(\ell)} \text{ 使得 } (a,b) \in R_c
+$$
+
+bit 编码下，把「存在支持」写成向量逻辑或：
+
+$$
+\exists b:\ \mathbf{s}_{c,i,a}[b] = 1 \land \mathbf{d}_j^{(\ell)}[b] = 1
+\iff
+\bigvee_{b=0}^{M-1} \big( \mathbf{s}_{c,i,a}[b] \land \mathbf{d}_j^{(\ell)}[b] \big) = 1
+$$
+
+定义中间向量：
+
+$$
+\mathbf{t}_{c,i,a}^{(\ell)}
+  := \mathbf{s}_{c,i,a} \land \mathbf{d}_j^{(\ell)} \in \{0,1\}^M
+$$
+
+则：
+
+$$
+\text{has\_support}_c^{i \to j}(a)
+  := \left( \bigvee_{b=0}^{M-1} \mathbf{t}_{c,i,a}^{(\ell)}[b] \right)
+  = \left( \mathbf{s}_{c,i,a} \land \mathbf{d}_j^{(\ell)} \neq \mathbf{0} \right)
+$$
+
+删值规则可以写成：
+
+$$
+\boxed{
+  \mathbf{d}_i^{(\ell)\,\text{new}}[a] =
+    \mathbf{d}_i^{(\ell)}[a] \land
+    \text{has\_support}_c^{i \to j}(a)
+}
+$$
+
+也就是：
+
+$$
+\boxed{
+  \mathbf{d}_i^{(\ell)\,\text{new}}[a] =
+    \mathbf{d}_i^{(\ell)}[a] \land
+    \left(
+      \bigvee_{b=0}^{M-1}
+        \big(
+          S_c^{i \to j}(a,b) \land \mathbf{d}_j^{(\ell)}[b]
+        \big)
+    \right)
+}
+$$
+
+在实现层面，\(\bigvee\) 是按 32-bit word 分块做的：
+
+$$
+\exists k \text{ 使得 }
+\big(\text{word\_sup}_k(a) \land \text{word\_dom}_k(j)\big) \neq 0
+$$
+
+同理，从 \(j \to i\) 方向有：
+
+$$
+\boxed{
+  \mathbf{d}_j^{(\ell)\,\text{new}}[b] =
+    \mathbf{d}_j^{(\ell)}[b] \land
+    \left(
+      \bigvee_{a=0}^{M-1}
+        \big(
+          S_c^{j \to i}(b,a) \land \mathbf{d}_i^{(\ell)}[a]
+        \big)
+    \right)
+}
+$$
+
+### 11.4 全局 GAC 固定点（忽略 frontier 细节）
+
+记第 \(t\) 轮传播后，变量 \(X_i\) 的域 bit 向量为 \(\mathbf{d}_i^{(t)}\)。
+
+对每个约束 \(c=(X_i,X_j)\)，定义当前轮从 \(i \to j\) 方向得到的「保留掩码」：
+
+$$
+\mathbf{g}_{i,c}^{(t)}[a] =
+  \bigvee_{b=0}^{M-1} \big(
+    S_c^{i \to j}(a,b) \land \mathbf{d}_j^{(t)}[b]
+  \big)
+$$
+
+全局更新（抽象掉 frontier，只看数学上的「所有相关约束都 enforce 一遍」）是：
+
+$$
+\mathbf{d}_i^{(t+1)}[a]
+  =
+  \mathbf{d}_i^{(t)}[a]
+  \land
+  \bigwedge_{c \in N(i)} \mathbf{g}_{i,c}^{(t)}[a]
+$$
+
+其中 \(N(i)\) 是所有包含 \(X_i\) 的约束集合。
+
+GAC 固定点条件是：存在某个 \(T\) 使得
+
+$$
+\forall i,\ \mathbf{d}_i^{(T+1)} = \mathbf{d}_i^{(T)}
+$$
+
+或者等价地：
+
+$$
+\forall c=(X_i,X_j),\ \forall a\ \text{若}\ \mathbf{d}_i^{(T)}[a]=1,\ 
+\text{则}\ \exists b\ \mathbf{d}_j^{(T)}[b]=1 \land (a,b)\in R_c
+$$
+
+以及对称的 \(j \to i\) 条件。
+
+### 11.5 frontier bitmap 与邻接传播的抽象
+
+约束集合 \(C = \{c_0,\dots,c_{m-1}\}\)，frontier 用 bit 向量表示：
+
+$$
+\mathbf{f}^{(t)} \in \{0,1\}^{|C|}, \quad
+\mathbf{f}^{(t)}[k] = 1 \iff c_k \text{ 在第 } t \text{ 轮需要处理}
+$$
+
+变量–约束邻接矩阵（由 `d_subscription` / `d_subscription_offset` 给出）：
+
+$$
+A \in \{0,1\}^{n \times |C|}, \quad
+A[i,k] = 1 \iff X_i \in \text{scope}(c_k)
+$$
+
+第 \(t\) 轮域发生变化的变量标记为：
+
+$$
+\Delta_i^{(t)} =
+\begin{cases}
+1, & \mathbf{d}_i^{(t+1)} \neq \mathbf{d}_i^{(t)} \\
+0, & \text{otherwise}
+\end{cases}
+$$
+
+组合成向量 \(\boldsymbol{\Delta}^{(t)} \in \{0,1\}^n\)。下一轮 frontier 可抽象为：
+
+$$
+\mathbf{f}^{(t+1)}[k] =
+  \bigvee_{i=1}^n \big( \Delta_i^{(t)} \land A[i,k] \big)
+$$
+
+也就是「所有域发生变化的变量，把它们邻接到的约束的 bit 置 1」——与 `PropagateVarToNextBitmap` 的位运算逻辑一致。
 
 ---
 

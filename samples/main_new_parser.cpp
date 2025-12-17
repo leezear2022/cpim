@@ -170,11 +170,40 @@ void TestNewParser(const BenchFileInfo& bench_file) {
   // 将中间模型直接接入旧版 CPU 求解器并运行 MAC+AC3bit。
   LOG(INFO) << "\n========== CPU MAC Solver ==========";
   cpim::Network network(model);
+
+  // 调试信息：使用 VLOG(1) 控制，通过 --v=1 启用
+  VLOG(1) << "Network: tabs=" << network.tabs.size()
+          << " max_dom=" << network.max_domain_size()
+          << " max_arity=" << network.max_arity();
+
   cpim::MAC mac(&network, cpim::AC_3bit, cpim::Heuristic::VRH_DOM_MIN,
                 cpim::Heuristic::VLH_MIN);
   constexpr int kCpuSolverTimeLimitMs = 900000;
   cpim::SearchStatistics solve_stats = mac.enforce(kCpuSolverTimeLimitMs);
-  mac.get_solution();
+  // NOTE: MAC::enforce() already calls get_solution() internally when a solution is found.
+  // Do NOT call get_solution() unconditionally here, as it would fill solution vector
+  // even when no solution exists (UNSAT case).
+
+  // 验证解是否满足所有约束（仅在 VLOG(1) 或更高级别时输出详情）
+  if (!mac.solution.empty() && VLOG_IS_ON(1)) {
+    VLOG(1) << "Verifying solution against all constraints...";
+    int violations = 0;
+    for (auto* tab : network.tabs) {
+      std::vector<int> tuple = {mac.solution[tab->scope[0]->id()],
+                                 mac.solution[tab->scope[1]->id()]};
+      if (!tab->sat(tuple)) {
+        LOG(ERROR) << "VIOLATION: constraint " << tab->id()
+                   << " (V" << tab->scope[0]->id() << ", V" << tab->scope[1]->id() << ")"
+                   << " tuple=(" << tuple[0] << ", " << tuple[1] << ")";
+        ++violations;
+      }
+    }
+    if (violations == 0) {
+      VLOG(1) << "All constraints satisfied!";
+    } else {
+      LOG(ERROR) << "Found " << violations << " constraint violations!";
+    }
+  }
 
   std::vector<const DomainRemap*> remap_lookup(model.num_domains(), nullptr);
   for (const DomainRemap& remap : normalizer.domain_remaps()) {

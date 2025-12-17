@@ -114,6 +114,7 @@ void IntVar::ReduceTo(const int a, const int p) {
   for (auto& v : bit_doms_[p]) v.reset();
   bit_doms_[p][get<0>(index)].set(get<1>(index));
   top_size = 0;
+  assigned_[p] = true;  // FIX: Mark variable as assigned
 }
 
 void IntVar::AddValue(const int a, const int p) {

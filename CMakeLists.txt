@@ -433,3 +433,33 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm")
     $<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=-DABSL_HAVE_NEON=0>
   )
 endif()
+
+# ============================================================================
+# verify_gac: GAC 正确性验证工具 (穷举法对比 AC3bit)
+# ============================================================================
+add_executable(verify_gac
+  samples/verify_gac.cpp
+)
+
+target_link_libraries(verify_gac PRIVATE
+  cpim_model
+  cpim_solver_cpu
+  glog::glog
+  absl::flags
+  absl::flags_parse
+)
+
+# ============================================================================
+# verify_search: MAC 搜索过程正确性验证工具
+# ============================================================================
+add_executable(verify_search
+  samples/verify_search.cpp
+)
+
+target_link_libraries(verify_search PRIVATE
+  cpim_model
+  cpim_solver_cpu
+  glog::glog
+  absl::flags
+  absl::flags_parse
+)

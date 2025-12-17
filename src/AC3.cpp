@@ -183,7 +183,6 @@ bool AC3::revise(const arc& c_x, const int p) {
   while (a != Limits::INDEX_OVERFLOW) {
     if (!seek_support(IntConVal(c_x, a), p)) {
       c_x.v()->RemoveValue(a, p);
-      // cout << "remove: (" << c_x.v_id() << ", " << a << ")" << endl;
       ++cs.num_delete;
       ++delete_;
     }

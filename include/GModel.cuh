@@ -4,6 +4,7 @@
 #include <vector>
 
 #include <cuda_runtime.h>
+#include <cooperative_groups.h>
 
 namespace cpim {
 namespace model {
@@ -17,6 +18,52 @@ struct GacStats {
   int iterations = 0;
   int deletions = 0;
   bool inconsistent = false;
+};
+
+// ============================================================================
+// GAC GPU 控制结构（用于 Bitmap Frontier 方案）
+// ============================================================================
+struct GACControl {
+  int inconsistent_flag;   // 0 or 1，全局不一致标志
+  int scanner_index;       // word-based bitmap 扫描游标
+  unsigned long long deletions;  // 累计删值数（使用 unsigned long long 以支持 atomicAdd）
+  int iterations;          // 传播轮数（frontier 轮数）
+};
+
+// ============================================================================
+// 持久化 Kernel 控制结构（用于 Cooperative Groups 持久化 GAC）
+// ============================================================================
+struct PersistentGACControl {
+  // 基础控制字段（与 GACControl 兼容）
+  int inconsistent_flag;         // 0 or 1，全局不一致标志
+  int scanner_index;             // word-based bitmap 扫描游标
+  unsigned long long deletions;  // 累计删值数
+  int iterations;                // 传播轮数
+
+  // 持久化 Kernel 专用字段
+  int converged_flag;            // 0: 继续, 1: 收敛（达到不动点）
+  int frontier_nonempty;         // 0: next frontier 为空, 1: 非空
+
+  // 双缓冲指针（允许在 GPU 端 swap）
+  u32* frontier_A;               // Current Frontier
+  u32* frontier_B;               // Next Frontier
+};
+
+// GModel 数据视图（传入 kernel 使用）
+struct GModelData {
+  int num_vars;
+  int num_constraints;
+  int max_dom_size;
+  int bit_dom_int_size;
+  int bit_doms_int_size;
+  int bitsup_per_constraint;
+
+  u32*         bitDom;
+  int*         d_cur_dom_size;
+  const uint2* bitSupData;
+  const int2*  constraint_scopes;
+  const uint3* d_subscription;
+  const int*   d_subscription_offset;
 };
 
 // ============================================================================
@@ -98,6 +145,19 @@ class GModel {
   // 初始域大小（CPU 侧基线）
   std::vector<int> initial_dom_sizes;
 
+  // ========================================================================
+  // GAC GPU 控制资源（Bitmap Frontier 方案）
+  // ========================================================================
+  GACControl* d_gac_control = nullptr;      // GPU 控制块
+  u32* d_queue_bitmap_A = nullptr;          // Current Frontier
+  u32* d_queue_bitmap_B = nullptr;          // Next Frontier
+  int bitmap_size_words = 0;                // Bitmap 字数 = (num_constraints + 31) / 32
+
+  // ========================================================================
+  // 持久化 Kernel 控制资源（Cooperative Groups）
+  // ========================================================================
+  PersistentGACControl* d_persistent_control = nullptr;  // 持久化控制块
+
   // 从 IntermediateModel 构造（已弃用，建议使用 GModelAdapter::Build）
   // 保留此构造函数以保持向后兼容性
   [[deprecated("Use GModelAdapter::Build() instead")]] explicit GModel(
@@ -121,8 +181,35 @@ class GModel {
   [[deprecated("Use GModelValidator::ValidateGPUMemory() instead")]] void
   VerifyOnGPU() const;
 
-  // 基线 GAC 传播：CPU 队列 + GPU CsCheckMain
-  GacStats EnforceGAC(bool verbose = true, bool use_thrust_queue = false);
+  // ========================================================================
+  // GAC 传播接口
+  // ========================================================================
+
+  // Bitmap GAC 传播（推荐，高效）
+  // assigned_var: 如果 >= 0，表示增量 GAC（只激活该变量邻接约束）
+  //               如果 < 0，表示初始 GAC（激活所有约束）
+  GacStats EnforceGAC(bool verbose = true, int assigned_var = -1);
+
+  // 持久化 Kernel GAC 传播（使用 Cooperative Groups，消除多轮启动开销）
+  // 仅在支持 Cooperative Launch 的设备上可用
+  // assigned_var: 如果 >= 0，表示增量 GAC（只激活该变量邻接约束）
+  //               如果 < 0，表示初始 GAC（激活所有约束）
+  GacStats EnforceGAC_Persistent(bool verbose = true, int assigned_var = -1);
+
+  // 旧版基线 GAC 传播：CPU 队列 + GPU CsCheckMain（已弃用）
+  [[deprecated("Use EnforceGAC(verbose, assigned_var) instead")]]
+  GacStats EnforceGAC_Legacy(bool verbose = true);
+
+  // GPU 资源初始化/释放
+  void InitializeGPUResources();
+  void FreeGPUResources();
+
+  // 持久化 Kernel 资源初始化/释放
+  void InitializeGPUResources_Persistent();
+  void FreeGPUResources_Persistent();
+
+  // 获取 GModel 数据视图（传入 kernel 使用）
+  GModelData GetGModelDataView() const;
 
   // ========================================================================
   // 多层级搜索支持
@@ -137,6 +224,33 @@ class GModel {
   bool AssignValue(int var, int value, int level);  // 赋值变量
   bool RemoveValue(int var, int value, int level);  // 删除域值
   int GetDomainSize(int var, int level) const;      // 获取域大小
+
+  // ========================================================================
+  // 求解器辅助方法
+  // ========================================================================
+
+  // 选择最小域变量（启发式）
+  // 返回 -1 表示所有变量都已赋值
+  int GetMinDomainVar(int level) const;
+
+  // 检查变量是否已赋值（域大小 = 1）
+  bool IsAssigned(int var, int level) const;
+
+  // 检查所有变量是否都已赋值
+  bool IsFullyAssigned(int level) const;
+
+  // 获取已赋值变量的唯一值
+  // 前提：IsAssigned(var, level) == true
+  // 返回 -1 表示变量未赋值或域为空
+  int GetAssignedValue(int var, int level) const;
+
+  // 获取变量域中的第一个值
+  // 返回 -1 表示域为空
+  int GetFirstValue(int var, int level) const;
+
+  // 获取变量域中的下一个值
+  // 返回 -1 表示没有更多值
+  int GetNextValue(int var, int value, int level) const;
 
   // 辅助方法：获取位域索引
   inline int GetBitDomIndex(int var, int word, int level) const {

@@ -1,15 +1,20 @@
 #include "GModel.cuh"
 
 #include <algorithm>
+#include <cstring>  // for memset (统一内存直接操作)
 #include <iostream>
 #include <stdexcept>
 #include <utility>
 #include <vector>
 
+#include <cooperative_groups.h>
+
 #include "model/gmodel_adapter.h"
 #include "model/intermediate_model.h"
 
 namespace cpim {
+
+namespace cg = cooperative_groups;
 
 // GPU kernel to verify data access (deprecated, moved to GModelValidator)
 __global__ void VerifyGModelKernel(const u32* bitDom,
@@ -207,6 +212,9 @@ GModel& GModel::operator=(GModel&& other) noexcept {
 // Destructor
 // ============================================================================
 GModel::~GModel() {
+  // 释放 Bitmap GAC 资源
+  FreeGPUResources();
+
   if (bitDom || d_cur_dom_size || d_assigned || d_subscription ||
       d_subscription_offset || texObj_BitSup || cuArray3D_BitSup) {
     std::cout << "[GModel] Destructor: freeing GPU memory and textures"
@@ -454,7 +462,7 @@ __global__ void CsCheckMainKernel(const int* events, int num_events,
 
 }  // namespace
 
-GacStats GModel::EnforceGAC(bool verbose, bool /*use_thrust_queue*/) {
+GacStats GModel::EnforceGAC_Legacy(bool verbose) {
   GacStats stats;
   if (!bitDom || !bitSupData || !constraint_scopes) {
     std::cerr << "[GModel::EnforceGAC] Missing GPU data structures" << std::endl;
@@ -604,6 +612,778 @@ GacStats GModel::EnforceGAC(bool verbose, bool /*use_thrust_queue*/) {
     std::cout << "\n[GAC] iterations=" << stats.iterations
               << " deletions=" << stats.deletions
               << " inconsistent=" << (stats.inconsistent ? "true" : "false")
+              << std::endl;
+  }
+
+  return stats;
+}
+
+// ============================================================================
+// Bitmap GAC 传播实现（Scheme F: Bitmap Frontier）
+// ============================================================================
+
+namespace {
+
+// 传播结果结构
+struct PropagateResult {
+  bool x_changed;
+  bool y_changed;
+  bool inconsistent;
+  int deletions;
+};
+
+// 变量 → 邻接约束的传播（Producer）
+__device__ __forceinline__
+void PropagateVarToNextBitmap(
+    int var,
+    const GModelData& model,
+    u32* next_bitmap) {
+
+  const int start = model.d_subscription_offset[var];
+  const int end = model.d_subscription_offset[var + 1];
+
+  for (int i = start; i < end; ++i) {
+    int cid = model.d_subscription[i].z;  // uint3 中 cid 在 z 分量
+    int w = cid / 32;
+    int b = cid % 32;
+    atomicOr(&next_bitmap[w], 1u << b);
+  }
+}
+
+// 从 bitmap 取任务（word 级调度）
+__device__ __forceinline__
+int FetchNextCidFromBitmap(
+    u32* frontier_cur,
+    int bitmap_size_words,
+    int* scanner_index,
+    int& local_word,
+    int& local_offset) {
+
+  while (true) {
+    if (local_word != 0) {
+      int bit = __ffs(local_word) - 1;
+      local_word &= ~(1u << bit);
+      return local_offset + bit;
+    }
+    int w = atomicAdd(scanner_index, 1);
+    if (w >= bitmap_size_words) {
+      return -1;  // 本轮没有任务了
+    }
+    u32 word = atomicExch(&frontier_cur[w], 0u);
+    if (word == 0u) {
+      continue;  // 这个 word 没有任务，继续抢下一 word
+    }
+    local_word = word;
+    local_offset = w * 32;
+  }
+}
+
+// BpC 核心：执行单约束检查
+__device__
+PropagateResult ExecuteConstraintCheck_BpC(
+    int cid,
+    const GModelData& model,
+    int current_level,
+    u32* shared_mem) {
+
+  PropagateResult r{};
+  r.x_changed = r.y_changed = r.inconsistent = false;
+  r.deletions = 0;
+
+  const int2 scope = model.constraint_scopes[cid];
+  const int x = scope.x;
+  const int y = scope.y;
+  if (x < 0 || y < 0) {
+    return r;
+  }
+
+  const int level_offset = current_level * model.bit_doms_int_size;
+  u32* dom_x = model.bitDom + level_offset + x * model.bit_dom_int_size;
+  u32* dom_y = model.bitDom + level_offset + y * model.bit_dom_int_size;
+
+  u32* s_dom_x = shared_mem;
+  u32* s_dom_y = shared_mem + model.bit_dom_int_size;
+
+  // 1) load 到 shared memory
+  for (int w = threadIdx.x; w < model.bit_dom_int_size; w += blockDim.x) {
+    s_dom_x[w] = dom_x[w];
+    s_dom_y[w] = dom_y[w];
+  }
+  __syncthreads();
+
+  // 2) 每个线程处理若干 value
+  for (int val = threadIdx.x; val < model.max_dom_size; val += blockDim.x) {
+    const int word = val / 32;
+    const int bit = val % 32;
+    if (word >= model.bit_dom_int_size) break;
+    const u32 mask = 1u << bit;
+
+    const bool active_x = (s_dom_x[word] & mask) != 0u;
+    const bool active_y = (s_dom_y[word] & mask) != 0u;
+
+    bool keep_x = true, keep_y = true;
+
+    if (active_x) {
+      const int sup_idx_base_x =
+          cid * model.bitsup_per_constraint +
+          (0 * model.max_dom_size + val) * model.bit_dom_int_size;
+      bool has_sup = false;
+      #pragma unroll
+      for (int w = 0; w < model.bit_dom_int_size; ++w) {
+        has_sup |= (model.bitSupData[sup_idx_base_x + w].x & s_dom_y[w]) != 0;
+      }
+      keep_x = has_sup;
+    }
+
+    if (active_y) {
+      const int sup_idx_base_y =
+          cid * model.bitsup_per_constraint +
+          (1 * model.max_dom_size + val) * model.bit_dom_int_size;
+      bool has_sup = false;
+      #pragma unroll
+      for (int w = 0; w < model.bit_dom_int_size; ++w) {
+        has_sup |= (model.bitSupData[sup_idx_base_y + w].y & s_dom_x[w]) != 0;
+      }
+      keep_y = has_sup;
+    }
+
+    if (active_x && !keep_x) {
+      atomicAnd(&s_dom_x[word], ~mask);
+    }
+    if (active_y && !keep_y) {
+      atomicAnd(&s_dom_y[word], ~mask);
+    }
+  }
+  __syncthreads();
+
+  // 3) 写回 global + 统计删值 + DWO
+  if (threadIdx.x == 0) {
+    int new_size_x = 0, new_size_y = 0;
+
+    for (int w = 0; w < model.bit_dom_int_size; ++w) {
+      const u32 old_x = dom_x[w];
+      const u32 new_x = s_dom_x[w];
+      const u32 removed_x = old_x & ~new_x;
+      if (removed_x) {
+        atomicAnd(reinterpret_cast<unsigned int*>(&dom_x[w]), new_x);
+        r.x_changed = true;
+        r.deletions += __popc(removed_x);
+      }
+
+      const u32 old_y = dom_y[w];
+      const u32 new_y = s_dom_y[w];
+      const u32 removed_y = old_y & ~new_y;
+      if (removed_y) {
+        atomicAnd(reinterpret_cast<unsigned int*>(&dom_y[w]), new_y);
+        r.y_changed = true;
+        r.deletions += __popc(removed_y);
+      }
+    }
+
+    // 重新计算域大小
+    const int base_x = level_offset + x * model.bit_dom_int_size;
+    const int base_y = level_offset + y * model.bit_dom_int_size;
+    for (int w = 0; w < model.bit_dom_int_size; ++w) {
+      new_size_x += __popc(model.bitDom[base_x + w]);
+      new_size_y += __popc(model.bitDom[base_y + w]);
+    }
+    model.d_cur_dom_size[current_level * model.num_vars + x] = new_size_x;
+    model.d_cur_dom_size[current_level * model.num_vars + y] = new_size_y;
+
+    if (new_size_x == 0 || new_size_y == 0) {
+      r.inconsistent = true;
+    }
+  }
+  __syncthreads();
+
+  return r;
+}
+
+// Bitmap GAC Kernel（单轮传播）
+__global__
+void BitmapGACKernel(
+    GModelData model,
+    GACControl* control,
+    u32* frontier_cur,
+    u32* frontier_next,
+    int bitmap_size_words,
+    int current_level) {
+
+  extern __shared__ u32 shmem[];
+  int local_word = 0;
+  int local_offset = 0;
+
+  while (true) {
+    __shared__ int cid_shared;
+    if (threadIdx.x == 0) {
+      int cid = FetchNextCidFromBitmap(
+          frontier_cur,
+          bitmap_size_words,
+          &control->scanner_index,
+          local_word,
+          local_offset);
+      cid_shared = cid;
+    }
+    __syncthreads();
+
+    int cid = cid_shared;
+    if (cid < 0) {
+      break;  // 当前轮 frontier 用完
+    }
+
+    // 检查约束 ID 有效性
+    if (cid >= model.num_constraints) {
+      break;
+    }
+
+    // 传播
+    PropagateResult r =
+        ExecuteConstraintCheck_BpC(cid, model, current_level, shmem);
+
+    if (threadIdx.x == 0) {
+      if (r.deletions > 0) {
+        atomicAdd(&control->deletions, (unsigned long long)r.deletions);
+        const int2 scope = model.constraint_scopes[cid];
+        if (r.x_changed) {
+          PropagateVarToNextBitmap(scope.x, model, frontier_next);
+        }
+        if (r.y_changed) {
+          PropagateVarToNextBitmap(scope.y, model, frontier_next);
+        }
+      }
+      if (r.inconsistent) {
+        atomicExch(&control->inconsistent_flag, 1);
+      }
+    }
+    __syncthreads();
+
+    if (control->inconsistent_flag) {
+      break;  // 快速逃出
+    }
+  }
+}
+
+// ============================================================================
+// 持久化 GAC Kernel（使用 Cooperative Groups 实现 GPU 内部多轮迭代）
+// ============================================================================
+__global__
+void PersistentGACKernel(
+    GModelData model,
+    PersistentGACControl* control,
+    int bitmap_size_words,
+    int current_level,
+    int max_iterations) {
+
+  // 初始化 Cooperative Groups
+  cg::grid_group grid = cg::this_grid();
+
+  extern __shared__ u32 shmem[];
+  int local_word = 0;
+  int local_offset = 0;
+
+  // 主循环：直到收敛或发现不一致
+  for (int iter = 0; iter < max_iterations; ++iter) {
+
+    // === 阶段 1：重置扫描索引 ===
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+      control->scanner_index = 0;
+      control->iterations++;
+    }
+    grid.sync();
+
+    // === 阶段 2：处理当前 frontier ===
+    while (true) {
+      __shared__ int cid_shared;
+      if (threadIdx.x == 0) {
+        int cid = FetchNextCidFromBitmap(
+            control->frontier_A,
+            bitmap_size_words,
+            &control->scanner_index,
+            local_word,
+            local_offset);
+        cid_shared = cid;
+      }
+      __syncthreads();
+
+      int cid = cid_shared;
+      if (cid < 0 || cid >= model.num_constraints) {
+        break;  // 当前 block 没有更多任务
+      }
+
+      // 执行约束传播
+      PropagateResult r = ExecuteConstraintCheck_BpC(
+          cid, model, current_level, shmem);
+
+      if (threadIdx.x == 0) {
+        if (r.deletions > 0) {
+          atomicAdd(&control->deletions, (unsigned long long)r.deletions);
+          const int2 scope = model.constraint_scopes[cid];
+          if (r.x_changed) {
+            PropagateVarToNextBitmap(scope.x, model, control->frontier_B);
+          }
+          if (r.y_changed) {
+            PropagateVarToNextBitmap(scope.y, model, control->frontier_B);
+          }
+        }
+        if (r.inconsistent) {
+          atomicExch(&control->inconsistent_flag, 1);
+        }
+      }
+      __syncthreads();
+
+      if (control->inconsistent_flag) {
+        break;
+      }
+    }
+
+    // === 阶段 3：全局同步 + 检查不一致 ===
+    grid.sync();
+
+    if (control->inconsistent_flag) {
+      break;  // 退出主循环
+    }
+
+    // === 阶段 4：检查 next frontier 是否为空 ===
+    __shared__ int block_nonempty;
+    if (threadIdx.x == 0) {
+      block_nonempty = 0;
+    }
+    __syncthreads();
+
+    // 每个 block 检查部分 words
+    int words_per_block = (bitmap_size_words + gridDim.x - 1) / gridDim.x;
+    int start = blockIdx.x * words_per_block;
+    int end = min(start + words_per_block, bitmap_size_words);
+    for (int w = start + (int)threadIdx.x; w < end; w += (int)blockDim.x) {
+      if (control->frontier_B[w] != 0u) {
+        atomicExch(&block_nonempty, 1);
+        break;
+      }
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+      atomicOr(&control->frontier_nonempty, block_nonempty);
+    }
+
+    grid.sync();
+
+    // 检查是否收敛
+    if (control->frontier_nonempty == 0) {
+      if (blockIdx.x == 0 && threadIdx.x == 0) {
+        control->converged_flag = 1;
+      }
+      break;  // 退出主循环
+    }
+
+    // === 阶段 5：Swap 双缓冲 ===
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+      u32* temp = control->frontier_A;
+      control->frontier_A = control->frontier_B;
+      control->frontier_B = temp;
+      control->frontier_nonempty = 0;
+    }
+
+    grid.sync();
+
+    // === 阶段 6：清空新的 next frontier ===
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_threads = gridDim.x * blockDim.x;
+    for (int w = tid; w < bitmap_size_words; w += total_threads) {
+      control->frontier_B[w] = 0u;
+    }
+
+    grid.sync();
+  }
+}
+
+}  // namespace
+
+// ============================================================================
+// GPU 资源管理
+// ============================================================================
+
+void GModel::InitializeGPUResources() {
+  if (d_gac_control) return;  // 已经初始化
+
+  bitmap_size_words = (num_constraints + 31) / 32;
+
+  cudaError_t err;
+  // 使用统一内存，Jetson 上 CPU/GPU 零拷贝访问
+  err = cudaMallocManaged(&d_gac_control, sizeof(GACControl));
+  if (err != cudaSuccess) {
+    throw std::runtime_error(
+        "[GModel::InitializeGPUResources] Failed to allocate d_gac_control: " +
+        std::string(cudaGetErrorString(err)));
+  }
+
+  err = cudaMallocManaged(&d_queue_bitmap_A, bitmap_size_words * sizeof(u32));
+  if (err != cudaSuccess) {
+    cudaFree(d_gac_control);
+    d_gac_control = nullptr;
+    throw std::runtime_error(
+        "[GModel::InitializeGPUResources] Failed to allocate d_queue_bitmap_A: " +
+        std::string(cudaGetErrorString(err)));
+  }
+
+  err = cudaMallocManaged(&d_queue_bitmap_B, bitmap_size_words * sizeof(u32));
+  if (err != cudaSuccess) {
+    cudaFree(d_gac_control);
+    cudaFree(d_queue_bitmap_A);
+    d_gac_control = nullptr;
+    d_queue_bitmap_A = nullptr;
+    throw std::runtime_error(
+        "[GModel::InitializeGPUResources] Failed to allocate d_queue_bitmap_B: " +
+        std::string(cudaGetErrorString(err)));
+  }
+}
+
+void GModel::FreeGPUResources() {
+  if (d_gac_control) {
+    cudaFree(d_gac_control);
+    d_gac_control = nullptr;
+  }
+  if (d_queue_bitmap_A) {
+    cudaFree(d_queue_bitmap_A);
+    d_queue_bitmap_A = nullptr;
+  }
+  if (d_queue_bitmap_B) {
+    cudaFree(d_queue_bitmap_B);
+    d_queue_bitmap_B = nullptr;
+  }
+}
+
+// ============================================================================
+// 持久化 Kernel 资源管理
+// ============================================================================
+
+void GModel::InitializeGPUResources_Persistent() {
+  if (d_persistent_control) return;  // 已经初始化
+
+  // 先初始化基础资源（bitmap 等）
+  InitializeGPUResources();
+
+  // 分配持久化控制结构（统一内存）
+  cudaError_t err = cudaMallocManaged(&d_persistent_control,
+                                       sizeof(PersistentGACControl));
+  if (err != cudaSuccess) {
+    throw std::runtime_error(
+        "[GModel::InitializeGPUResources_Persistent] "
+        "Failed to allocate d_persistent_control: " +
+        std::string(cudaGetErrorString(err)));
+  }
+}
+
+void GModel::FreeGPUResources_Persistent() {
+  // 释放持久化控制结构
+  if (d_persistent_control) {
+    cudaFree(d_persistent_control);
+    d_persistent_control = nullptr;
+  }
+
+  // 释放基础资源
+  FreeGPUResources();
+}
+
+GModelData GModel::GetGModelDataView() const {
+  GModelData md;
+  md.num_vars = num_vars;
+  md.num_constraints = num_constraints;
+  md.max_dom_size = max_dom_size;
+  md.bit_dom_int_size = bit_dom_int_size;
+  md.bit_doms_int_size = bit_doms_int_size;
+  md.bitsup_per_constraint = bitsup_per_constraint;
+
+  md.bitDom = bitDom;
+  md.d_cur_dom_size = d_cur_dom_size;
+  md.bitSupData = bitSupData;
+  md.constraint_scopes = constraint_scopes;
+  md.d_subscription = d_subscription;
+  md.d_subscription_offset = d_subscription_offset;
+  return md;
+}
+
+// ============================================================================
+// 新版 Bitmap GAC 传播（EnforceGAC）
+// ============================================================================
+
+GacStats GModel::EnforceGAC(bool verbose, int assigned_var) {
+  GacStats stats;
+
+  if (!bitDom || !bitSupData || !constraint_scopes) {
+    std::cerr << "[GModel::EnforceGAC] Missing GPU data structures" << std::endl;
+    return stats;
+  }
+
+  // 初始化 GPU 资源（首次调用时分配）
+  InitializeGPUResources();
+
+  // 1. 初始化 GAC 控制块（统一内存，直接写入）
+  d_gac_control->inconsistent_flag = 0;
+  d_gac_control->scanner_index = 0;
+  d_gac_control->deletions = 0;
+  d_gac_control->iterations = 0;
+
+  // 2. 清空 next frontier（统一内存，用 memset）
+  memset(d_queue_bitmap_B, 0, bitmap_size_words * sizeof(u32));
+
+  // 3. 初始化 current frontier（统一内存，直接写入）
+  memset(d_queue_bitmap_A, 0, bitmap_size_words * sizeof(u32));
+
+  if (assigned_var < 0) {
+    // 初始 GAC：所有约束激活
+    for (int cid = 0; cid < num_constraints; ++cid) {
+      if (constraint_scopes[cid].x < 0) continue;
+      int w = cid / 32;
+      int b = cid % 32;
+      d_queue_bitmap_A[w] |= (1u << b);
+    }
+  } else {
+    // 增量 GAC：只激活 assigned_var 邻接约束
+    const int start = d_subscription_offset[assigned_var];
+    const int end = d_subscription_offset[assigned_var + 1];
+    for (int i = start; i < end; ++i) {
+      int cid = d_subscription[i].z;
+      int w = cid / 32;
+      int b = cid % 32;
+      d_queue_bitmap_A[w] |= (1u << b);
+    }
+  }
+
+  GModelData md = GetGModelDataView();
+
+  bool done = false;
+  while (!done) {
+    // 每轮迭代（统一内存，直接写入）
+    ++d_gac_control->iterations;
+    d_gac_control->scanner_index = 0;
+
+    // 启动 Kernel
+    int blocks = std::min(bitmap_size_words, 128);
+    int threads = std::min(max_dom_size, 256);
+    size_t shmem_bytes = 2 * bit_dom_int_size * sizeof(u32);
+
+    BitmapGACKernel<<<blocks, threads, shmem_bytes>>>(
+        md,
+        d_gac_control,
+        d_queue_bitmap_A,
+        d_queue_bitmap_B,
+        bitmap_size_words,
+        current_level_);
+
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+      std::cerr << "[GAC-Bitmap] Kernel failed: " << cudaGetErrorString(err)
+                << std::endl;
+      break;
+    }
+
+    // 4. 检查 inconsistent / 下一轮是否为空（统一内存，直接读取）
+    if (d_gac_control->inconsistent_flag) {
+      stats.inconsistent = true;
+      done = true;
+    } else {
+      // 检查 d_queue_bitmap_B 是否全 0（统一内存，直接读取）
+      bool non_empty = false;
+      for (int i = 0; i < bitmap_size_words; ++i) {
+        if (d_queue_bitmap_B[i] != 0u) {
+          non_empty = true;
+          break;
+        }
+      }
+
+      if (!non_empty) {
+        done = true;  // 达到不动点
+      } else {
+        // swap A/B，清空新的 B（统一内存，用 memset）
+        std::swap(d_queue_bitmap_A, d_queue_bitmap_B);
+        memset(d_queue_bitmap_B, 0, bitmap_size_words * sizeof(u32));
+      }
+    }
+  }
+
+  stats.deletions = static_cast<int>(d_gac_control->deletions);
+  stats.iterations = d_gac_control->iterations;
+
+  if (verbose) {
+    std::cout << "[GAC-Bitmap] iterations=" << stats.iterations
+              << " deletions=" << stats.deletions
+              << " inconsistent=" << (stats.inconsistent ? "true" : "false")
+              << std::endl;
+  }
+
+  return stats;
+}
+
+// ============================================================================
+// 持久化 Kernel GAC 传播（Cooperative Groups）
+// ============================================================================
+
+GacStats GModel::EnforceGAC_Persistent(bool verbose, int assigned_var) {
+  GacStats stats;
+
+  if (!bitDom || !bitSupData || !constraint_scopes) {
+    std::cerr << "[GModel::EnforceGAC_Persistent] Missing GPU data structures"
+              << std::endl;
+    return stats;
+  }
+
+  // 初始化持久化 GPU 资源（首次调用时分配）
+  InitializeGPUResources_Persistent();
+
+  // ========================================================================
+  // 1. 检查设备是否支持 Cooperative Launch
+  // ========================================================================
+  int deviceId = 0;
+  int supportsCoopLaunch = 0;
+  cudaDeviceGetAttribute(&supportsCoopLaunch,
+                         cudaDevAttrCooperativeLaunch, deviceId);
+
+  if (!supportsCoopLaunch) {
+    if (verbose) {
+      std::cerr << "[GModel::EnforceGAC_Persistent] "
+                << "Device does not support cooperative launch, "
+                << "falling back to EnforceGAC" << std::endl;
+    }
+    return EnforceGAC(verbose, assigned_var);
+  }
+
+  // ========================================================================
+  // 2. 初始化持久化控制块（统一内存，直接写入）
+  // ========================================================================
+  d_persistent_control->inconsistent_flag = 0;
+  d_persistent_control->scanner_index = 0;
+  d_persistent_control->deletions = 0;
+  d_persistent_control->iterations = 0;
+  d_persistent_control->converged_flag = 0;
+  d_persistent_control->frontier_nonempty = 0;
+  d_persistent_control->frontier_A = d_queue_bitmap_A;
+  d_persistent_control->frontier_B = d_queue_bitmap_B;
+
+  // ========================================================================
+  // 3. 初始化 bitmap frontier
+  // ========================================================================
+  memset(d_queue_bitmap_A, 0, bitmap_size_words * sizeof(u32));
+  memset(d_queue_bitmap_B, 0, bitmap_size_words * sizeof(u32));
+
+  if (assigned_var < 0) {
+    // 初始 GAC：所有约束激活
+    for (int cid = 0; cid < num_constraints; ++cid) {
+      if (constraint_scopes[cid].x < 0) continue;
+      int w = cid / 32;
+      int b = cid % 32;
+      d_queue_bitmap_A[w] |= (1u << b);
+    }
+  } else {
+    // 增量 GAC：只激活 assigned_var 邻接约束
+    const int start = d_subscription_offset[assigned_var];
+    const int end = d_subscription_offset[assigned_var + 1];
+    for (int i = start; i < end; ++i) {
+      int cid = d_subscription[i].z;
+      int w = cid / 32;
+      int b = cid % 32;
+      d_queue_bitmap_A[w] |= (1u << b);
+    }
+  }
+
+  // ========================================================================
+  // 4. 计算 Cooperative Launch 参数
+  // ========================================================================
+  int threadsPerBlock = std::min(max_dom_size, 256);
+  size_t sharedMemBytes = 2 * bit_dom_int_size * sizeof(u32);
+
+  // 查询最大可驻留 blocks
+  int maxBlocksPerSM = 0;
+  cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &maxBlocksPerSM,
+      PersistentGACKernel,
+      threadsPerBlock,
+      sharedMemBytes);
+
+  cudaDeviceProp prop;
+  cudaGetDeviceProperties(&prop, deviceId);
+
+  int maxGridSize = maxBlocksPerSM * prop.multiProcessorCount;
+  int desiredBlocks = std::min(bitmap_size_words, 128);
+  int actualGridSize = std::min(desiredBlocks, maxGridSize);
+
+  if (verbose) {
+    std::cout << "[GAC-Persistent] Cooperative Launch config:" << std::endl;
+    std::cout << "  Blocks: " << actualGridSize
+              << " (max: " << maxGridSize << ")" << std::endl;
+    std::cout << "  Threads per block: " << threadsPerBlock << std::endl;
+    std::cout << "  Shared memory: " << sharedMemBytes << " bytes" << std::endl;
+  }
+
+  // ========================================================================
+  // 5. 使用 Cooperative Launch 启动 Kernel
+  // ========================================================================
+  GModelData md = GetGModelDataView();
+  int maxIterations = num_vars * 10;  // 安全限制
+
+  void* args[] = {
+    &md,
+    &d_persistent_control,
+    &bitmap_size_words,
+    &current_level_,
+    &maxIterations
+  };
+
+  cudaError_t err = cudaLaunchCooperativeKernel(
+      (void*)PersistentGACKernel,
+      dim3(actualGridSize),
+      dim3(threadsPerBlock),
+      args,
+      sharedMemBytes);
+
+  if (err != cudaSuccess) {
+    std::cerr << "[GAC-Persistent] Cooperative launch failed: "
+              << cudaGetErrorString(err) << std::endl;
+
+    // 如果是 grid 太大导致失败，尝试缩小
+    if (err == cudaErrorCooperativeLaunchTooLarge) {
+      std::cerr << "  Grid size too large, reducing and retrying..."
+                << std::endl;
+      actualGridSize = maxGridSize / 2;
+      if (actualGridSize > 0) {
+        err = cudaLaunchCooperativeKernel(
+            (void*)PersistentGACKernel,
+            dim3(actualGridSize),
+            dim3(threadsPerBlock),
+            args,
+            sharedMemBytes);
+      }
+    }
+
+    // 如果仍然失败，回退到非持久化版本
+    if (err != cudaSuccess) {
+      std::cerr << "  Falling back to EnforceGAC" << std::endl;
+      return EnforceGAC(verbose, assigned_var);
+    }
+  }
+
+  // ========================================================================
+  // 6. 等待 Kernel 完成
+  // ========================================================================
+  err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) {
+    std::cerr << "[GAC-Persistent] Kernel execution failed: "
+              << cudaGetErrorString(err) << std::endl;
+    return stats;
+  }
+
+  // ========================================================================
+  // 7. 读取结果（统一内存，直接访问）
+  // ========================================================================
+  stats.deletions = static_cast<int>(d_persistent_control->deletions);
+  stats.iterations = d_persistent_control->iterations;
+  stats.inconsistent = (d_persistent_control->inconsistent_flag != 0);
+
+  if (verbose) {
+    std::cout << "[GAC-Persistent] iterations=" << stats.iterations
+              << " deletions=" << stats.deletions
+              << " inconsistent=" << (stats.inconsistent ? "true" : "false")
+              << " converged=" << (d_persistent_control->converged_flag ? "true" : "false")
               << std::endl;
   }
 
@@ -764,6 +1544,160 @@ int GModel::GetDomainSize(int var, int level) const {
   }
 
   return d_cur_dom_size[level * num_vars + var];
+}
+
+// ============================================================================
+// 求解器辅助方法实现
+// ============================================================================
+
+int GModel::GetMinDomainVar(int level) const {
+  if (level < 0 || level >= max_depth) {
+    throw std::runtime_error(
+        "[GModel::GetMinDomainVar] Invalid level: " + std::to_string(level));
+  }
+
+  int min_var = -1;
+  int min_size = max_dom_size + 1;
+
+  for (int var = 0; var < num_vars; ++var) {
+    const int size = d_cur_dom_size[level * num_vars + var];
+    // 跳过已赋值的变量（size == 1）和空域（size == 0）
+    if (size > 1 && size < min_size) {
+      min_size = size;
+      min_var = var;
+    }
+  }
+
+  return min_var;  // -1 表示所有变量都已赋值或域为空
+}
+
+bool GModel::IsAssigned(int var, int level) const {
+  if (var < 0 || var >= num_vars) {
+    throw std::runtime_error(
+        "[GModel::IsAssigned] Invalid var: " + std::to_string(var));
+  }
+
+  if (level < 0 || level >= max_depth) {
+    throw std::runtime_error(
+        "[GModel::IsAssigned] Invalid level: " + std::to_string(level));
+  }
+
+  return d_cur_dom_size[level * num_vars + var] == 1;
+}
+
+bool GModel::IsFullyAssigned(int level) const {
+  if (level < 0 || level >= max_depth) {
+    throw std::runtime_error(
+        "[GModel::IsFullyAssigned] Invalid level: " + std::to_string(level));
+  }
+
+  for (int var = 0; var < num_vars; ++var) {
+    if (d_cur_dom_size[level * num_vars + var] != 1) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+int GModel::GetAssignedValue(int var, int level) const {
+  if (var < 0 || var >= num_vars) {
+    throw std::runtime_error(
+        "[GModel::GetAssignedValue] Invalid var: " + std::to_string(var));
+  }
+
+  if (level < 0 || level >= max_depth) {
+    throw std::runtime_error(
+        "[GModel::GetAssignedValue] Invalid level: " + std::to_string(level));
+  }
+
+  const int size = d_cur_dom_size[level * num_vars + var];
+  if (size != 1) {
+    return -1;  // 未赋值或域为空
+  }
+
+  // 查找域中唯一的值（使用 __builtin_ctz 优化）
+  const int base_idx = GetBitDomIndex(var, 0, level);
+  for (int word = 0; word < bit_dom_int_size; ++word) {
+    const u32 bits = bitDom[base_idx + word];
+    if (bits != 0u) {
+      const int bit = __builtin_ctz(bits);  // Count Trailing Zeros，O(1)
+      const int value = word * kBitsPerWord + bit;
+      return (value < max_dom_size) ? value : -1;
+    }
+  }
+
+  return -1;  // 不应该到达这里
+}
+
+int GModel::GetFirstValue(int var, int level) const {
+  if (var < 0 || var >= num_vars) {
+    throw std::runtime_error(
+        "[GModel::GetFirstValue] Invalid var: " + std::to_string(var));
+  }
+
+  if (level < 0 || level >= max_depth) {
+    throw std::runtime_error(
+        "[GModel::GetFirstValue] Invalid level: " + std::to_string(level));
+  }
+
+  // 使用 __builtin_ctz 快速查找第一个值
+  const int base_idx = GetBitDomIndex(var, 0, level);
+  for (int word = 0; word < bit_dom_int_size; ++word) {
+    const u32 bits = bitDom[base_idx + word];
+    if (bits != 0u) {
+      const int bit = __builtin_ctz(bits);  // Count Trailing Zeros，O(1)
+      const int value = word * kBitsPerWord + bit;
+      return (value < max_dom_size) ? value : -1;
+    }
+  }
+
+  return -1;  // 域为空
+}
+
+int GModel::GetNextValue(int var, int value, int level) const {
+  if (var < 0 || var >= num_vars) {
+    throw std::runtime_error(
+        "[GModel::GetNextValue] Invalid var: " + std::to_string(var));
+  }
+
+  if (level < 0 || level >= max_depth) {
+    throw std::runtime_error(
+        "[GModel::GetNextValue] Invalid level: " + std::to_string(level));
+  }
+
+  if (value < 0 || value >= max_dom_size - 1) {
+    return -1;  // 没有更多值
+  }
+
+  // 使用 __builtin_ctz 快速查找下一个值
+  const int base_idx = GetBitDomIndex(var, 0, level);
+  const int start_value = value + 1;
+  const int start_word = start_value / kBitsPerWord;
+  const int start_bit = start_value % kBitsPerWord;
+
+  // 检查起始 word 的剩余位
+  if (start_word < bit_dom_int_size) {
+    // 屏蔽掉 start_bit 之前的位
+    u32 bits = bitDom[base_idx + start_word] >> start_bit;
+    if (bits != 0u) {
+      const int bit = __builtin_ctz(bits);
+      const int v = start_word * kBitsPerWord + start_bit + bit;
+      return (v < max_dom_size) ? v : -1;
+    }
+  }
+
+  // 检查后续 word
+  for (int word = start_word + 1; word < bit_dom_int_size; ++word) {
+    const u32 bits = bitDom[base_idx + word];
+    if (bits != 0u) {
+      const int bit = __builtin_ctz(bits);
+      const int v = word * kBitsPerWord + bit;
+      return (v < max_dom_size) ? v : -1;
+    }
+  }
+
+  return -1;  // 没有更多值
 }
 
 }  // namespace cpim

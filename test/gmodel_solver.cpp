@@ -1,6 +1,7 @@
 // 简单的 GModel MAC 求解器
 #include <iostream>
 #include <vector>
+#include <cstring>
 #include "GModel.cuh"
 #include "model/xcsp_parser.h"
 #include "model/model_normalizer.h"
@@ -12,7 +13,8 @@ using namespace cpim::model;
 // 简单的 MAC 搜索
 class SimpleGModelSolver {
  public:
-  explicit SimpleGModelSolver(GModel* model) : model_(model) {}
+  explicit SimpleGModelSolver(GModel* model, bool use_persistent = false)
+      : model_(model), use_persistent_(use_persistent) {}
 
   bool Solve() {
     std::cout << "\n=== Starting MAC Search ===" << std::endl;
@@ -21,9 +23,12 @@ class SimpleGModelSolver {
     solution_.assign(model_->num_vars, -1);
 
     // 初始 GAC
-    GacStats init_stats = model_->EnforceGAC(false);
+    GacStats init_stats = use_persistent_
+        ? model_->EnforceGAC_Persistent(false)
+        : model_->EnforceGAC(false);
     std::cout << "[Solver] Initial GAC: " << init_stats.deletions << " deletions, "
-              << init_stats.iterations << " iterations" << std::endl;
+              << init_stats.iterations << " iterations"
+              << (use_persistent_ ? " (Persistent)" : "") << std::endl;
 
     if (init_stats.inconsistent || HasEmptyDomain(0)) {
       std::cout << "[Solver] Problem is inconsistent!" << std::endl;
@@ -74,7 +79,9 @@ class SimpleGModelSolver {
       solution_[var] = value;
 
       // 传播
-      GacStats stats = model_->EnforceGAC(false);
+      GacStats stats = use_persistent_
+          ? model_->EnforceGAC_Persistent(false, var)
+          : model_->EnforceGAC(false, var);
       std::cout << "  [GAC] deletions=" << stats.deletions
                 << ", inconsistent=" << (stats.inconsistent ? "true" : "false");
 
@@ -156,24 +163,39 @@ class SimpleGModelSolver {
   GModel* model_;
   std::vector<int> solution_;
   int nodes_ = 0;
+  bool use_persistent_ = false;
 };
 
 int main(int argc, char* argv[]) {
   if (argc < 2) {
-    std::cerr << "Usage: " << argv[0] << " <xcsp_file>" << std::endl;
+    std::cerr << "Usage: " << argv[0] << " <xcsp_file> [--persistent]" << std::endl;
     return 1;
+  }
+
+  // 检查 --persistent 选项
+  bool use_persistent = false;
+  const char* xcsp_file = argv[1];
+  for (int i = 1; i < argc; ++i) {
+    if (std::strcmp(argv[i], "--persistent") == 0) {
+      use_persistent = true;
+    } else if (argv[i][0] != '-') {
+      xcsp_file = argv[i];
+    }
   }
 
   try {
     // 解析和构建模型
-    std::cout << "[Main] Parsing: " << argv[1] << std::endl;
+    std::cout << "[Main] Parsing: " << xcsp_file << std::endl;
+    if (use_persistent) {
+      std::cout << "[Main] Using Persistent Kernel (Cooperative Groups)" << std::endl;
+    }
     auto parser = XcspParser::Create(ParserType::kLibXml2);
     if (!parser) {
       std::cerr << "Failed to create parser" << std::endl;
       return 1;
     }
 
-    auto model_or = parser->Parse(argv[1]);
+    auto model_or = parser->Parse(xcsp_file);
     if (!model_or.ok()) {
       std::cerr << "Failed to parse: " << model_or.status() << std::endl;
       return 1;
@@ -199,7 +221,7 @@ int main(int argc, char* argv[]) {
 
     // 测试完整的 MAC 求解
     std::cout << "\n=== Starting MAC Solver ===" << std::endl;
-    SimpleGModelSolver solver(&gmodel);
+    SimpleGModelSolver solver(&gmodel, use_persistent);
 
     bool solved = solver.Solve();
 

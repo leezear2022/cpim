@@ -281,7 +281,7 @@ endif()
 # test_multilevel: 测试 GModel 多层级功能
 # ============================================================================
 add_executable(test_multilevel
-  test_multilevel.cpp
+  test/test_multilevel.cpp
   src/GModel.cu
   src/model/gmodel_adapter.cu
   src/model/gmodel_validator.cu
@@ -312,7 +312,7 @@ endif()
 # gmodel_solver: 简单的 GModel MAC 求解器
 # ============================================================================
 add_executable(gmodel_solver
-  gmodel_solver.cpp
+  test/gmodel_solver.cpp
   src/GModel.cu
   src/model/gmodel_adapter.cu
   src/model/gmodel_validator.cu
@@ -399,3 +399,37 @@ target_link_libraries(cpim_gac_cpu PRIVATE
 # 添加 CUDA 相关的路径
 include_directories(${CUDA_INCLUDE_DIRS})
 link_directories(${CUDA_TOOLKIT_ROOT_DIR}/lib64)
+
+# ============================================================================
+# compare_cpu_gpu: CPU vs GPU 求解器对比测试
+# ============================================================================
+add_executable(compare_cpu_gpu
+  samples/compare_cpu_gpu.cpp
+  src/GModel.cu
+  src/GModelSolver.cu
+  src/model/gmodel_adapter.cu
+  src/model/gmodel_validator.cu
+)
+
+set_target_properties(compare_cpu_gpu PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON
+)
+
+target_link_libraries(compare_cpu_gpu PRIVATE
+  cpim_model
+  cpim_solver_cpu
+  glog::glog
+  absl::flags
+  absl::flags_parse
+  cuda
+  cudart
+)
+
+# ARM 平台 NEON 禁用
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm")
+  target_compile_options(compare_cpu_gpu PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=-U__ARM_NEON>
+    $<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=-U__ARM_NEON__>
+    $<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=-DABSL_HAVE_NEON=0>
+  )
+endif()

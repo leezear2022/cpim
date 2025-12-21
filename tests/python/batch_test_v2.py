@@ -67,7 +67,7 @@ def run_cpim(xml_path: str, timeout: int) -> dict:
     Returns:
         {status, time_ms, branches, backtracks, num_vars, num_cons}
     """
-    cpim_path = Path(__file__).parent.parent / "build" / "cpim_test_parser"
+    cpim_path = Path(__file__).parent.parent.parent / "build" / "cpim_test_parser"
 
     if not cpim_path.exists():
         return {
@@ -102,11 +102,11 @@ def run_cpim(xml_path: str, timeout: int) -> dict:
         if time_match:
             time_ms = int(time_match.group(1))
 
-        pos_match = re.search(r'positive\s*=\s*(\d+)', output)
+        pos_match = re.search(r'positives?\s*=\s*(\d+)', output)
         if pos_match:
             branches = int(pos_match.group(1))
 
-        neg_match = re.search(r'negative\s*=\s*(\d+)', output)
+        neg_match = re.search(r'negatives?\s*=\s*(\d+)', output)
         if neg_match:
             backtracks = int(neg_match.group(1))
 
@@ -363,7 +363,7 @@ def main():
     args = parser.parse_args()
 
     # 检查 CPIM 是否已编译
-    cpim_path = Path(__file__).parent.parent / "build" / "cpim_test_parser"
+    cpim_path = Path(__file__).parent.parent.parent / "build" / "cpim_test_parser"
     if not cpim_path.exists():
         print(f"Error: CPIM not built. Please run: cd build && make -j4")
         sys.exit(1)

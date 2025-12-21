@@ -3,6 +3,7 @@
 #include <climits>
 #include <vector>
 
+#include "base/unified_trail.h"
 #include "model/intermediate_model.h"
 // #include "xcsp3model/XBuilder.h"  // 已弃用，使用新的 LibXml2Parser 替代
 
@@ -141,37 +142,49 @@ using namespace cpim;
 
 class IntVar {
  public:
-  IntVar(int id, int domain_size, int num_vars);
+  // Phase 1.1: 添加 UnifiedTrail* 参数
+  IntVar(int id, int domain_size, UnifiedTrail* trail);
   // IntVar(const int id, vector<int>& v);
   ~IntVar(){};
-  void RemoveValue(const int a, const int p = 0);
-  void ReduceTo(const int a, const int p = 0);
-  void AddValue(const int a, const int p = 0);
-  // void RestoreUpTo(const int p);
+
+  // Phase 1.1: 简化接口,移除 level 参数 (p)
+  void RemoveValue(const int a);
+  void ReduceTo(const int a);
+  void AddValue(const int a);
+
+  // Phase 1.1: Trail 域恢复接口
+  void RestoreBitWord(int word_idx, uint32_t bits);
+
   int value(const int idx) const { return vals_[idx]; }
-  int size(const int p) const;
+  int size() const;  // Phase 1.1: 移除 level 参数
   int capacity() const { return init_size_; }
-  bool assigned(const int p) const { return assigned_[p]; }
-  void assign(const bool a, const int p) { assigned_[p] = a; }
-  int next(const int a, const int p) const;
-  void next_value(int& a, const int p);
-  int prev(const int a, const int p) const;
-  bool have(const int a, const int p) const;
-  int head(const int p) const;
-  int tail(const int p) const;
-  bool faild(const int p) const { return size(p) == 0; };
+  bool assigned() const { return assigned_; }  // Phase 1.1: 单一 assigned 状态
+  void assign(const bool a) { assigned_ = a; }
+  int next(const int a) const;
+  void next_value(int& a);
+  int prev(const int a) const;
+  bool have(const int a) const;
+  int head() const;
+  int tail() const;
+  bool faild() const { return size() == 0; };
   int stamp() const { return stamp_; }
   void stamp(const int s) { stamp_ = s; }
-  bitSetVector& bitDom(const int p) { return bit_doms_[p]; }
+
+  // Phase 1.1: 单层域访问
+  bitSetVector& bitDom() { return bit_doms_; }
+  const bitSetVector& bitDom() const { return bit_doms_; }
+
   int id() const { return id_; }
-  void show(const int p);
-  // inline tuple<int, int> get_bit_index(const int idx) const;
+  void show();
   vector<int>& values() { return vals_; }
-  int GetDelete(const int src, const int dest, bitSetVector& del_vals);
-  void BackTo(const int dest);
-  void ClearLevel(const int p);
-  int new_level(int src);
-  void copy(const int src, const int dest);
+
+  // Phase 1.1: 删除多级域相关方法
+  // int GetDelete(const int src, const int dest, bitSetVector& del_vals);
+  // void BackTo(const int dest);
+  // void ClearLevel(const int p);
+  // int new_level(int src);
+  // void copy(const int src, const int dest);
+
   int top_size = 0;
   int num_bit_;
 
@@ -180,16 +193,20 @@ class IntVar {
   int init_size_;
   int value_ = -1;
   uint64_t stamp_ = 0;
-  vector<bool> assigned_;
+
+  // Phase 1.1: 单一 assigned 状态 (vs vector<bool>)
+  bool assigned_ = false;
+
   int limit_;
   vector<int> vals_;
   int top_;
-  // unordered_map<int, int> val_map;
-  // vector<int> anti_map;
-  vector<bitSetVector> bit_doms_;
+
+  // Phase 1.1: 单层域 (vs vector<bitSetVector>)
+  bitSetVector bit_doms_;
   bitSetVector bit_tmp_;
-  // static inline int get_value(const int i, const int j);
-  // vector<uint64_t> tmp_;
+
+  // Phase 1.1: Trail 指针
+  UnifiedTrail* trail_;
 };
 
 class IntVal {
@@ -354,14 +371,20 @@ class Network {
     return c;
   }
 
-  int top() const { return top_; }
+  // Phase 1.1: Trail 访问器
+  UnifiedTrail* trail() { return trail_; }
+  const UnifiedTrail* trail() const { return trail_; }
+
+  // Phase 1.1: 旧接口兼容 (临时保留,后续删除)
+  int top() const { return trail_->CurrentLevel(); }
   int tmp() const { return tmp_; }
-  // void RestoreUpto(const int level);
-  int NewLevel(const int src);
-  void BackTo(const int dest);
-  void CopyLevel(const int src, const int dest);
-  void ClearLevel(const int p);
-  // int NewTmpLevel();
+
+  // Phase 1.1: 删除多级域管理方法 (由 Trail 替代)
+  // int NewLevel(const int src);
+  // void BackTo(const int dest);
+  // void CopyLevel(const int src, const int dest);
+  // void ClearLevel(const int p);
+
   int max_arity() const { return max_arity_; }
   int max_domain_size() const { return max_dom_size_; }
   int max_bitDom_size() const { return max_bitDom_size_; }
@@ -375,7 +398,11 @@ class Network {
   int max_bitDom_size_;
   int num_vars_;
   int num_tabs_;
-  int top_ = 0;
+
+  // Phase 1.1: Trail 替代多级域管理
+  UnifiedTrail* trail_;
+
+  // Phase 1.1: 保留临时变量 (后续可能删除)
   int tmp_ = 0;
 };
 

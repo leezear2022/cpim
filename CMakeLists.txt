@@ -111,7 +111,7 @@ include_directories(${Unwind_INCLUDE_DIRS})
 include_directories(include)
 
 # 添加子目录
-add_subdirectory(xcsp3parser)
+add_subdirectory(third_party/xcsp3parser)
 
 # ============================================================================
 # 新模块: cpim_model (XCSP3 解析和中间模型)
@@ -160,20 +160,26 @@ target_compile_options(cpim_model PRIVATE
 
 
 add_library(cpim_solver_cpu STATIC
-  src/AC.cpp
-  src/AC3.cpp
-  src/AC3bit.cpp
-  src/AC3rm.cpp
-  src/FC.cpp
-  src/MAC.cpp
-  src/Network.cpp
-  src/NSAC.cpp
-  src/RNSQ.cpp
-  src/RPC3.cpp
-  src/SAC1.cpp
-  src/SAC3.cpp
-  src/Solver.cpp
-  src/lMaxRPC.cpp
+  # 基础组件
+  src/base/unified_trail.cpp
+
+  # CPU 算法
+  src/solver/cpu/AC.cpp
+  src/solver/cpu/AC3.cpp
+  src/solver/cpu/AC3bit.cpp
+  src/solver/cpu/AC3rm.cpp
+  src/solver/cpu/FC.cpp
+  src/solver/cpu/MAC.cpp
+  src/solver/cpu/NSAC.cpp
+  src/solver/cpu/RNSQ.cpp
+  src/solver/cpu/RPC3.cpp
+  src/solver/cpu/SAC1.cpp
+  src/solver/cpu/SAC3.cpp
+  src/solver/cpu/lMaxRPC.cpp
+
+  # 共享代码
+  src/solver/common/Network.cpp
+  src/solver/common/Solver.cpp
 )
 
 target_include_directories(cpim_solver_cpu PUBLIC
@@ -203,7 +209,7 @@ target_compile_options(cpim_solver_cpu PRIVATE
 # ============================================================================
 # 新解析器测试程序 (纯 C++ 程序，不含 CUDA 代码)
 # ============================================================================
-add_executable(cpim_test_parser samples/main_new_parser.cpp)
+add_executable(cpim_test_parser apps/cpim_test_parser.cpp)
 
 target_link_libraries(cpim_test_parser PRIVATE
   cpim_model
@@ -217,8 +223,8 @@ target_link_libraries(cpim_test_parser PRIVATE
 # GPU CModel dump utility (parses XML -> IntermediateModel -> CModel)
 # ============================================================================
 add_executable(cpim_dump
-  samples/dump_cmodel.cpp
-  src/cuSAC.cu
+  apps/cpim_dump.cpp
+  src/solver/gpu/cuSAC.cu
 )
 
 set_target_properties(cpim_dump PROPERTIES
@@ -249,8 +255,8 @@ endif()
 # GModel dump utility (simplified GPU model with unified memory)
 # ============================================================================
 add_executable(dump_gmodel
-  samples/dump_gmodel.cpp
-  src/GModel.cu
+  apps/dump_gmodel.cpp
+  src/solver/gpu/GModel.cu
   src/model/gmodel_adapter.cu
   src/model/gmodel_validator.cu
 )
@@ -281,8 +287,8 @@ endif()
 # test_multilevel: 测试 GModel 多层级功能
 # ============================================================================
 add_executable(test_multilevel
-  test/test_multilevel.cpp
-  src/GModel.cu
+  tests/cpp/test_multilevel.cpp
+  src/solver/gpu/GModel.cu
   src/model/gmodel_adapter.cu
   src/model/gmodel_validator.cu
 )
@@ -312,8 +318,8 @@ endif()
 # gmodel_solver: 简单的 GModel MAC 求解器
 # ============================================================================
 add_executable(gmodel_solver
-  test/gmodel_solver.cpp
-  src/GModel.cu
+  apps/gmodel_solver.cpp
+  src/solver/gpu/GModel.cu
   src/model/gmodel_adapter.cu
   src/model/gmodel_validator.cu
 )
@@ -343,7 +349,7 @@ endif()
 # CPU GAC baseline utility (serial event queue + propagation)
 # ============================================================================
 add_executable(cpim_gac_cpu
-  samples/run_gac_cpu.cpp
+  apps/cpim_gac_cpu.cpp
   src/model/gac_cpu.cpp
 )
 
@@ -404,9 +410,9 @@ link_directories(${CUDA_TOOLKIT_ROOT_DIR}/lib64)
 # compare_cpu_gpu: CPU vs GPU 求解器对比测试
 # ============================================================================
 add_executable(compare_cpu_gpu
-  samples/compare_cpu_gpu.cpp
-  src/GModel.cu
-  src/GModelSolver.cu
+  apps/compare_cpu_gpu.cpp
+  src/solver/gpu/GModel.cu
+  src/solver/gpu/GModelSolver.cu
   src/model/gmodel_adapter.cu
   src/model/gmodel_validator.cu
 )
@@ -438,7 +444,7 @@ endif()
 # verify_gac: GAC 正确性验证工具 (穷举法对比 AC3bit)
 # ============================================================================
 add_executable(verify_gac
-  samples/verify_gac.cpp
+  apps/verify_gac.cpp
 )
 
 target_link_libraries(verify_gac PRIVATE
@@ -453,7 +459,7 @@ target_link_libraries(verify_gac PRIVATE
 # verify_search: MAC 搜索过程正确性验证工具
 # ============================================================================
 add_executable(verify_search
-  samples/verify_search.cpp
+  apps/verify_search.cpp
 )
 
 target_link_libraries(verify_search PRIVATE

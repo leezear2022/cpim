@@ -183,10 +183,6 @@ add_library(cpim_solver_cpu STATIC
 
   # Phase 1.5: 变量选择启发式
   src/solver/common/variable_selector.cpp
-
-  # Phase 2.1: Propagator 框架
-  src/solver/common/propagation_engine.cpp
-  src/solver/common/table_propagator.cpp
 )
 
 target_include_directories(cpim_solver_cpu PUBLIC

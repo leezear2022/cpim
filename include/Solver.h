@@ -572,13 +572,10 @@ class RPC3 : public AC {
   vector<vector<IntVar*>> neighborhood;
 };
 
-// Forward declaration for Phase 2.1
-class PropagationEngine;
-
 class MAC {
  public:
   MAC(Network* n, ACAlgorithm ac_algzm, const Heuristic::Var varh,
-      const Heuristic::Val valh, bool use_propagator_framework = false);
+      const Heuristic::Val valh);
   SearchStatistics enforce(const int time_limits);
   // SearchStatistics enforce_fc(const int time_limits);
   virtual ~MAC();
@@ -606,13 +603,6 @@ class MAC {
   SearchStatistics statistics_;
   Heuristic::Var varh_;
   Heuristic::Val valh_;
-
-  // Phase 2.1: Propagator 框架支持
-  bool use_propagator_framework_;
-  PropagationEngine* propagation_engine_ = nullptr;
-
-  // Phase 2.1: 初始化 PropagationEngine（注册 TableConstraintPropagators）
-  void InitializePropagationEngine();
 };
 
 // class Search {

@@ -44,6 +44,27 @@ ABSL_FLAG(std::string, bench_path, "",
           "Direct path to a bench file or directory (overrides manifest).");
 ABSL_FLAG(bool, list_only, false,
           "List discovered bench files without parsing them.");
+ABSL_FLAG(std::string, ac_algorithm, "AC3bit",
+          "Arc consistency algorithm: AC3, AC3bit, RPC3, lMaxRPC, NSAC, SAC1, SAC3");
+
+// ============================================================================
+// AC 算法选择辅助函数
+// ============================================================================
+
+cpim::ACAlgorithm ParseACAlgorithm(const std::string& name) {
+  if (name == "AC3") return cpim::AC_3;
+  if (name == "AC3bit") return cpim::AC_3bit;
+  if (name == "RPC3") return cpim::CA_RPC3;
+  if (name == "lMaxRPC") return cpim::CA_LMRPC_BIT;
+  if (name == "NSAC") return cpim::A_NSAC;
+  if (name == "SAC1" || name == "SAC3") {
+    LOG(WARNING) << "SAC1/SAC3 not yet integrated via ACAlgorithm enum, falling back to AC3bit";
+    return cpim::AC_3bit;
+  }
+
+  LOG(WARNING) << "Unknown AC algorithm: " << name << ", falling back to AC3bit";
+  return cpim::AC_3bit;
+}
 
 // ============================================================================
 // 测试新解析器
@@ -167,7 +188,7 @@ void TestNewParser(const BenchFileInfo& bench_file) {
     }
   }
 
-  // 将中间模型直接接入旧版 CPU 求解器并运行 MAC+AC3bit。
+  // 将中间模型直接接入旧版 CPU 求解器并运行 MAC+AC。
   LOG(INFO) << "\n========== CPU MAC Solver ==========";
   cpim::Network network(model);
 
@@ -176,7 +197,11 @@ void TestNewParser(const BenchFileInfo& bench_file) {
           << " max_dom=" << network.max_domain_size()
           << " max_arity=" << network.max_arity();
 
-  cpim::MAC mac(&network, cpim::AC_3bit, cpim::Heuristic::VRH_DOM_MIN,
+  // 解析 AC 算法参数
+  cpim::ACAlgorithm ac_alg = ParseACAlgorithm(absl::GetFlag(FLAGS_ac_algorithm));
+  LOG(INFO) << "Using AC algorithm: " << absl::GetFlag(FLAGS_ac_algorithm);
+
+  cpim::MAC mac(&network, ac_alg, cpim::Heuristic::VRH_DOM_MIN,
                 cpim::Heuristic::VLH_MIN);
   constexpr int kCpuSolverTimeLimitMs = 900000;
   cpim::SearchStatistics solve_stats = mac.enforce(kCpuSolverTimeLimitMs);

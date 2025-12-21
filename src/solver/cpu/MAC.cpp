@@ -2,15 +2,29 @@
 #include <sstream>
 
 #include "Solver.h"
+#include "solver/common/propagation_engine.h"  // Phase 2.1
+#include "solver/common/table_propagator.h"     // Phase 2.1
+#include <glog/logging.h>
+
 using namespace std;
 namespace cpim {
 
 MAC::MAC(Network* n, const ACAlgorithm ac_algzm, const Heuristic::Var varh,
-         const Heuristic::Val valh)
-    : n_(n), ac_algzm_(ac_algzm), varh_(varh), valh_(valh) {
+         const Heuristic::Val valh, bool use_propagator_framework)
+    : n_(n), ac_algzm_(ac_algzm), varh_(varh), valh_(valh),
+      use_propagator_framework_(use_propagator_framework) {
   x_evt_.reserve(n_->vars.size());
   I.initial(n_);
 
+  // Phase 2.1: 如果启用 Propagator 框架，初始化 PropagationEngine
+  if (use_propagator_framework_) {
+    VLOG(1) << "MAC: Using Propagator framework";
+    InitializePropagationEngine();
+  } else {
+    VLOG(1) << "MAC: Using traditional AC algorithm";
+  }
+
+  // 传统 AC 算法初始化
   switch (ac_algzm) {
     case AC_3:
       ac_ = new AC3(n_);
@@ -38,6 +52,20 @@ MAC::MAC(Network* n, const ACAlgorithm ac_algzm, const Heuristic::Var varh,
     default:
       break;
   }
+}
+
+void MAC::InitializePropagationEngine() {
+  // 创建 PropagationEngine
+  propagation_engine_ = new PropagationEngine();
+
+  // 为每个表约束创建 TableConstraintPropagator
+  for (Tabular* constraint : n_->tabs) {
+    auto propagator = std::make_unique<TableConstraintPropagator>(constraint, n_);
+    propagation_engine_->AddPropagator(std::move(propagator));
+  }
+
+  VLOG(1) << "MAC: Initialized PropagationEngine with "
+          << propagation_engine_->GetPropagatorCount() << " propagators";
 }
 
 // SearchStatistics MAC::enforce(const int time_limits) {
@@ -100,7 +128,16 @@ MAC::MAC(Network* n, const ACAlgorithm ac_algzm, const Heuristic::Var varh,
 SearchStatistics MAC::enforce(const int time_limits) {
   Timer t;
   x_evt_.clear();
-  consistent_ = ac_->enforce(n_->vars, 0).state;
+
+  // Phase 2.1: 初始传播（使用 PropagationEngine 或 AC）
+  if (use_propagator_framework_) {
+    auto result = propagation_engine_->Propagate(n_->vars, 0);
+    consistent_ = (result.state != PropagationState::INCONSISTENT);
+    VLOG(2) << "MAC: Initial propagation (PropagationEngine) - consistent=" << consistent_;
+  } else {
+    consistent_ = ac_->enforce(n_->vars, 0).state;
+  }
+
   // consistent_ = one_pass_sac();
   if (!consistent_) {
     statistics_.solve_time = t.elapsed();
@@ -122,10 +159,20 @@ SearchStatistics MAC::enforce(const int time_limits) {
     ++statistics_.num_positive;
     v_a.v()->ReduceTo(v_a.a());
     x_evt_.push_back(v_a.v());
-    auto cs = ac_->enforce(x_evt_, I.size());
-    consistent_ = cs.state;
-    cout << "  [GAC] deletions=" << cs.num_delete
-         << ", inconsistent=" << (!consistent_ ? "true" : "false");
+
+    // Phase 2.1: 赋值后传播（使用 PropagationEngine 或 AC）
+    if (use_propagator_framework_) {
+      auto result = propagation_engine_->Propagate(x_evt_, I.size());
+      consistent_ = (result.state != PropagationState::INCONSISTENT);
+      int num_delete = result.modified_vars.size();  // 近似
+      cout << "  [Propagator] modified_vars=" << num_delete
+           << ", inconsistent=" << (!consistent_ ? "true" : "false");
+    } else {
+      auto cs = ac_->enforce(x_evt_, I.size());
+      consistent_ = cs.state;
+      cout << "  [GAC] deletions=" << cs.num_delete
+           << ", inconsistent=" << (!consistent_ ? "true" : "false");
+    }
     x_evt_.clear();
     // I.update_model_assigned();
     if (consistent_ && I.full()) {
@@ -156,8 +203,19 @@ SearchStatistics MAC::enforce(const int time_limits) {
       v_a.v()->RemoveValue(v_a.a());
       ++statistics_.num_negative;
       x_evt_.push_back(v_a.v());
-      consistent_ =
-          v_a.v()->size() && ac_->enforce(x_evt_, I.size()).state;
+
+      // Phase 2.1: 回溯后传播（使用 PropagationEngine 或 AC）
+      if (use_propagator_framework_) {
+        if (v_a.v()->size()) {
+          auto result = propagation_engine_->Propagate(x_evt_, I.size());
+          consistent_ = (result.state != PropagationState::INCONSISTENT);
+        } else {
+          consistent_ = false;
+        }
+      } else {
+        consistent_ =
+            v_a.v()->size() && ac_->enforce(x_evt_, I.size()).state;
+      }
       x_evt_.clear();
       I.update_model_assigned();
     }
@@ -228,6 +286,10 @@ SearchStatistics MAC::enforce(const int time_limits) {
 
 MAC::~MAC() {
   delete ac_;
+  // Phase 2.1: 清理 PropagationEngine
+  if (propagation_engine_ != nullptr) {
+    delete propagation_engine_;
+  }
   // delete I;
 }
 

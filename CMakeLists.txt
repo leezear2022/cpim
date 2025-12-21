@@ -180,6 +180,13 @@ add_library(cpim_solver_cpu STATIC
   # 共享代码
   src/solver/common/Network.cpp
   src/solver/common/Solver.cpp
+
+  # Phase 1.5: 变量选择启发式
+  src/solver/common/variable_selector.cpp
+
+  # Phase 2.1: Propagator 框架
+  src/solver/common/propagation_engine.cpp
+  src/solver/common/table_propagator.cpp
 )
 
 target_include_directories(cpim_solver_cpu PUBLIC
@@ -267,6 +274,7 @@ set_target_properties(dump_gmodel PROPERTIES
 
 target_link_libraries(dump_gmodel PRIVATE
   cpim_model
+  cpim_solver_cpu  # Phase 1.2: 需要 UnifiedTrail + IntVar (用于条件编译的符号)
   glog::glog
   absl::flags
   absl::flags_parse
@@ -299,6 +307,7 @@ set_target_properties(test_multilevel PROPERTIES
 
 target_link_libraries(test_multilevel PRIVATE
   cpim_model
+  cpim_solver_cpu  # Phase 1.2: 需要 UnifiedTrail + IntVar
   glog::glog
   absl::flags
   absl::flags_parse
@@ -330,6 +339,7 @@ set_target_properties(gmodel_solver PROPERTIES
 
 target_link_libraries(gmodel_solver PRIVATE
   cpim_model
+  cpim_solver_cpu  # Phase 1.2: 需要 UnifiedTrail + IntVar
   glog::glog
   absl::flags
   absl::flags_parse

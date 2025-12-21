@@ -105,6 +105,7 @@ python3 tests/python/batch_test_v2.py --tier=2
 | 2 | UNSAT 时调用 get_solution | apps/cpim_test_parser.cpp | ✅ | 同上 |
 | 3 | 找到解后未设置 num_sol | src/solver/cpu/MAC.cpp:134 | ✅ | 同上 |
 | 4-6 | Trail 回溯缺陷（3个） | src/base/, src/solver/common/ | ✅ | UNIFIED_TRAIL_MEMO.md |
+| 7 | GPU 二分回溯搜索错误 | apps/gmodel_solver.cpp:55-127 | ✅ | GPU_BINARY_BACKTRACK_FIX.md |
 
 ## 关键文件
 
@@ -119,23 +120,147 @@ python3 tests/python/batch_test_v2.py --tier=2
 - [src/solver/common/Network.cpp](src/solver/common/Network.cpp) - 多级域网络
 - [src/base/unified_trail.cpp](src/base/unified_trail.cpp) - 统一 Trail 回溯系统
 - [src/solver/gpu/GModel.cu](src/solver/gpu/GModel.cu) - 简化 GPU 模型
+- [src/solver/common/variable_selector.cpp](src/solver/common/variable_selector.cpp) - 变量选择启发式（Phase 1.5）
 
 ### 测试
 - [tests/python/batch_test_v2.py](tests/python/batch_test_v2.py) - 批量测试脚本
 - [tests/python/tier_definitions.py](tests/python/tier_definitions.py) - 分层测试集定义
+- [tests/python/compare_cpu_gpu.py](tests/python/compare_cpu_gpu.py) - CPU/GPU 对比测试
+- [tests/python/benchmark_heuristics.py](tests/python/benchmark_heuristics.py) - 启发式性能对比
 
 ## 开发规划
 
 详见 [docs/planning/](docs/planning/)
 
-**当前阶段**: Phase 1.1 - 统一 CPU/GPU Trail 回溯系统（已完成）
+**当前阶段**: Phase 1.5 完成，准备进入 Phase 1.3 或 Phase 2
 
-**下一步**:
-- Phase 1.2: GPU Trail 集成
-- Phase 1.3: 自适应 CPU/GPU 切换引擎
-- Phase 2: Propagator 框架重构
+### 已完成阶段
 
-完整计划：[docs/planning/MODERNIZATION_PLAN_V2.md](docs/planning/MODERNIZATION_PLAN_V2.md)
+#### Phase 1.1: 统一 CPU/GPU Trail 回溯系统 ✅
+- UnifiedTrail 基础架构
+- CPU Network 单层域 + Trail 集成
+- 修复 3 个 Trail 回溯缺陷
+- 文档：[UNIFIED_TRAIL_MEMO.md](docs/bugfixes/UNIFIED_TRAIL_MEMO.md)
+
+#### Phase 1.2: GPU Trail 集成与搜索验证 ✅
+**架构改造**：
+- GModel 单层域架构重构（内存节省 92%）
+- UnifiedTrail 集成到 GModel
+- GPU kernel 单层索引适配（BitmapGAC, PersistentGAC, ExecuteConstraintCheck）
+- EnforceGAC/EnforceGAC_Persistent 域快照与 Trail 记录
+- AssignValue/RemoveValue Host 端 Trail 记录
+- 优化的 BacktrackTo 批量域恢复逻辑
+
+**搜索算法修复**：
+- 修复 gmodel_solver 二分回溯搜索逻辑（while(true) 循环模拟 CPU MAC）
+- 实现正确的值移除 + 重新传播机制
+- 修复层级管理和节点计数
+
+**验证成果**：
+- ✅ TIER 0 完整通过（12/12 实例）
+- ✅ TIER 1 部分通过（15/39 实例，0 失败）
+- ✅ CPU/GPU 节点数精确匹配（Positives/Negatives 完全一致）
+- 关键测试案例：
+  - queens-4: P=5, N=1 ✓
+  - langford-3-9: P=468, N=441 ✓
+  - test.xml, langford-2-4, driverlogw-01c-sat 等全部通过
+
+**相关文件**：
+- [apps/gmodel_solver.cpp](apps/gmodel_solver.cpp:55-127) - GPU 求解器 Search() 实现
+- [tests/python/compare_cpu_gpu.py](tests/python/compare_cpu_gpu.py) - CPU/GPU 对比测试脚本
+
+#### Phase 1.5: 变量选择启发式增强 ✅
+**设计文档**: [docs/planning/PHASE_1.5_HEURISTICS_DESIGN.md](docs/planning/PHASE_1.5_HEURISTICS_DESIGN.md)
+
+**核心实现**：
+- ✅ 可插拔 VariableSelector 框架
+  - 抽象接口 + 三种具体实现（MinDomain, DOM/DEG, DOM/DDEG）
+  - [include/solver/common/variable_selector.h](include/solver/common/variable_selector.h)
+  - [src/solver/common/variable_selector.cpp](src/solver/common/variable_selector.cpp)
+
+- ✅ GModel 启发式支持
+  - 添加 var_degrees（变量度数）
+  - 添加 constraint_scopes_cpu（CPU 友好格式）
+  - GModelAdapter 自动计算启发式数据结构
+
+- ✅ gmodel_solver 集成
+  - 命令行选项：`--heuristic=min_domain|dom_deg|dom_ddeg`
+  - 默认使用 MinDomain（与 Phase 1.2 行为一致）
+  - 所有启发式保证 CPU/GPU 节点数匹配
+
+**验证成果**：
+- ✅ 编译通过，所有启发式正常工作
+- ✅ queens-4 测试：所有启发式 P=5/N=1（预期，变量度数相同）
+- ✅ test.xml 测试：所有启发式 P=3/N=0（预期）
+- ✅ CPU/GPU 一致性保持：节点数完全匹配
+
+**测试工具**：
+- [tests/python/benchmark_heuristics.py](tests/python/benchmark_heuristics.py) - 启发式性能对比脚本
+
+**下一步优化**：
+- 测试约束密集问题（预期 DOM/DDEG 有显著提升）
+- 添加 DOM/WDEG（加权度数）
+- 添加 Impact-Based Search
+
+### 计划中的阶段
+
+#### Phase 1.3: 自适应 CPU/GPU 切换引擎（待实施）
+**设计文档**: [docs/planning/ADAPTIVE_ENGINE_DESIGN.md](docs/planning/ADAPTIVE_ENGINE_DESIGN.md)
+
+**核心方案**：
+- **方案 1（优先）**: 基于问题特征的静态选择
+  - ProblemProfiler 分析器（变量数、约束数、域大小、传播复杂度）
+  - 启发式决策规则（小问题→CPU，大问题→GPU）
+  - 实现 cpim_adaptive_solver 应用
+
+- **方案 2（后期）**: 混合执行模式
+  - CPU 负责搜索（变量/值选择）
+  - GPU 负责传播（并行 GAC）
+  - 异步传播管线
+
+- **方案 3（长期）**: 运行时自适应切换
+  - 运行时性能监控
+  - 动态模式切换
+
+**状态**: 设计完成，暂不实施
+
+#### Phase 2: Propagator 框架重构（待实施）
+**设计文档**: [docs/planning/PROPAGATOR_FRAMEWORK_DESIGN.md](docs/planning/PROPAGATOR_FRAMEWORK_DESIGN.md)
+
+**核心目标**: 参考 OR-Tools CP-SAT 架构，重构为模块化的 Propagator 框架
+
+**四阶段计划**：
+- **Phase 2.1（2-3周）**: 基础框架
+  - IntegerVariable 接口（统一 CPU/GPU 域抽象）
+  - Propagator 接口（可插拔传播器）
+  - EventNotifier（事件驱动机制）
+  - PropagationEngine（传播引擎 + 不动点计算）
+
+- **Phase 2.2（3-4周）**: Propagator 实现
+  - AllDifferent（AC 传播）
+  - TableConstraint（GAC 算法）
+  - Linear（线性约束）
+  - Global Constraints（Element, Cumulative 等）
+
+- **Phase 2.3（2-3周）**: 现有代码迁移
+  - MAC 搜索器重构
+  - AC3bit 转换为 Propagator
+  - XcspParser 适配新框架
+
+- **Phase 2.4（3-4周）**: GPU 集成
+  - GPUIntegerVariable（通过 GModel 代理）
+  - GPUDomainManager（批量操作）
+  - GPUPropagatorAdapter（CPU→GPU 自动适配）
+
+**预期收益**：
+- ✅ 可扩展性（易于添加新约束类型）
+- ✅ CPU/GPU 统一抽象（降低维护成本）
+- ✅ 事件驱动优化（减少无效传播）
+- ✅ 支持用户自定义约束
+
+**状态**: 设计完成，暂不实施
+
+完整现代化计划：[docs/planning/MODERNIZATION_PLAN_V2.md](docs/planning/MODERNIZATION_PLAN_V2.md)
 
 ## 注意事项
 

@@ -2,12 +2,51 @@
 
 #include <string>
 #include <vector>
+#include <algorithm>
 
 #include "GModel.cuh"
+#include "solver/gpu/batch_probe_manager.h"
 
 namespace cpim {
 
-// GPU 求解统计信息（扩展版本，包含 GAC 统计）
+// ============================================================================
+// NeighborCSR - 共享邻接表（CSR 格式）
+// 在 GModelSolver 构造时一次性构建，所有 SAC 函数共享使用
+// ============================================================================
+struct NeighborCSR {
+  std::vector<int> offset;  // [num_vars + 1]
+  std::vector<int> data;    // 展平的邻居列表
+
+  // 获取变量 v 的邻居数量
+  int GetDegree(int v) const { return offset[v + 1] - offset[v]; }
+
+  // 遍历变量 v 的邻居
+  const int* GetNeighborsBegin(int v) const { return data.data() + offset[v]; }
+  const int* GetNeighborsEnd(int v) const { return data.data() + offset[v + 1]; }
+
+  // 从 GModel 构建 CSR
+  static NeighborCSR Build(GModel* model);
+};
+
+// SAC 模式选择
+enum class SACMode {
+  kSAC1,    // SAC1: 每轮全量检查 (dirty set 变量粒度)
+  kSAC3,    // SAC3: 队列驱动 (probe 粒度)
+  kAuto     // 自动选择（默认 SAC1）
+};
+
+// GPU MSAC 配置（搜索中的条件触发 SAC）
+// 注意：与 Solver.h 中的 MSACConfig 不同，这是 GPU 求解器专用的配置
+struct GpuMSACConfig {
+  bool enabled = false;              // 是否启用
+  int max_level = 5;                 // 只在前 N 层执行
+  int min_domain_size = 10;          // 域大于此值才执行
+  double min_fail_rate = 0.3;        // 上层失败率高于此值才执行
+  int max_probes_per_node = 100;     // 每节点最多 probe 数
+  bool lightweight = true;           // 轻量级模式（仅检查邻域）
+};
+
+// GPU 求解统计信息（扩展版本，包含 GAC 和 SAC 统计）
 struct GpuSearchStatistics {
   int num_positive = 0;      // 正向赋值次数
   int num_negative = 0;      // 回溯次数
@@ -18,6 +57,13 @@ struct GpuSearchStatistics {
   bool unsolvable = false;   // 是否证明无解
   double solve_time = 0.0;   // 求解时间（秒）
   double gac_time = 0.0;     // GAC 总时间（秒）
+
+  // SAC 统计
+  int sac_deletions = 0;     // SAC 删除的值总数
+  int sac_probes = 0;        // SAC 探测次数
+  int sac_rounds = 0;        // SAC 轮次
+  double sac_time = 0.0;     // SAC 总时间（秒）
+  StageSelection sac_stage = StageSelection::kAuto;  // SAC 使用的 Stage
 };
 
 // ============================================================================
@@ -53,6 +99,44 @@ class GModelSolver {
   // 设置最大解的数量（默认 1）
   void SetMaxSolutions(int max_solutions);
 
+  // ========== SAC 配置 ==========
+  // 启用 SAC1 预处理（在搜索前执行一次 SAC）
+  void SetSAC1Preprocessing(bool enable) { sac1_preprocessing_ = enable; }
+
+  // 设置 SAC Stage 选择模式
+  // kAuto: 使用 AutoStageSelector 自动选择（默认）
+  // kStage1: 强制使用 Micro-Batch
+  // kStage2: 强制使用 Persistent Blocks
+  void SetSACStageMode(StageSelection mode) { sac_stage_mode_ = mode; }
+
+  // 设置 SAC 算法模式
+  void SetSACMode(SACMode mode) { sac_mode_ = mode; }
+  SACMode GetSACMode() const { return sac_mode_; }
+
+  // SAC 早停配置
+  struct SACConfig {
+    int max_rounds = 100;           // 最大轮次
+    double time_budget_ms = 5000;   // 时间预算（毫秒）
+    double min_deletion_rate = 0.01; // 删值率低于此阈值则停止
+    bool early_stop_enabled = true;  // 是否启用早停
+    int warmup_rounds = 2;          // 预热轮次（不检查删值率）
+  };
+
+  void SetSACConfig(const SACConfig& config) { sac_config_ = config; }
+  const SACConfig& GetSACConfig() const { return sac_config_; }
+
+  // MSAC 配置（搜索中的条件触发 SAC）
+  void SetMSACConfig(const GpuMSACConfig& config) { msac_config_ = config; }
+  const GpuMSACConfig& GetMSACConfig() const { return msac_config_; }
+
+  // 执行 SAC1 预处理
+  // 返回删除的值的数量；如果检测到不一致返回 -1
+  int EnforceSAC1(GpuSearchStatistics& stats);
+
+  // 执行 SAC3 预处理（队列驱动，probe 粒度）
+  // 返回删除的值的数量；如果检测到不一致返回 -1
+  int EnforceSAC3(GpuSearchStatistics& stats);
+
  private:
   GModel* model_;                         // GModel 指针（不拥有）
   bool verbose_;                          // 是否打印详细信息
@@ -60,10 +144,32 @@ class GModelSolver {
   int max_solutions_;                     // 最大解的数量
   std::vector<std::vector<int>> solutions_;  // 找到的所有解
 
+  // 共享邻接表（构造时一次性构建）
+  NeighborCSR neighbor_csr_;
+
+  // SAC 配置
+  bool sac1_preprocessing_ = false;       // 是否启用 SAC1 预处理
+  StageSelection sac_stage_mode_ = StageSelection::kAuto;  // SAC Stage 模式
+  SACConfig sac_config_;                  // SAC 早停配置
+  SACMode sac_mode_ = SACMode::kSAC1;     // SAC 算法模式
+
+  // MSAC 配置
+  GpuMSACConfig msac_config_;             // MSAC 配置
+  int last_level_failures_ = 0;           // 上层失败次数（用于计算失败率）
+  int last_level_positives_ = 0;          // 上层正向节点数
+
   // 递归搜索（DFS + MAC）
   // 返回 true 表示找到解或达到最大解数量
   bool Search(int level, GpuSearchStatistics& stats, int time_limit,
               double start_time);
+
+  // MSAC 辅助函数
+  // 判断是否应该执行 MSAC
+  bool ShouldEnforceMSAC(int level, int var, const GpuSearchStatistics& stats);
+
+  // 执行轻量级 MSAC（只检查邻域）
+  // 返回删除的值的数量；如果检测到不一致返回 -1
+  int EnforceLightweightMSAC(int var, GpuSearchStatistics& stats);
 
   // 从当前状态提取解
   void ExtractSolution(int level);

@@ -45,7 +45,17 @@ ABSL_FLAG(std::string, bench_path, "",
 ABSL_FLAG(bool, list_only, false,
           "List discovered bench files without parsing them.");
 ABSL_FLAG(std::string, ac_algorithm, "AC3bit",
-          "Arc consistency algorithm: AC3, AC3bit, RPC3, lMaxRPC, NSAC, SAC1, SAC3");
+          "Arc consistency algorithm: AC3, AC3bit, RPC3, lMaxRPC, NSAC, MSAC3bit");
+ABSL_FLAG(int32_t, msac_max_probes, -1,
+          "Maximum number of SAC probes (-1 = unlimited)");
+ABSL_FLAG(int32_t, msac_max_time_ms, -1,
+          "Maximum SAC probe time in milliseconds (-1 = unlimited)");
+ABSL_FLAG(int32_t, msac_depth_limit, -1,
+          "Maximum search depth for SAC (-1 = all levels)");
+ABSL_FLAG(std::string, msac_mode, "SAC1",
+          "SAC mode: SAC1 (full scan) or SAC3 (incremental queue)");
+ABSL_FLAG(bool, msac_verbose_stats, false,
+          "Output verbose MSAC statistics after search");
 
 // ============================================================================
 // AC 算法选择辅助函数
@@ -57,6 +67,7 @@ cpim::ACAlgorithm ParseACAlgorithm(const std::string& name) {
   if (name == "RPC3") return cpim::CA_RPC3;
   if (name == "lMaxRPC") return cpim::CA_LMRPC_BIT;
   if (name == "NSAC") return cpim::A_NSAC;
+  if (name == "MSAC3bit") return cpim::A_MSAC3bit;  // Phase 1: MSAC with AC3bit kernel
   if (name == "SAC1" || name == "SAC3") {
     LOG(WARNING) << "SAC1/SAC3 not yet integrated via ACAlgorithm enum, falling back to AC3bit";
     return cpim::AC_3bit;
@@ -203,6 +214,33 @@ void TestNewParser(const BenchFileInfo& bench_file) {
 
   cpim::MAC mac(&network, ac_alg, cpim::Heuristic::VRH_DOM_MIN,
                 cpim::Heuristic::VLH_MIN);
+
+  // Phase 1: 配置 MSAC3bit 参数（如果使用了 MSAC）
+  if (ac_alg == cpim::A_MSAC3bit) {
+    // 解析 SAC 模式
+    std::string mode_str = absl::GetFlag(FLAGS_msac_mode);
+    cpim::MSACConfig::Mode mode = cpim::MSACConfig::SAC1;  // 默认 SAC1
+    if (mode_str == "SAC3") {
+      mode = cpim::MSACConfig::SAC3;
+    } else if (mode_str == "SAC_SDS") {
+      mode = cpim::MSACConfig::SAC_SDS;
+    }
+
+    cpim::MSACConfig msac_config(
+        absl::GetFlag(FLAGS_msac_max_probes),
+        absl::GetFlag(FLAGS_msac_max_time_ms),
+        absl::GetFlag(FLAGS_msac_depth_limit),
+        mode);
+
+    mac.ConfigureMSAC(msac_config);
+
+    LOG(INFO) << "MSAC3bit configuration:";
+    LOG(INFO) << "  mode: " << mode_str;
+    LOG(INFO) << "  max_probes: " << msac_config.max_probes;
+    LOG(INFO) << "  max_time_ms: " << msac_config.max_time_ms;
+    LOG(INFO) << "  depth_limit: " << msac_config.depth_limit;
+  }
+
   constexpr int kCpuSolverTimeLimitMs = 900000;
   cpim::SearchStatistics solve_stats = mac.enforce(kCpuSolverTimeLimitMs);
   // NOTE: MAC::enforce() already calls get_solution() internally when a solution is found.
@@ -266,6 +304,14 @@ void TestNewParser(const BenchFileInfo& bench_file) {
       static_cast<int>(solve_stats.solve_time), solve_stats.num_positive,
       solve_stats.num_negative, solve_stats.nodes,
       solve_stats.time_out ? "true" : "false");
+
+  // Phase 1: 输出 MSAC 统计信息
+  if (absl::GetFlag(FLAGS_msac_verbose_stats)) {
+    const auto* msac_stats = mac.GetMSACStats();
+    if (msac_stats) {
+      msac_stats->Print();
+    }
+  }
 
   // 示例：查询拓扑关系
   if (model.num_variables() > 0) {

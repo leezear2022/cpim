@@ -22,6 +22,9 @@ ABSL_FLAG(int, time_limit, 60000, "Time limit in milliseconds (default: 60s)");
 ABSL_FLAG(bool, verbose, false, "Enable verbose output");
 ABSL_FLAG(bool, cpu_only, false, "Run CPU solver only");
 ABSL_FLAG(bool, gpu_only, false, "Run GPU solver only");
+ABSL_FLAG(bool, sac, false, "Enable SAC preprocessing for GPU solver");
+ABSL_FLAG(std::string, sac_stage, "auto", "SAC stage selection: auto, stage1, stage2");
+ABSL_FLAG(std::string, sac_mode, "sac1", "SAC mode: sac1 (dirty set) or sac3 (probe queue)");
 
 using namespace cpim;
 
@@ -90,13 +93,24 @@ SearchStatistics RunCPUSolver(const model::IntermediateModel& im_model,
 // 运行 GPU 求解器
 GpuSearchStatistics RunGPUSolver(const model::IntermediateModel& im_model,
                                 int time_limit, bool verbose,
-                                std::vector<int>& solution) {
+                                std::vector<int>& solution,
+                                bool enable_sac = false,
+                                StageSelection sac_stage = StageSelection::kAuto,
+                                SACMode sac_mode = SACMode::kSAC1) {
   std::cout << "\n========================================" << std::endl;
   std::cout << "=== GPU 求解器 (GModel + GAC) ===" << std::endl;
   std::cout << "========================================" << std::endl;
 
   std::cout << "变量数: " << im_model.num_variables() << std::endl;
   std::cout << "约束数: " << im_model.num_constraints() << std::endl;
+  if (enable_sac) {
+    std::string mode_str = (sac_mode == SACMode::kSAC3) ? "SAC3" : "SAC1";
+    std::cout << mode_str << " 预处理: 启用" << std::endl;
+    std::string stage_str = "Auto";
+    if (sac_stage == StageSelection::kStage1) stage_str = "Stage 1";
+    else if (sac_stage == StageSelection::kStage2) stage_str = "Stage 2";
+    std::cout << "SAC Stage: " << stage_str << std::endl;
+  }
 
   // 构建 GModel
   model::GModelOptions options;
@@ -108,6 +122,13 @@ GpuSearchStatistics RunGPUSolver(const model::IntermediateModel& im_model,
 
   // 创建 GModelSolver
   GModelSolver solver(&gmodel, verbose);
+
+  // 配置 SAC
+  if (enable_sac) {
+    solver.SetSAC1Preprocessing(true);
+    solver.SetSACStageMode(sac_stage);
+    solver.SetSACMode(sac_mode);
+  }
 
   // 求解
   const GpuSearchStatistics stats = solver.Solve(time_limit);
@@ -127,6 +148,23 @@ int main(int argc, char** argv) {
   const bool verbose = absl::GetFlag(FLAGS_verbose);
   const bool cpu_only = absl::GetFlag(FLAGS_cpu_only);
   const bool gpu_only = absl::GetFlag(FLAGS_gpu_only);
+  const bool enable_sac = absl::GetFlag(FLAGS_sac);
+  const std::string sac_stage_str = absl::GetFlag(FLAGS_sac_stage);
+  const std::string sac_mode_str = absl::GetFlag(FLAGS_sac_mode);
+
+  // 解析 SAC stage 选项
+  StageSelection sac_stage = StageSelection::kAuto;
+  if (sac_stage_str == "stage1") {
+    sac_stage = StageSelection::kStage1;
+  } else if (sac_stage_str == "stage2") {
+    sac_stage = StageSelection::kStage2;
+  }
+
+  // 解析 SAC mode 选项
+  SACMode sac_mode = SACMode::kSAC1;
+  if (sac_mode_str == "sac3") {
+    sac_mode = SACMode::kSAC3;
+  }
 
   if (input.empty()) {
     std::cerr << "用法: " << argv[0] << " --input=/path/to/instance.xml"
@@ -136,6 +174,9 @@ int main(int argc, char** argv) {
     std::cerr << "  --verbose         打印详细信息" << std::endl;
     std::cerr << "  --cpu_only        只运行 CPU 求解器" << std::endl;
     std::cerr << "  --gpu_only        只运行 GPU 求解器" << std::endl;
+    std::cerr << "  --sac             启用 SAC 预处理（GPU）" << std::endl;
+    std::cerr << "  --sac_stage=X     SAC Stage 选择: auto|stage1|stage2" << std::endl;
+    std::cerr << "  --sac_mode=X      SAC 模式: sac1|sac3" << std::endl;
     return 1;
   }
 
@@ -197,7 +238,8 @@ int main(int argc, char** argv) {
 
     // 运行 GPU 求解器
     if (!cpu_only) {
-      gpu_stats = RunGPUSolver(normalized, time_limit, verbose, gpu_solution);
+      gpu_stats = RunGPUSolver(normalized, time_limit, verbose, gpu_solution,
+                               enable_sac, sac_stage, sac_mode);
 
       std::cout << "\n--- GPU 求解器统计 ---" << std::endl;
       std::cout << "求解时间: " << gpu_stats.solve_time << " s" << std::endl;
@@ -205,6 +247,12 @@ int main(int argc, char** argv) {
       std::cout << "回溯节点: " << gpu_stats.num_negative << std::endl;
       std::cout << "GAC 迭代: " << gpu_stats.gac_iterations << std::endl;
       std::cout << "GAC 删除: " << gpu_stats.gac_deletions << std::endl;
+      if (enable_sac) {
+        std::cout << "SAC 轮次: " << gpu_stats.sac_rounds << std::endl;
+        std::cout << "SAC 探测: " << gpu_stats.sac_probes << std::endl;
+        std::cout << "SAC 删除: " << gpu_stats.sac_deletions << std::endl;
+        std::cout << "SAC 时间: " << gpu_stats.sac_time << " s" << std::endl;
+      }
       std::cout << "找到解数: " << gpu_stats.num_solutions << std::endl;
       std::cout << "超时: " << (gpu_stats.time_out ? "是" : "否") << std::endl;
 

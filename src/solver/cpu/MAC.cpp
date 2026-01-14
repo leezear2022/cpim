@@ -35,8 +35,12 @@ MAC::MAC(Network* n, const ACAlgorithm ac_algzm, const Heuristic::Var varh,
       break;
     case CA_LMRPC_BIT:
       ac_ = new lMaxRPC(n_);
+      break;
     case CA_RPC3:
       ac_ = new RPC3(n_);
+      break;
+    case A_MSAC3bit:  // Phase 1: MSAC with AC3bit kernel
+      ac_ = new MSAC3bit(n_);
       break;
     default:
       break;
@@ -161,6 +165,8 @@ SearchStatistics MAC::enforce(const int time_limits) {
       if (n_->trail()->CurrentLevel() >= 0) {
         n_->trail()->BacktrackTo(I.size() - 1);
       }
+      // Fix: 清除回溯变量的 assigned 状态
+      v_a.v()->assign(false);
       v_a.v()->RemoveValue(v_a.a());
       ++statistics_.num_negative;
       x_evt_.push_back(v_a.v());
@@ -370,12 +376,22 @@ IntVar* MAC::select_var(const int p) const {
   double min_size = DBL_MAX;
   switch (varh_) {
     case Heuristic::VRH_DOM_MIN: {
-      for (auto v : n_->vars)
-        if (!v->assigned())
+      for (auto v : n_->vars) {
+        if (!v->assigned()) {
           if (v->size() < min_size) {
             min_size = v->size();
             var = v;
           }
+        }
+      }
+      // Debug: Log if no unassigned variable found
+      if (var == nullptr) {
+        LOG(WARNING) << "[MAC] select_var: No unassigned variable found!";
+        for (auto v : n_->vars) {
+          LOG(WARNING) << "  var[" << v->id() << "] assigned=" << v->assigned()
+                       << " size=" << v->size();
+        }
+      }
     }
       return var;
     case Heuristic::VRH_LEX:
@@ -434,6 +450,10 @@ IntVar* MAC::select_var(const int p) const {
 
 int MAC::select_val(const IntVar* v, const int p) const {
   int val = -1;
+  if (v == nullptr) {
+    LOG(ERROR) << "[MAC] select_val: variable is nullptr!";
+    return -1;
+  }
   switch (valh_) {
     case Heuristic::VLH_MIN:
       val = v->head();
@@ -450,6 +470,27 @@ int MAC::select_val(const IntVar* v, const int p) const {
     default:;
   }
   return val;
+}
+
+// Phase 1: 配置 MSAC 参数
+void MAC::ConfigureMSAC(const MSACConfig& config) {
+  if (ac_algzm_ != A_MSAC3bit) {
+    LOG(WARNING) << "ConfigureMSAC called but algorithm is not MSAC3bit";
+    return;
+  }
+
+  // 重新创建 MSAC3bit 实例以应用配置
+  delete ac_;
+  ac_ = new MSAC3bit(n_, config);
+}
+
+// Phase 1: 获取 MSAC 统计信息
+const MSACStats* MAC::GetMSACStats() const {
+  if (ac_algzm_ != A_MSAC3bit) {
+    return nullptr;
+  }
+  auto* msac = dynamic_cast<MSAC3bit*>(ac_);
+  return msac ? &msac->stats() : nullptr;
 }
 
 }  // namespace cpim

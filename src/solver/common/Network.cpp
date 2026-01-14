@@ -117,8 +117,8 @@ void IntVar::RemoveValue(const int a) {
   const auto index = GetBitIdx(a);
   const int word_idx = get<0>(index);
 
-  // 记录旧值到 Trail
-  if (trail_) {
+  // 记录旧值到 Trail（仅当 level >= 0 时记录，level -1 的修改是永久的）
+  if (trail_ && trail_->CurrentLevel() >= 0) {
     trail_->RecordDomainChange(id_, word_idx, bit_doms_[word_idx].to_ullong());
   }
 
@@ -131,8 +131,8 @@ void IntVar::ReduceTo(const int a) {
   const auto index = GetBitIdx(a);
   const int target_word = get<0>(index);
 
-  // 记录所有 word 的旧值到 Trail
-  if (trail_) {
+  // 记录所有 word 的旧值到 Trail（仅当 level >= 0 时记录）
+  if (trail_ && trail_->CurrentLevel() >= 0) {
     for (int i = 0; i < static_cast<int>(bit_doms_.size()); ++i) {
       if (bit_doms_[i].any()) {  // 只记录非零 word
         trail_->RecordDomainChange(id_, i, bit_doms_[i].to_ullong());
@@ -151,8 +151,8 @@ void IntVar::AddValue(const int a) {
   const auto index = GetBitIdx(a);
   const int word_idx = get<0>(index);
 
-  // 记录旧值到 Trail
-  if (trail_) {
+  // 记录旧值到 Trail（仅当 level >= 0 时记录）
+  if (trail_ && trail_->CurrentLevel() >= 0) {
     trail_->RecordDomainChange(id_, word_idx, bit_doms_[word_idx].to_ullong());
   }
 
@@ -162,16 +162,17 @@ void IntVar::AddValue(const int a) {
 }
 
 // Phase 1.1: Trail 域恢复方法
-void IntVar::RestoreBitWord(int word_idx, uint32_t bits) {
+void IntVar::RestoreBitWord(int word_idx, uint64_t bits) {
   bit_doms_[word_idx] = std::bitset<BITSIZE>(bits);
 
-  // Bug Fix: 重新计算 top_size 和 assigned_（修复搜索节点数异常问题）
-  // 原因：min-domain 启发式依赖 top_size，回溯后必须更新缓存值
+  // Bug Fix: 重新计算 top_size（min-domain 启发式依赖此值）
+  // 原因：回溯后必须更新缓存值
   top_size = 0;
   for (const auto& w : bit_doms_) {
     top_size += w.count();
   }
-  assigned_ = (top_size == 1);  // 动态判断是否已赋值
+  // Note: 不设置 assigned_，assigned_ 状态由搜索显式控制
+  // assigned_ 只在 ReduceTo 中设置为 true，在回溯时需要显式清除
 }
 
 // Phase 1.1: 新的无参数版本 (访问单层域)

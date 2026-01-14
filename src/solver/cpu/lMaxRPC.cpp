@@ -82,7 +82,7 @@ ConsistencyState lMaxRPC::enforce(vector<IntVar*>& x_evt, const int p) {
           // cout << "delete: (" << i->id << "," << a << ")" << endl;
           if (i->faild()) {
             // cout << "faild: " << i->id << endl;
-            ++c->weight;
+            IncrementWeight(c);  // Phase 0.1: 使用受控的 weight 更新
             cs.state = false;
             return cs;
           }

@@ -6,6 +6,8 @@
 #include <cuda_runtime.h>
 #include <cooperative_groups.h>
 
+#include "base/unified_trail.h"  // Phase 1.2: Trail 回溯系统
+
 namespace cpim {
 namespace model {
 class IntermediateModel;
@@ -14,10 +16,20 @@ class GModelAdapter;
 
 using u32 = uint32_t;
 
+// Forward declarations for Batch AC-GPU (defined in solver/gpu/batch_probe_manager.h)
+struct ProbeTask;
+struct BatchProbeControl;
+
 struct GacStats {
   int iterations = 0;
   int deletions = 0;
   bool inconsistent = false;
+};
+
+// Frontier 初始化策略
+enum class FrontierInitStrategy {
+  FULL_ACTIVATION,      // 激活所有约束（全局 GAC）
+  NEIGHBOR_ACTIVATION   // 只激活邻接约束（增量 GAC）
 };
 
 // ============================================================================
@@ -86,17 +98,20 @@ class GModel {
   const int max_dom_size;
   const int bit_dom_int_size;  // 每个变量域需要多少个 uint32
   const int bit_doms_int_size;  // 所有变量域需要多少个 uint32 = num_vars * bit_dom_int_size
-  const int max_depth;  // 最大搜索深度（通常为 num_vars + 1）
   const int bitsup_per_constraint = 0;
 
-  // 位域表示（统一内存 - CPU/GPU 都可访问，需要读写）
-  // 多层级布局：bitDom[level * bit_doms_int_size + var_id * bit_dom_int_size + word_idx]
-  // 注意：bitDom 是多层级的，总大小为 max_depth * bit_doms_int_size
+  // Phase 1.2: 单层域布局（统一内存 - CPU/GPU 都可访问，需要读写）
+  // 单层布局：bitDom[var_id * bit_dom_int_size + word_idx]
+  // 大小: bit_doms_int_size = num_vars * bit_dom_int_size
   u32* bitDom = nullptr;
 
-  // 域大小追踪（统一内存）
-  // 布局：d_cur_dom_size[level * num_vars + var_id]
+  // 域大小追踪（统一内存，单层）
+  // 布局：d_cur_dom_size[var_id]
+  // 大小: num_vars
   int* d_cur_dom_size = nullptr;
+
+  // Phase 1.2: Trail 回溯系统（统一内存）
+  UnifiedTrail* trail_ = nullptr;
 
   // 赋值栈（统一内存）
   // 布局：d_assigned[level] = (var_id, value)
@@ -144,6 +159,14 @@ class GModel {
 
   // 初始域大小（CPU 侧基线）
   std::vector<int> initial_dom_sizes;
+
+  // Phase 1.5: 启发式支持
+  // 变量度数（静态）- 用于 DOM/DEG 启发式
+  std::vector<int> var_degrees;
+
+  // 约束作用域（CPU 友好格式）- 用于 DOM/DDEG 启发式
+  // constraint_scopes_cpu[cid] = 约束 cid 的变量列表
+  std::vector<std::vector<int>> constraint_scopes_cpu;
 
   // ========================================================================
   // GAC GPU 控制资源（Bitmap Frontier 方案）
@@ -212,18 +235,19 @@ class GModel {
   GModelData GetGModelDataView() const;
 
   // ========================================================================
-  // 多层级搜索支持
+  // Phase 1.2: Trail 回溯支持（单层域 + Trail）
   // ========================================================================
 
-  // 层级管理
-  int CreateNewLevel();                      // 创建新层级（复制上一层域）
-  void BackToLevel(int level);               // 回溯到指定层级
+  // 层级管理（委托给 Trail）
+  void NewLevel();                           // 进入新层级（O(1)）
+  void BacktrackTo(int target_level);        // 回溯到指定层级（O(1)）
   int GetCurrentLevel() const;               // 获取当前层级
 
-  // 域操作（在指定层级）
-  bool AssignValue(int var, int value, int level);  // 赋值变量
-  bool RemoveValue(int var, int value, int level);  // 删除域值
-  int GetDomainSize(int var, int level) const;      // 获取域大小
+  // 域操作（单层域 + Trail 记录）
+  // 注意：域修改会自动记录到 Trail，回溯时恢复
+  bool AssignValue(int var, int value);      // 赋值变量
+  bool RemoveValue(int var, int value);      // 删除域值
+  int GetDomainSize(int var) const;          // 获取域大小
 
   // ========================================================================
   // 求解器辅助方法
@@ -231,55 +255,94 @@ class GModel {
 
   // 选择最小域变量（启发式）
   // 返回 -1 表示所有变量都已赋值
-  int GetMinDomainVar(int level) const;
+  int GetMinDomainVar() const;
 
   // 检查变量是否已赋值（域大小 = 1）
-  bool IsAssigned(int var, int level) const;
+  bool IsAssigned(int var) const;
 
   // 检查所有变量是否都已赋值
-  bool IsFullyAssigned(int level) const;
+  bool IsFullyAssigned() const;
 
   // 获取已赋值变量的唯一值
-  // 前提：IsAssigned(var, level) == true
+  // 前提：IsAssigned(var) == true
   // 返回 -1 表示变量未赋值或域为空
-  int GetAssignedValue(int var, int level) const;
+  int GetAssignedValue(int var) const;
 
   // 获取变量域中的第一个值
   // 返回 -1 表示域为空
-  int GetFirstValue(int var, int level) const;
+  int GetFirstValue(int var) const;
 
   // 获取变量域中的下一个值
   // 返回 -1 表示没有更多值
-  int GetNextValue(int var, int value, int level) const;
+  int GetNextValue(int var, int value) const;
 
-  // 辅助方法：获取位域索引
-  inline int GetBitDomIndex(int var, int word, int level) const {
-    return level * bit_doms_int_size + var * bit_dom_int_size + word;
+  // Phase 1.2: 辅助方法：获取位域索引（单层域，去掉 level 参数）
+  inline int GetBitDomIndex(int var, int word) const {
+    return var * bit_dom_int_size + word;
   }
+
+  // ========================================================================
+  // Phase 2.x: Batch AC-GPU 辅助方法
+  // ========================================================================
+
+  // 获取 GModelData 视图（用于 Batch Probe Kernel）
+  GModelData GetModelData() const { return GetGModelDataView(); }
+
+  // 获取当前域指针（用于快照保存）
+  const u32* GetBitDom() const { return bitDom; }
+  u32* GetBitDomMutable() { return bitDom; }  // 可修改版本（避免 const_cast）
+
+  // 获取基础参数（用于 BatchProbeManager）
+  int GetNumVars() const { return num_vars; }
+  int GetNumCons() const { return num_constraints; }
+  int GetBitDomIntSize() const { return bit_dom_int_size; }
+
+  // 批量恢复域大小（用于 Batch AC 状态恢复）
+  void RestoreDomainSizes(const int* sizes, int count);
+
+  // 获取域大小数组指针（用于快照保存）
+  int* GetDomainSizesPtr() { return d_cur_dom_size; }
+  const int* GetDomainSizesPtr() const { return d_cur_dom_size; }
 
  private:
   // 纹理后端存储（CUDA Array，对用户不可见）
   cudaArray_t cuArray3D_BitSup = nullptr;
 
-  // 当前搜索层级（从 0 开始）
-  int current_level_ = 0;
+  // Phase 1.2: 移除 current_level_（由 Trail 管理）
+  // int current_level_ = 0;  // 已删除，使用 trail_->CurrentLevel()
 
-  // 赋值栈大小
+  // 赋值栈大小（暂时保留，可能还有用）
   int assigned_size_ = 0;
 
   // 私有构造函数，由 GModelAdapter 调用
   // 接收预分配的内存指针和纹理对象（所有权转移给 GModel）
+  // Phase 1.2: 移除 max_depth 参数，添加 trail 参数
+  // Phase 1.5: 添加 var_degrees 和 constraint_scopes_cpu 参数
   GModel(int num_vars, int num_constraints, int max_dom_size,
-         int bit_dom_int_size, int bit_doms_int_size, int max_depth,
+         int bit_dom_int_size, int bit_doms_int_size,
          int bitsup_per_constraint, u32* bitDom, int* d_cur_dom_size,
          int2* d_assigned, uint3* d_subscription, int* d_subscription_offset,
          int subscription_size, cudaTextureObject_t texObj_BitSup,
          cudaArray_t cuArray3D_BitSup, uint2* bitSupData, int2* constraint_scopes,
          std::vector<std::vector<int>> var_to_constraints,
-         std::vector<int> initial_dom_sizes);
+         std::vector<int> initial_dom_sizes,
+         std::vector<int> var_degrees,
+         std::vector<std::vector<int>> constraint_scopes_cpu,
+         UnifiedTrail* trail);
 
   // 旧的转换逻辑（已移到 GModelAdapter）
   void BuildFromIntermediate(const model::IntermediateModel& im_model);
 };
+
+// ============================================================================
+// Batch AC-GPU Kernel Wrapper（实现在 GModel.cu）
+// ============================================================================
+// 启动 PersistentBatchProbeKernel 的 wrapper 函数
+// 由 BatchProbeManager 调用，实际 kernel 实现在 GModel.cu
+// grid_size 和 block_size 会在 wrapper 内部根据设备能力自动计算
+void LaunchPersistentBatchProbeKernelWrapper(
+    GModelData model_data,
+    BatchProbeControl* control,
+    int max_iterations_per_probe);
 
 }  // namespace cpim

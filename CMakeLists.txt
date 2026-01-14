@@ -170,6 +170,7 @@ add_library(cpim_solver_cpu STATIC
   src/solver/cpu/AC3rm.cpp
   src/solver/cpu/FC.cpp
   src/solver/cpu/MAC.cpp
+  src/solver/cpu/MSAC3bit.cpp
   src/solver/cpu/NSAC.cpp
   src/solver/cpu/RNSQ.cpp
   src/solver/cpu/RPC3.cpp
@@ -260,6 +261,7 @@ endif()
 add_executable(dump_gmodel
   apps/dump_gmodel.cpp
   src/solver/gpu/GModel.cu
+  src/solver/gpu/batch_probe_manager.cu
   src/model/gmodel_adapter.cu
   src/model/gmodel_validator.cu
 )
@@ -293,6 +295,7 @@ endif()
 add_executable(test_multilevel
   tests/cpp/test_multilevel.cpp
   src/solver/gpu/GModel.cu
+  src/solver/gpu/batch_probe_manager.cu
   src/model/gmodel_adapter.cu
   src/model/gmodel_validator.cu
 )
@@ -320,11 +323,115 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm")
 endif()
 
 # ============================================================================
+# test_batch_probe_state: 测试 BatchProbeManager 状态一致性
+# ============================================================================
+add_executable(test_batch_probe_state
+  tests/cpp/test_batch_probe_state.cpp
+  src/solver/gpu/GModel.cu
+  src/solver/gpu/batch_probe_manager.cu
+  src/model/gmodel_adapter.cu
+  src/model/gmodel_validator.cu
+)
+
+set_target_properties(test_batch_probe_state PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON
+)
+
+target_link_libraries(test_batch_probe_state PRIVATE
+  cpim_model
+  cpim_solver_cpu
+  glog::glog
+  absl::flags
+  absl::flags_parse
+  cuda
+  cudart
+)
+
+# 定义项目根路径宏（支持从任意目录运行测试）
+target_compile_definitions(test_batch_probe_state PRIVATE
+  CPIM_PROJECT_ROOT="${CMAKE_SOURCE_DIR}"
+)
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm")
+  target_compile_options(test_batch_probe_state PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=-U__ARM_NEON>
+    $<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=-U__ARM_NEON__>
+    $<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=-DABSL_HAVE_NEON=0>
+  )
+endif()
+
+# 启用测试（如果尚未启用）
+if(NOT CMAKE_TESTING_ENABLED)
+  enable_testing()
+endif()
+
+# 注册到 ctest
+add_test(
+  NAME test_batch_probe_state
+  COMMAND test_batch_probe_state --input=${CMAKE_SOURCE_DIR}/tests/data/bench/queens-4_ext.xml
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+)
+
+set_tests_properties(test_batch_probe_state PROPERTIES
+  LABELS "gpu;batch_ac"
+  TIMEOUT 120
+)
+
+# ============================================================================
+# test_batch2_probe: 比较 Batch-2 (Micro-Batch) 与 Batch-1 的结果一致性
+# ============================================================================
+add_executable(test_batch2_probe
+  tests/cpp/test_batch2_probe.cpp
+  src/solver/gpu/GModel.cu
+  src/solver/gpu/batch_probe_manager.cu
+  src/model/gmodel_adapter.cu
+  src/model/gmodel_validator.cu
+)
+
+set_target_properties(test_batch2_probe PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON
+)
+
+target_link_libraries(test_batch2_probe PRIVATE
+  cpim_model
+  cpim_solver_cpu
+  glog::glog
+  absl::flags
+  absl::flags_parse
+  cuda
+  cudart
+)
+
+target_compile_definitions(test_batch2_probe PRIVATE
+  CPIM_PROJECT_ROOT="${CMAKE_SOURCE_DIR}"
+)
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm")
+  target_compile_options(test_batch2_probe PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=-U__ARM_NEON>
+    $<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=-U__ARM_NEON__>
+    $<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=-DABSL_HAVE_NEON=0>
+  )
+endif()
+
+add_test(
+  NAME test_batch2_probe
+  COMMAND test_batch2_probe --input=${CMAKE_SOURCE_DIR}/tests/data/bench/queens-4_ext.xml
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+)
+
+set_tests_properties(test_batch2_probe PROPERTIES
+  LABELS "gpu;batch_ac"
+  TIMEOUT 120
+)
+
+# ============================================================================
 # gmodel_solver: 简单的 GModel MAC 求解器
 # ============================================================================
 add_executable(gmodel_solver
   apps/gmodel_solver.cpp
   src/solver/gpu/GModel.cu
+  src/solver/gpu/batch_probe_manager.cu
   src/model/gmodel_adapter.cu
   src/model/gmodel_validator.cu
 )
@@ -350,6 +457,83 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm")
     $<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=-DABSL_HAVE_NEON=0>
   )
 endif()
+
+# ============================================================================
+# Batch-1 vs Batch-2 Throughput Benchmark
+# ============================================================================
+add_executable(benchmark_probe_throughput
+  apps/benchmark_probe_throughput.cpp
+  src/solver/gpu/GModel.cu
+  src/solver/gpu/batch_probe_manager.cu
+  src/model/gmodel_adapter.cu
+  src/model/gmodel_validator.cu
+)
+
+set_target_properties(benchmark_probe_throughput PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON
+)
+
+target_link_libraries(benchmark_probe_throughput PRIVATE
+  cpim_model
+  cpim_solver_cpu
+  glog::glog
+  absl::flags
+  absl::flags_parse
+  cuda
+  cudart
+)
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm")
+  target_compile_options(benchmark_probe_throughput PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=-U__ARM_NEON>
+    $<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=-U__ARM_NEON__>
+    $<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=-DABSL_HAVE_NEON=0>
+  )
+endif()
+
+# ============================================================================
+# Stage 1 vs Stage 2 (Persistent Blocks) correctness test
+# ============================================================================
+add_executable(test_stage2_persistent
+  tests/cpp/test_stage2_persistent.cpp
+  src/solver/gpu/GModel.cu
+  src/solver/gpu/batch_probe_manager.cu
+  src/model/gmodel_adapter.cu
+  src/model/gmodel_validator.cu
+  src/base/unified_trail.cpp
+  src/solver/common/Network.cpp
+)
+
+target_link_libraries(test_stage2_persistent PRIVATE
+  cpim_model
+  glog::glog
+  absl::flags
+  absl::flags_parse
+)
+
+target_include_directories(test_stage2_persistent PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/include/model
+)
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm")
+  target_compile_options(test_stage2_persistent PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=-U__ARM_NEON>
+    $<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=-U__ARM_NEON__>
+    $<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=-DABSL_HAVE_NEON=0>
+  )
+endif()
+
+add_test(
+  NAME test_stage2_persistent
+  COMMAND test_stage2_persistent ${CMAKE_SOURCE_DIR}/tests/data/bench/queens-4_ext.xml
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+)
+
+set_tests_properties(test_stage2_persistent PROPERTIES
+  LABELS "gpu;batch_ac;stage2"
+  TIMEOUT 120
+)
 
 # ============================================================================
 # CPU GAC baseline utility (serial event queue + propagation)
@@ -418,6 +602,7 @@ link_directories(${CUDA_TOOLKIT_ROOT_DIR}/lib64)
 add_executable(compare_cpu_gpu
   apps/compare_cpu_gpu.cpp
   src/solver/gpu/GModel.cu
+  src/solver/gpu/batch_probe_manager.cu
   src/solver/gpu/GModelSolver.cu
   src/model/gmodel_adapter.cu
   src/model/gmodel_validator.cu
@@ -475,3 +660,88 @@ target_link_libraries(verify_search PRIVATE
   absl::flags
   absl::flags_parse
 )
+
+# ============================================================================
+# test_batch3a: Batch-3A (约束聚合) 测试
+# ============================================================================
+add_executable(test_batch3a
+  tests/cpp/test_batch3a.cpp
+  src/solver/gpu/GModel.cu
+  src/solver/gpu/batch_probe_manager.cu
+  src/model/gmodel_adapter.cu
+  src/model/gmodel_validator.cu
+)
+
+set_target_properties(test_batch3a PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON
+)
+
+target_link_libraries(test_batch3a PRIVATE
+  cpim_model
+  cpim_solver_cpu
+  glog::glog
+  absl::flags
+  absl::flags_parse
+  cuda
+  cudart
+)
+
+target_compile_definitions(test_batch3a PRIVATE
+  CPIM_PROJECT_ROOT="${CMAKE_SOURCE_DIR}"
+)
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm")
+  target_compile_options(test_batch3a PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=-U__ARM_NEON>
+    $<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=-U__ARM_NEON__>
+    $<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=-DABSL_HAVE_NEON=0>
+  )
+endif()
+
+add_test(
+  NAME test_batch3a
+  COMMAND test_batch3a --input=${CMAKE_SOURCE_DIR}/tests/data/bench/queens-4_ext.xml --num_probes=10
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+)
+
+set_tests_properties(test_batch3a PROPERTIES
+  LABELS "gpu;batch_ac;batch3a"
+  TIMEOUT 120
+)
+
+# ============================================================================
+# sac_benchmark: SAC-GPU 统一基准测试工具
+# ============================================================================
+add_executable(sac_benchmark
+  apps/sac_benchmark.cpp
+  src/solver/gpu/GModel.cu
+  src/solver/gpu/batch_probe_manager.cu
+  src/model/gmodel_adapter.cu
+  src/model/gmodel_validator.cu
+)
+
+set_target_properties(sac_benchmark PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON
+)
+
+target_link_libraries(sac_benchmark PRIVATE
+  cpim_model
+  cpim_solver_cpu
+  glog::glog
+  absl::flags
+  absl::flags_parse
+  cuda
+  cudart
+)
+
+target_compile_definitions(sac_benchmark PRIVATE
+  CPIM_PROJECT_ROOT="${CMAKE_SOURCE_DIR}"
+)
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm")
+  target_compile_options(sac_benchmark PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=-U__ARM_NEON>
+    $<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=-U__ARM_NEON__>
+    $<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=-DABSL_HAVE_NEON=0>
+  )
+endif()

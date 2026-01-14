@@ -15,10 +15,10 @@ struct TrailEntry {
   };
 
   Type type;
-  uint8_t padding[3];      // 对齐到 4 字节
+  uint8_t padding[7];      // 对齐到 8 字节
   int32_t var_id;          // 变量 ID
   int32_t word_index;      // bitDom 中的 word 索引
-  uint32_t old_bits;       // 修改前的 bit 值
+  uint64_t old_bits;       // 修改前的 bit 值 (BITSIZE=64，必须用 64 位)
 };
 
 /**
@@ -90,7 +90,7 @@ class UnifiedTrail {
    * @param word_idx bitDom 中的 word 索引
    * @param old_bits 修改前的 bit 值
    */
-  void RecordDomainChange(int var_id, int word_idx, uint32_t old_bits);
+  void RecordDomainChange(int var_id, int word_idx, uint64_t old_bits);
 
   /**
    * 获取当前层级
@@ -106,6 +106,13 @@ class UnifiedTrail {
    * 获取 Trail 容量
    */
   int Capacity() const { return trail_capacity_; }
+
+  /**
+   * 获取指定索引的 Trail 条目 (用于增量队列初始化等场景)
+   * @param index 条目索引 (0 到 Size()-1)
+   * @return Trail 条目的只读引用
+   */
+  const TrailEntry& GetEntry(int index) const { return trail_entries_[index]; }
 
   /**
    * GPU 辅助接口 (Phase 1.2 使用)

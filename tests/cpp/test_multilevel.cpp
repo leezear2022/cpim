@@ -97,38 +97,40 @@ int main(int argc, char* argv[]) {
     std::cout << "\n=== Multi-Level Test ===" << std::endl;
     std::cout << "Initial level: " << gmodel.GetCurrentLevel() << std::endl;
 
-    // 2. 测试 CreateNewLevel
+    // 2. Phase 1.2: 测试 NewLevel（API 更名）
     std::cout << "\n[Test] Creating level 1..." << std::endl;
-    int level1 = gmodel.CreateNewLevel();
+    gmodel.NewLevel();
+    int level1 = gmodel.GetCurrentLevel();
     std::cout << "  Current level: " << level1 << std::endl;
 
-    // 3. 测试 AssignValue
+    // 3. Phase 1.2: 测试 AssignValue（移除 level 参数）
     if (gmodel.num_vars > 0) {
       std::cout << "\n[Test] Assigning var[0] = 0 at level 1..." << std::endl;
-      bool success = gmodel.AssignValue(0, 0, level1);
+      bool success = gmodel.AssignValue(0, 0);
       std::cout << "  Success: " << (success ? "true" : "false") << std::endl;
       std::cout << "  Domain size after assignment: "
-                << gmodel.GetDomainSize(0, level1) << std::endl;
+                << gmodel.GetDomainSize(0) << std::endl;
     }
 
-    // 4. 测试 CreateNewLevel（第二层）
+    // 4. Phase 1.2: 测试 NewLevel（第二层）
     std::cout << "\n[Test] Creating level 2..." << std::endl;
-    int level2 = gmodel.CreateNewLevel();
+    gmodel.NewLevel();
+    int level2 = gmodel.GetCurrentLevel();
     std::cout << "  Current level: " << level2 << std::endl;
 
     if (gmodel.num_vars > 1) {
       std::cout << "  Domain size of var[0] at level 2: "
-                << gmodel.GetDomainSize(0, level2) << std::endl;
+                << gmodel.GetDomainSize(0) << std::endl;
     }
 
     // 5. 测试 BackToLevel
     std::cout << "\n[Test] Backtracking to level 0..." << std::endl;
-    gmodel.BackToLevel(0);
+    gmodel.BacktrackTo(0);
     std::cout << "  Current level: " << gmodel.GetCurrentLevel() << std::endl;
 
     if (gmodel.num_vars > 0) {
       std::cout << "  Domain size of var[0] at level 0: "
-                << gmodel.GetDomainSize(0, 0) << std::endl;
+                << gmodel.GetDomainSize(0) << std::endl;
     }
 
     // 6. 测试 RemoveValue
@@ -147,10 +149,11 @@ int main(int argc, char* argv[]) {
       }
       std::cout << "}" << std::endl;
 
-      bool success = gmodel.RemoveValue(0, 1, 0);
+      // Phase 1.2: RemoveValue 移除 level 参数
+      bool success = gmodel.RemoveValue(0, 1);
       std::cout << "  Success: " << (success ? "true" : "false") << std::endl;
       std::cout << "  Domain size after removal: "
-                << gmodel.GetDomainSize(0, 0) << std::endl;
+                << gmodel.GetDomainSize(0) << std::endl;
 
       // 打印删除后的域
       std::cout << "  After removal, var[0] at level 0: {";
@@ -169,7 +172,7 @@ int main(int argc, char* argv[]) {
 
     // 7. 测试 EnforceGAC（约束传播）
     std::cout << "\n[Test] Testing GAC enforcement at level 0..." << std::endl;
-    gmodel.BackToLevel(0);  // 确保在 level 0
+    gmodel.BacktrackTo(0);  // 确保在 level 0
 
     GacStats gac_stats = gmodel.EnforceGAC(true);  // verbose=true
     std::cout << "\n[Test] GAC Results:" << std::endl;
@@ -180,7 +183,7 @@ int main(int argc, char* argv[]) {
     // 打印传播后的域
     std::cout << "\n[Test] Domain sizes after GAC:" << std::endl;
     for (int var = 0; var < gmodel.num_vars; ++var) {
-      std::cout << "  var[" << var << "]: " << gmodel.GetDomainSize(var, 0) << std::endl;
+      std::cout << "  var[" << var << "]: " << gmodel.GetDomainSize(var) << std::endl;
     }
 
     std::cout << "\n=== All Tests Passed! ===" << std::endl;

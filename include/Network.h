@@ -153,7 +153,7 @@ class IntVar {
   void AddValue(const int a);
 
   // Phase 1.1: Trail 域恢复接口
-  void RestoreBitWord(int word_idx, uint32_t bits);
+  void RestoreBitWord(int word_idx, uint64_t bits);
 
   int value(const int idx) const { return vals_[idx]; }
   int size() const;  // Phase 1.1: 移除 level 参数

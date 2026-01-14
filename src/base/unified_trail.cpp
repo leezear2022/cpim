@@ -75,14 +75,18 @@ void UnifiedTrail::BacktrackTo(int target_level) {
   }
 
   // Phase 1.1: 恢复域数据 (从后向前遍历 trail entries)
-  CHECK(vars_ != nullptr) << "Variables not set! Call SetVariables() first.";
+  // Phase 1.2: 如果 vars_ 为空（GModel 场景），跳过自动恢复，由调用者手动恢复
   int old_trail_size = trail_size_;
-  for (int i = trail_size_ - 1; i >= target_trail_size; --i) {
-    const TrailEntry& entry = trail_entries_[i];
-    if (entry.type == TrailEntry::DOMAIN_CHANGE) {
-      (*vars_)[entry.var_id]->RestoreBitWord(entry.word_index, entry.old_bits);
+  if (vars_ != nullptr) {
+    // CPU 场景：自动恢复 IntVar 域
+    for (int i = trail_size_ - 1; i >= target_trail_size; --i) {
+      const TrailEntry& entry = trail_entries_[i];
+      if (entry.type == TrailEntry::DOMAIN_CHANGE) {
+        (*vars_)[entry.var_id]->RestoreBitWord(entry.word_index, entry.old_bits);
+      }
     }
   }
+  // else: GPU 场景（GModel），调用者需要在 GModel::BacktrackTo() 中手动恢复
 
   // 更新 trail 指针
   trail_size_ = target_trail_size;
@@ -94,7 +98,7 @@ void UnifiedTrail::BacktrackTo(int target_level) {
 }
 
 void UnifiedTrail::RecordDomainChange(int var_id, int word_idx,
-                                       uint32_t old_bits) {
+                                       uint64_t old_bits) {
   CHECK_LT(trail_size_, trail_capacity_)
       << "Trail overflow! Increase max_trail_size. Current capacity="
       << trail_capacity_;

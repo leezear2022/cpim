@@ -84,7 +84,7 @@ bool NSAC::full_NSAC(IntVar* v, IntVar* x, const int level) {
     // 可优化
     if (res) {
       if (y->faild()) {
-        ++(c->weight);
+        IncrementWeight(c);  // Phase 0.1
         return false;
       }
     }
@@ -99,7 +99,7 @@ bool NSAC::full_NSAC(IntVar* v, IntVar* x, const int level) {
       res = revise(arc(c, z), level);
       if (res) {
         if (z->faild()) {
-          ++(c->weight);
+          IncrementWeight(c);  // Phase 0.1
           return false;
         }
       }

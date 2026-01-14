@@ -77,7 +77,7 @@ void AC3::insert(IntVar* v) {
 //{ 									cs.tab =
 //c; 									cs.var =
 //y;
-//									++(c->weight);
+//									IncrementWeight(c);  // Phase 0.1
 //									//cout
 //<< c->id()<<": weight = "<<c->weight << endl;
 //cs.state = false;
@@ -122,7 +122,7 @@ ConsistencyState AC3::enforce(vector<IntVar*>& x_evt, const int level) {
                 if (y->faild()) {
                   cs.tab = c;
                   cs.var = y;
-                  ++(c->weight);
+                  IncrementWeight(c);  // Phase 0.1
                   // cout << c->id()<<": weight = "<<c->weight << endl;
                   cs.state = false;
                   return cs;

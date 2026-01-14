@@ -153,7 +153,7 @@ ConsistencyState RPC3::enforce(vector<IntVar*>& x_evt, const int p) {
 			}
 
 			if (vp.x->faild()) {
-				++c->weight;
+				IncrementWeight(c);  // Phase 0.1
 				cs.state = false;
 				return cs;
 			}

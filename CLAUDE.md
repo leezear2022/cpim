@@ -43,6 +43,23 @@ cd .. && python3 tests/python/batch_test_v2.py --tier=0
 
 **数据流**: `XCSP3 → Parser → IntermediateModel → Network → MAC + AC → Solution`
 
+## 文档导航
+
+详见 [docs/README.md](docs/README.md)
+
+### 快速链接
+
+| 类别 | 文档 |
+|------|------|
+| 系统架构 | [docs/architecture/ARCHITECTURE.md](docs/architecture/ARCHITECTURE.md) |
+| 应用程序参考 | [docs/guides/APPS_REFERENCE.md](docs/guides/APPS_REFERENCE.md) |
+| 测试指南 | [docs/guides/TESTING_GUIDE.md](docs/guides/TESTING_GUIDE.md) |
+| AC 算法 | [docs/algorithms/consistency/AC_HIERARCHY.md](docs/algorithms/consistency/AC_HIERARCHY.md) |
+| SAC 算法 | [docs/algorithms/consistency/SAC_ALGORITHMS.md](docs/algorithms/consistency/SAC_ALGORITHMS.md) |
+| MAC 搜索 | [docs/algorithms/search/MAC_SEARCH.md](docs/algorithms/search/MAC_SEARCH.md) |
+| 变量启发式 | [docs/algorithms/heuristics/VARIABLE_HEURISTICS.md](docs/algorithms/heuristics/VARIABLE_HEURISTICS.md) |
+| GPU 实现 | [docs/gpu/GMODEL_ARCHITECTURE.md](docs/gpu/GMODEL_ARCHITECTURE.md) |
+
 ## 目录结构
 
 ```
@@ -66,10 +83,15 @@ cpim/
 ├── third_party/
 │   └── xcsp3parser/   # XCSP3 解析器
 ├── docs/
+│   ├── README.md      # 文档导航入口
 │   ├── architecture/  # 架构文档
+│   ├── algorithms/    # 算法理论（AC, SAC, MAC, 启发式）
+│   ├── gpu/           # GPU 实现文档
 │   ├── guides/        # 使用指南
-│   ├── planning/      # 开发规划
-│   └── performance/   # 性能分析
+│   ├── planning/      # 活跃开发规划
+│   ├── performance/   # 性能分析
+│   ├── bugfixes/      # Bug 修复记录
+│   └── archive/       # 归档文档
 └── benchmarks/        # 大型测试实例（.gitignore）
 ```
 
@@ -110,9 +132,26 @@ python3 tests/python/batch_test_v2.py --tier=2
 ## 关键文件
 
 ### 应用程序
+
+详见 [docs/guides/APPS_REFERENCE.md](docs/guides/APPS_REFERENCE.md)
+
+**求解器**
 - [apps/cpim_test_parser.cpp](apps/cpim_test_parser.cpp) - CPU 求解器入口
+- [apps/gmodel_solver.cpp](apps/gmodel_solver.cpp) - GPU 求解器
+
+**验证工具**
 - [apps/verify_gac.cpp](apps/verify_gac.cpp) - GAC 验证工具
 - [apps/verify_search.cpp](apps/verify_search.cpp) - 搜索验证工具
+
+**基准测试**
+- [apps/sac_benchmark.cpp](apps/sac_benchmark.cpp) - SAC-GPU 基准测试
+- [apps/benchmark_probe_throughput.cpp](apps/benchmark_probe_throughput.cpp) - Batch 探测吞吐量
+- [apps/compare_cpu_gpu.cpp](apps/compare_cpu_gpu.cpp) - CPU/GPU 对比
+
+**调试工具**
+- [apps/dump_gmodel.cpp](apps/dump_gmodel.cpp) - GModel 导出
+- [apps/cpim_dump.cpp](apps/cpim_dump.cpp) - 模型导出
+- [apps/cpim_gac_cpu.cpp](apps/cpim_gac_cpu.cpp) - CPU GAC 工具
 
 ### 核心实现
 - [src/solver/cpu/MAC.cpp](src/solver/cpu/MAC.cpp) - MAC 搜索算法
@@ -122,11 +161,25 @@ python3 tests/python/batch_test_v2.py --tier=2
 - [src/solver/gpu/GModel.cu](src/solver/gpu/GModel.cu) - 简化 GPU 模型
 - [src/solver/common/variable_selector.cpp](src/solver/common/variable_selector.cpp) - 变量选择启发式（Phase 1.5）
 
-### 测试
-- [tests/python/batch_test_v2.py](tests/python/batch_test_v2.py) - 批量测试脚本
+### 测试脚本
+
+**批量测试**
+- [tests/python/batch_test_v2.py](tests/python/batch_test_v2.py) - 分层批量测试（主测试脚本）
 - [tests/python/tier_definitions.py](tests/python/tier_definitions.py) - 分层测试集定义
-- [tests/python/compare_cpu_gpu.py](tests/python/compare_cpu_gpu.py) - CPU/GPU 对比测试
+
+**对比测试**
+- [tests/python/compare_cpu_gpu.py](tests/python/compare_cpu_gpu.py) - CPU/GPU 节点数对比
+- [tests/python/compare_ac_algorithms.py](tests/python/compare_ac_algorithms.py) - AC 算法对比
+- [tests/python/compare_sac_algorithms.py](tests/python/compare_sac_algorithms.py) - SAC 算法对比
+- [tests/python/compare_activation_strategies.py](tests/python/compare_activation_strategies.py) - 激活策略对比
+- [tests/python/compare_batch2_tier0.py](tests/python/compare_batch2_tier0.py) - Batch2 测试
+
+**基准测试**
 - [tests/python/benchmark_heuristics.py](tests/python/benchmark_heuristics.py) - 启发式性能对比
+
+**外部求解器**
+- [tests/python/solve_xcsp_ortools.py](tests/python/solve_xcsp_ortools.py) - OR-Tools SAT 求解
+- [tests/python/solve_xcsp_ortools_cp.py](tests/python/solve_xcsp_ortools_cp.py) - OR-Tools CP 求解
 
 ## 开发规划
 

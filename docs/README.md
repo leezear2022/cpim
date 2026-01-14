@@ -47,7 +47,7 @@
 ### 关键规划文档
 
 - [现代化计划 V2](planning/MODERNIZATION_PLAN_V2.md) - 总体开发规划
-- [**Batch-GPU SAC 优化**](planning/BATCHGPU_SAC_OPTIMIZATION.md) - bitGEMM 化与 SAC-2/3 升级
+- [**SAC-GPU 设计**](planning/SACGPU_DESIGN.md) - bitGEMM 化、SACq/NSACq、长尾控制
 - [Phase 1.5 启发式](planning/PHASE_1.5_HEURISTICS_DESIGN.md) - 变量选择启发式
 - [Propagator 框架](planning/PROPAGATOR_FRAMEWORK_DESIGN.md) - Phase 2 重构计划
 - [自适应引擎](planning/ADAPTIVE_ENGINE_DESIGN.md) - CPU/GPU 切换策略

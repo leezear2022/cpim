@@ -33,6 +33,13 @@
 
 规划文档：[docs/planning/MODERNIZATION_PLAN_V2.md](docs/planning/MODERNIZATION_PLAN_V2.md)
 
+## 开发规范（SAC-GPU 迭代）
+
+- **回归测试**: 每个改进点完成后必须运行 `batch_test_v2.py --tier=0` 验证正确性
+- **性能记录**: 记录改动前后的 p50/p95/p99 时间，用于评估收益
+- **消融开关**: 关键旧版本保留运行时开关（如 `--use_legacy_xxx`）以备消融实验
+- **可回退原则**: 任何新路径必须能回退到 Stage2 稳定路径
+
 ## 注意事项
 
 - **通信语言**: 全程使用中文交流

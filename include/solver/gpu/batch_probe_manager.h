@@ -6,10 +6,22 @@
 #define CPIM_BATCH_PROBE_MANAGER_H_
 
 #include <vector>
+#include <algorithm>
+#include <climits>
+#include <cstdint>
 #include <cuda_runtime.h>
 #include "GModel.cuh"
 
 namespace cpim {
+
+// ============================================================================
+// ProbeStatus - 探测结果状态（P0-1：UNKNOWN 语义）
+// ============================================================================
+enum class ProbeStatus : int8_t {
+  kOK = 0,       // 正常收敛，域一致（不删值）
+  kDWO = 1,      // Domain Wipe-Out（值可删）
+  kUNKNOWN = 2   // 预算超限/未收敛（不删值，保守处理）
+};
 
 // ============================================================================
 // ProbeTask - 单个探测任务 (12 bytes)
@@ -62,6 +74,12 @@ struct BatchProbeControl {
   unsigned long long short_circuit_count; // 短路次数（跳过 GAC）
   int need_gac_flag;                      // Precheck 结果标志（0=短路，1=需要GAC）
 
+  // ========== P0-1 NEW: UNKNOWN 语义与预算控制 ==========
+  int8_t* probe_status;           // 探测状态数组 [num_tasks]（ProbeStatus 枚举值）
+  int* probe_iterations;          // 每个 probe 的实际迭代次数 [num_tasks]
+  int max_iterations_per_probe;   // per-probe 迭代预算（0 = 无限制）
+  int budget_hit_flag;            // 当前 probe 是否触发预算（1 = 触发）
+
   // ========== 构造函数 ==========
   __host__ __device__ BatchProbeControl()
       : num_tasks(0),
@@ -83,7 +101,69 @@ struct BatchProbeControl {
         activation_strategy(-1),      // P0-1: -1 表示未设置
         precheck_count(0),            // P0-2
         short_circuit_count(0),       // P0-2
-        need_gac_flag(0) {}           // P0-2
+        need_gac_flag(0),             // P0-2
+        probe_status(nullptr),        // P0-1 NEW
+        probe_iterations(nullptr),    // P0-1 NEW
+        max_iterations_per_probe(0),  // P0-1 NEW: 0 = 无限制
+        budget_hit_flag(0) {}         // P0-1 NEW
+};
+
+// ============================================================================
+// ProbeStatistics - 探测统计信息（P0-1：统计闭环）
+// ============================================================================
+struct ProbeStatistics {
+  // 基础计数
+  int total_probes = 0;           // 总探测数
+  int dwo_count = 0;              // DWO 计数（可删值）
+  int ok_count = 0;               // OK 计数（一致）
+  int unknown_count = 0;          // UNKNOWN 计数（预算超限）
+  int budget_hit_count = 0;       // 预算触发次数
+
+  // 迭代统计
+  int64_t total_iterations = 0;   // 总迭代次数
+  int max_iterations = 0;         // 最大单次迭代
+  int min_iterations = INT_MAX;   // 最小单次迭代
+
+  // 用于计算分位数的直方图（可选）
+  std::vector<int> iter_histogram;
+
+  // 计算 UNKNOWN 比例
+  double unknown_rate() const {
+    return total_probes > 0 ? static_cast<double>(unknown_count) / total_probes : 0.0;
+  }
+
+  // 计算 DWO 比例
+  double dwo_rate() const {
+    return total_probes > 0 ? static_cast<double>(dwo_count) / total_probes : 0.0;
+  }
+
+  // 计算平均迭代次数
+  double avg_iterations() const {
+    return total_probes > 0 ? static_cast<double>(total_iterations) / total_probes : 0.0;
+  }
+
+  // 重置统计
+  void Reset() {
+    total_probes = dwo_count = ok_count = unknown_count = budget_hit_count = 0;
+    total_iterations = 0;
+    max_iterations = 0;
+    min_iterations = INT_MAX;
+    iter_histogram.clear();
+  }
+
+  // 合并统计（用于多批次累计）
+  void Merge(const ProbeStatistics& other) {
+    total_probes += other.total_probes;
+    dwo_count += other.dwo_count;
+    ok_count += other.ok_count;
+    unknown_count += other.unknown_count;
+    budget_hit_count += other.budget_hit_count;
+    total_iterations += other.total_iterations;
+    max_iterations = std::max(max_iterations, other.max_iterations);
+    if (other.min_iterations < min_iterations) {
+      min_iterations = other.min_iterations;
+    }
+  }
 };
 
 // ============================================================================
@@ -296,7 +376,11 @@ struct Batch2PersistentControl {
 
   // ========== 任务与结果 ==========
   const ProbeTask* tasks;         // 任务数组 [num_tasks]
-  bool* results;                  // 结果数组 [num_tasks]
+  bool* results;                  // 结果数组 [num_tasks]（兼容旧接口）
+
+  // ========== P0-1 NEW: 三态结果 ==========
+  int8_t* task_status;            // 探测状态 [num_tasks]（ProbeStatus 枚举值）
+                                  // kOK=0: 收敛一致, kDWO=1: 可删, kUNKNOWN=2: 预算超限
 
   // ========== Per-task 统计（可选，nullptr 表示不收集）==========
   int* task_iterations;           // 每个 task 的迭代次数 [num_tasks]
@@ -322,6 +406,7 @@ struct Batch2PersistentControl {
         dom_size_snapshot(nullptr),
         tasks(nullptr),
         results(nullptr),
+        task_status(nullptr),       // P0-1 NEW
         task_iterations(nullptr),
         task_deletions(nullptr),
         workspaces(nullptr),
@@ -393,6 +478,13 @@ class Batch2PersistentManager {
     return last_precheck_short_circuit_count_;
   }
 
+  // P0-1 NEW: 获取最近一次执行的统计（三态）
+  const ProbeStatistics& GetLastStatistics() const { return last_statistics_; }
+
+  // P0-1 NEW: 设置预算参数
+  void SetMaxIterationsPerProbe(int max_iters) { max_iterations_per_probe_ = max_iters; }
+  int GetMaxIterationsPerProbe() const { return max_iterations_per_probe_; }
+
  private:
   void AllocateMemory();
   void FreeMemory();
@@ -426,6 +518,9 @@ class Batch2PersistentManager {
   int* d_task_iterations_ = nullptr;        // [max_tasks]
   unsigned long long* d_task_deletions_ = nullptr;  // [max_tasks]
 
+  // P0-1 NEW: 三态状态数组
+  int8_t* d_task_status_ = nullptr;         // [max_tasks] ProbeStatus 枚举值
+
   // Precheck 统计（全局计数器）
   unsigned long long* d_precheck_short_circuit_count_ = nullptr;  // 原子递增
 
@@ -442,6 +537,10 @@ class Batch2PersistentManager {
   std::vector<int> last_probe_iterations_;
   std::vector<unsigned long long> last_probe_deletions_;
   unsigned long long last_precheck_short_circuit_count_ = 0;
+
+  // P0-1 NEW: 三态统计
+  ProbeStatistics last_statistics_;
+  int max_iterations_per_probe_ = 1000;  // 默认预算
 
   bool memory_allocated_ = false;
 };

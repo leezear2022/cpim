@@ -1,10 +1,54 @@
 # 修改清单（中文）
 
+## 2026-01-16
+
+### P0-1：显式 UNKNOWN 语义与统计闭环（基础设施）
+
+**背景**：根据 `docs/planning/TODO_SACGPU_NEXT.md` 的优先级规划，实施 P0-1 任务。
+
+**目标**：probe 执行若 hit budget，则标记 `UNKNOWN`，结果一律"不删"（保守处理）。
+
+**交付内容**：
+- `ProbeStatus { kOK, kDWO, kUNKNOWN }` 枚举（三态）
+- `ProbeStatistics` 统计结构（unknown_rate、budget_hit_count、avg/max iterations）
+- Stage2 内核根据 `max_iterations_per_probe` 判断是否预算超限
+- `CollectResults` 仅对 `kDWO` 删值，`kUNKNOWN` 保守不删
+
+**修改文件**：
+- `include/solver/gpu/batch_probe_manager.h`: 添加 `ProbeStatus`、`ProbeStatistics`、`Batch2PersistentControl::task_status` 等
+- `src/solver/gpu/batch_probe_manager.cu`: 内存分配/释放、`CollectResults` 三态统计收集
+- `src/solver/gpu/GModel.cu`: Stage2 内核设置 `task_status`（预算超限→kUNKNOWN）
+
+**开发规范**：
+- 在 `AGENTS.md` 和 `CLAUDE.md` 添加开发规范：回归测试、性能记录、消融开关、可回退原则
+
+**验收**：`batch_test_v2.py --tier=0` 通过（8/12 匹配，4 个超时是已有性能问题）
+
+---
+
+### SACGPU 下一阶段 TODO 备忘
+
+- 新增 `docs/planning/TODO_SACGPU_NEXT.md`：整理 P0-P3 的实施清单（UNKNOWN 语义、NSAC mask、
+  Batch-3A 接入、bitGEMM 路线与 `bmma_sync(b1, AND+POPC)` 插入点），作为后续迭代备忘录。
+- 补充：在 P1-1 增加依赖关系说明（P0-1/P0-3），在 P3-2 明确 BMMA 对 “world 列矩阵 packing 载体稳定”
+  的前提要求。
+
+---
+
+## 2026-01-15
+
+### SAC‑GPU 设计文档（Draft v2）整理
+
+- 重写 `docs/planning/SACGPU_DESIGN copy.md`：将原“讨论纪要式”文本整理为可发布的设计草案（元信息/术语对齐/与代码现状锚定/参考文献编号统一），并明确 Phase 5（Batch‑3A/3D 扁平化队列）作为可选加速器的启用条件与主线优先级（budget + NSAC）。
+- 更新 `docs/planning/SACGPU_DESIGN.md`：合并 copy 版的关键增补（文档 frontmatter/扁平化层次定义/代码现状对齐/Phase 5 启用条件与回退策略），作为统一版主入口。
+
+---
+
 ## 2026-01-12
 
 ### Phase 5（Batch‑3D）问题与讨论备忘
 
-- 新增 `docs/planning/BATCH_AC_GPU_PHASE5_BATCH3D_DISCUSSION_MEMO.md`：总结 Phase 5
+- 新增 `docs/archive/batch_ac_versions/BATCH_AC_GPU_PHASE5_BATCH3D_DISCUSSION_MEMO.md`：总结 Phase 5
   推进中的瓶颈（并行度/访存/长尾/调度开销/平台约束）与下一步数据验证清单，用于
   与外部大模型做方案评审。
 - 扩展补充：在备忘中加入 Phase 1‑4 已完成工作概览与 Full/fast MSAC 现象说明，便于外部对齐上下文。

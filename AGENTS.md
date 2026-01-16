@@ -49,6 +49,13 @@
 - NVIDIA Orin GPU, CUDA 12.6
 - 7.4 GiB unified memory
 
+## Development Guidelines (SAC-GPU Iteration)
+
+- **Regression Test**: Run `batch_test_v2.py --tier=0` after each improvement to verify correctness
+- **Performance Recording**: Record p50/p95/p99 times before and after changes to evaluate gains
+- **Ablation Switches**: Keep runtime switches for key legacy versions (e.g., `--use_legacy_xxx`) for ablation experiments
+- **Rollback Principle**: Any new path must be able to fall back to the stable Stage2 path
+
 ## Notes
 
 - **Communication**: 全程使用中文交流 (Use Chinese throughout)

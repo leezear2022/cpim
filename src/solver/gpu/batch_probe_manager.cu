@@ -931,6 +931,12 @@ void Batch2PersistentManager::AllocateMemory() {
   CHECK(err == cudaSuccess) << "Failed to allocate d_task_deletions_: "
                             << cudaGetErrorString(err);
 
+  // P0-1 NEW: 三态状态数组
+  const size_t status_bytes = static_cast<size_t>(max_tasks_) * sizeof(int8_t);
+  err = cudaMallocManaged(&d_task_status_, status_bytes);
+  CHECK(err == cudaSuccess) << "Failed to allocate d_task_status_: "
+                            << cudaGetErrorString(err);
+
   // Precheck 短路计数器
   err = cudaMallocManaged(&d_precheck_short_circuit_count_,
                           sizeof(unsigned long long));
@@ -976,6 +982,7 @@ void Batch2PersistentManager::FreeMemory() {
   if (d_ws_frontier_B_) cudaFree(d_ws_frontier_B_);
   if (d_task_iterations_) cudaFree(d_task_iterations_);
   if (d_task_deletions_) cudaFree(d_task_deletions_);
+  if (d_task_status_) cudaFree(d_task_status_);  // P0-1 NEW
   if (d_precheck_short_circuit_count_) cudaFree(d_precheck_short_circuit_count_);
 
   d_tasks_ = nullptr;
@@ -991,6 +998,7 @@ void Batch2PersistentManager::FreeMemory() {
   d_ws_frontier_B_ = nullptr;
   d_task_iterations_ = nullptr;
   d_task_deletions_ = nullptr;
+  d_task_status_ = nullptr;  // P0-1 NEW
   d_precheck_short_circuit_count_ = nullptr;
 
   memory_allocated_ = false;
@@ -1040,6 +1048,7 @@ void Batch2PersistentManager::ReserveTaskCapacity(int capacity) {
   if (d_results_) cudaFree(d_results_);
   if (d_task_iterations_) cudaFree(d_task_iterations_);
   if (d_task_deletions_) cudaFree(d_task_deletions_);
+  if (d_task_status_) cudaFree(d_task_status_);  // P0-1 NEW
 
   max_tasks_ = capacity;
 
@@ -1059,6 +1068,11 @@ void Batch2PersistentManager::ReserveTaskCapacity(int capacity) {
   err = cudaMallocManaged(&d_task_deletions_,
                           capacity * sizeof(unsigned long long));
   CHECK(err == cudaSuccess) << "Failed to reallocate d_task_deletions_: "
+                            << cudaGetErrorString(err);
+
+  // P0-1 NEW: 三态状态数组
+  err = cudaMallocManaged(&d_task_status_, capacity * sizeof(int8_t));
+  CHECK(err == cudaSuccess) << "Failed to reallocate d_task_status_: "
                             << cudaGetErrorString(err);
 }
 
@@ -1135,6 +1149,11 @@ void Batch2PersistentManager::LaunchPersistentBlocksKernel() {
   // 清空结果数组
   cudaMemset(d_results_, 0, num_tasks * sizeof(bool));
 
+  // P0-1 NEW: 清空三态状态数组（默认 kOK = 0）
+  if (d_task_status_) {
+    cudaMemset(d_task_status_, 0, num_tasks * sizeof(int8_t));
+  }
+
   // 初始化控制结构
   d_control_->num_tasks = num_tasks;
   d_control_->task_cursor = d_task_cursor_;
@@ -1142,13 +1161,14 @@ void Batch2PersistentManager::LaunchPersistentBlocksKernel() {
   d_control_->dom_size_snapshot = d_dom_size_snapshot_;
   d_control_->tasks = d_tasks_;
   d_control_->results = d_results_;
+  d_control_->task_status = d_task_status_;  // P0-1 NEW
   d_control_->task_iterations = stats_enabled_ ? d_task_iterations_ : nullptr;
   d_control_->task_deletions = stats_enabled_ ? d_task_deletions_ : nullptr;
   d_control_->workspaces = d_workspaces_;
   d_control_->num_blocks = effective_num_blocks_;
   d_control_->activation_strategy = activation_strategy_;
   d_control_->enable_precheck = precheck_enabled_ ? 1 : 0;
-  d_control_->max_iterations_per_probe = 1000;
+  d_control_->max_iterations_per_probe = max_iterations_per_probe_;  // P0-1 NEW: 使用成员变量
   d_control_->chunk_size = chunk_size_;
 
   // Precheck 统计（如果 precheck 启用）
@@ -1179,21 +1199,63 @@ int Batch2PersistentManager::CollectResults(std::vector<int>& failed_vars,
   const int num_tasks = static_cast<int>(task_queue_.size());
   int num_failed = 0;
 
+  // P0-1 NEW: 重置三态统计
+  last_statistics_.Reset();
+  last_statistics_.total_probes = num_tasks;
+
   for (int i = 0; i < num_tasks; ++i) {
-    if (!d_results_[i]) {
-      failed_vars.push_back(task_queue_[i].var_id);
-      failed_values.push_back(task_queue_[i].value);
-      num_failed++;
+    // P0-1 NEW: 使用三态状态（如果可用）
+    if (d_task_status_) {
+      ProbeStatus status = static_cast<ProbeStatus>(d_task_status_[i]);
+      switch (status) {
+        case ProbeStatus::kDWO:
+          // 仅对 DWO 删值
+          failed_vars.push_back(task_queue_[i].var_id);
+          failed_values.push_back(task_queue_[i].value);
+          num_failed++;
+          last_statistics_.dwo_count++;
+          break;
+        case ProbeStatus::kUNKNOWN:
+          // 预算超限，不删值（保守处理）
+          last_statistics_.unknown_count++;
+          last_statistics_.budget_hit_count++;
+          break;
+        case ProbeStatus::kOK:
+        default:
+          // 正常收敛，不删值
+          last_statistics_.ok_count++;
+          break;
+      }
+    } else {
+      // 回退到旧逻辑（兼容性）
+      if (!d_results_[i]) {
+        failed_vars.push_back(task_queue_[i].var_id);
+        failed_values.push_back(task_queue_[i].value);
+        num_failed++;
+        last_statistics_.dwo_count++;
+      } else {
+        last_statistics_.ok_count++;
+      }
     }
   }
 
-  // 收集统计（如果启用）
+  // 收集迭代统计（如果启用）
   if (stats_enabled_ && d_task_iterations_ && d_task_deletions_) {
     last_probe_iterations_.resize(num_tasks);
     last_probe_deletions_.resize(num_tasks);
     for (int i = 0; i < num_tasks; ++i) {
       last_probe_iterations_[i] = d_task_iterations_[i];
       last_probe_deletions_[i] = d_task_deletions_[i];
+
+      // P0-1 NEW: 更新迭代统计
+      int iters = d_task_iterations_[i];
+      last_statistics_.total_iterations += iters;
+      if (iters > last_statistics_.max_iterations) {
+        last_statistics_.max_iterations = iters;
+      }
+      if (iters < last_statistics_.min_iterations) {
+        last_statistics_.min_iterations = iters;
+      }
     }
   }
 

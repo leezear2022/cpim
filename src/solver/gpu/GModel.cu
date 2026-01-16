@@ -2509,6 +2509,10 @@ void Batch2ProbeKernel_PersistentBlocks(
     if (ws->inconsistent_flag == 1) {
       if (threadIdx.x == 0) {
         control->results[task_id] = false;
+        // P0-1 NEW: 设置三态状态
+        if (control->task_status != nullptr) {
+          control->task_status[task_id] = 1;  // kDWO
+        }
       }
       __syncthreads();
       continue;  // 处理下一个任务
@@ -2521,6 +2525,10 @@ void Batch2ProbeKernel_PersistentBlocks(
       if (!need_gac) {
         if (threadIdx.x == 0) {
           control->results[task_id] = false;
+          // P0-1 NEW: 设置三态状态
+          if (control->task_status != nullptr) {
+            control->task_status[task_id] = 1;  // kDWO
+          }
           if (control->precheck_short_circuit_count != nullptr) {
             atomicAdd(control->precheck_short_circuit_count, 1ULL);
           }
@@ -2570,7 +2578,22 @@ void Batch2ProbeKernel_PersistentBlocks(
 
     // [7] 写回结果和统计
     if (threadIdx.x == 0) {
-      control->results[task_id] = (ws->inconsistent_flag == 0);
+      const bool is_dwo = (ws->inconsistent_flag == 1);
+      control->results[task_id] = !is_dwo;
+
+      // P0-1 NEW: 设置三态状态
+      if (control->task_status != nullptr) {
+        if (is_dwo) {
+          control->task_status[task_id] = 1;  // kDWO: 可删值
+        } else if (control->max_iterations_per_probe > 0 &&
+                   ws->iterations >= control->max_iterations_per_probe) {
+          // 预算超限但没有 DWO：UNKNOWN（不删值，保守处理）
+          control->task_status[task_id] = 2;  // kUNKNOWN
+        } else {
+          control->task_status[task_id] = 0;  // kOK: 正常收敛
+        }
+      }
+
       // 写入 per-task 统计（如果启用）
       if (control->task_iterations != nullptr) {
         control->task_iterations[task_id] = ws->iterations;

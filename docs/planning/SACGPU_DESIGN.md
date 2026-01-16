@@ -1,10 +1,37 @@
-# CPIM：面向 GPU 的强相容性（SAC/MSAC）加速设计
+---
+status: active
+---
 
-> **状态**: 设计中
-> **平台**: Jetson Orin（8 SM，UMA，managed memory）
-> **目标**: 在大实例上实现可控、高效的 SAC-GPU 加速
+# CPIM：SAC/MSAC 的 GPU 加速设计（统一版）
+
+> **状态**：设计 + 实现同步中（对齐 2026-01 代码现状）
+> **平台**：Jetson Orin（8 SM，UMA；`concurrentManagedAccess==0`）
+> **目标**：在大实例/长尾实例上实现可控、可预算、可回退的 SAC/MSAC/NSAC 加速，
+> 并保证 sound（宁可少删，不许多删）
+>
+> **代码锚点（现状）**
+> - `src/solver/gpu/GModelSolver.cu`：`GModelSolver::EnforceSAC1()`
+> - `include/solver/gpu/batch_probe_manager.h`：Batch-2 Stage1/Stage2/Auto
+> - `src/model/gmodel_adapter.cu`：只读数据 hint（`cudaMemAdviseSetReadMostly`）
+>
+> 本文整合 `docs/planning/SACGPU_DESIGN.md` 与 `docs/planning/SACGPU_DESIGN copy.md` 的内容，
+> 作为主入口。
 
 ---
+
+## 0. 术语与“扁平化”的层次
+
+为避免讨论时“flatten”指代不清，本文区分三层（由易到难）：
+
+1. **Probe-level 扁平化（已落地）**：把“对每个 probe 独立跑一轮 AC”的串行结构，
+   改成 GPU 上 worker blocks 从 probe 队列拉任务（Batch-2 Stage 2 / Persistent Blocks），
+   解决 probe 间负载不均衡。
+2. **Constraint-level 扁平化（Phase 5 / Batch-3A/3D）**：把“每个 probe 内部的 AC 传播队列”
+   跨 probes 扁平化为 `<cid, world_mask>` 任务队列（约束聚合），追求 bitSup 复用与更强负载均衡。
+3. **Word/value-level 打散（Batch-3D 激进形态）**：把任务单位进一步细化为
+   `<world,cid>`/`<world,cid,word>` 甚至 `<world,cid,value>`，试图消除单个长尾 probe 的内部长尾。
+
+本文主线优先级：先把（1）+ 算法 budget/降级做扎实，再用数据判定（2）（3）是否值得做。
 
 ## 1. 核心矛盾与问题定义
 
@@ -33,6 +60,18 @@ SAC 的本质是：对每个候选值做一次"赋值→AC 到不动点→判不
 每个 value 都要读对侧域 `dom_y[w]`。批处理后拥有 `B × W` 的域矩阵，如果仍按 bitGEMV 做，dom 侧会被重复读。
 
 > **结论**: 必须把 bitGEMV 变成 bitGEMM，让 `dom_y` 以矩阵形态进 shared/L2。
+
+### 1.3 代码现状对齐（截至 2026-01）
+
+这份设计并非“从零开始”，当前仓库已具备可跑通的主线与大量关键优化：
+
+- **Probe-level 并行（Batch-2）**：Stage 1（Micro-Batch）与 Stage 2（Persistent Blocks），并有 Auto 选择。
+- **传播内核优化**：NEIGHBOR_ACTIVATION、Warp-per-Word、域大小增量更新、只读数据 hint 等已落地并验证。
+- **SAC 主线集成**：`GModelSolver::EnforceSAC1()` 已接入 dirty-set 增量任务收集与 Stage auto 选择。
+- **仍需落地/加强的关键点**：
+  - “真 NSAC”的 `allowed-constraints mask`（让 singleton test 的 AC 真正只在邻域子图传播）
+  - budget 触发后的 **UNKNOWN 语义与可观测统计闭环**（UNKNOWN 一律不删）
+  - Phase 5（Batch-3A/3D）的约束聚合/扁平化队列：作为可选加速器的数据驱动启用/回退
 
 ---
 
@@ -235,6 +274,24 @@ bool has_sup = (acc != 0);
 | **batch 放 value 维** | thread=(world,val) | 直观；容易表达 bitGEMM | 写回删值难做 ballot；线程数爆炸 | ★★☆☆☆ |
 | **batch 放 word 维** | warp 固定 word | 可继续用 ballot；删值结构稳定 | 需要 word-major layout；调度要精细 | ★★★★☆ |
 | **bit-matrix** | lane=yval，寄存器里是 32 worlds | 单指令同时处理 32 worlds | dom_size/DWO/trail 大重构 | ★★★★☆（中期） |
+
+### 7.5 Phase 5（Batch-3A/3D）：约束聚合/扁平化队列的难点与启用条件
+
+约束聚合（`<cid, world_mask>`）的收益不是必然：它要同时满足“聚合度足够高”和“GPU 并行度欠饱和”，
+否则会被队列构建/调度/共享内存成本吞掉。
+
+#### 7.5.1 主要难点
+- **乱序调度下的语义**：需要保证 per-world 的 AC 不动点语义（soundness），并尽量保持可复现性。
+- **队列/位图热点**：即便 world 状态隔离，frontier/active 标记/统计仍可能形成全局原子热点。
+- **shared memory 压力**：缓存 bitSup 会压低 occupancy（Orin 的 SM 少，尤其敏感）。
+
+#### 7.5.2 建议启用条件（数据驱动）
+- `world_mask popcount` 的均值/分位数足够大（例如 mean≥2~3），否则 bitSup 复用收益低。
+- 活跃 blocks 长期欠饱和（例如 < `2×SM`）或 probe 内部长尾占主导，才值得用聚合来“填满”GPU。
+- `shared_mem_bytes` 不至于把 occupancy 压到极低（用 occupancy API/实测确认）。
+
+#### 7.5.3 回退策略
+- 不满足启用条件时默认回退 Stage 2（probe-level persistent blocks），优先保证稳定吞吐与简单性。
 
 ---
 

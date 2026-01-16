@@ -4,6 +4,7 @@
 #include <deque>
 #include <iostream>
 #include <stdexcept>
+#include <unordered_map>
 
 #include "Timer.h"
 
@@ -509,6 +510,156 @@ class ProbeQueue {
 };
 
 // ============================================================================
+// DeferredProbeQueue - UNKNOWN probes 的延后复查队列（P0-1c）
+// 语义：UNKNOWN 不删值；仅当“邻域发生删值变化”后才重跑该 probe。
+// ============================================================================
+class DeferredProbeQueue {
+ public:
+  static constexpr int kBitsPerWord = 32;
+
+  struct DeferredProbe {
+    int var_id = -1;
+    int value = -1;
+    int nb_epoch_snapshot = 0;  // V1：邻域 epoch 快照（低开销、允许少量 false positive）
+    int retry = 0;              // 已重检次数
+    int enqueue_round = 0;      // 入队轮次（用于超期清理）
+  };
+
+  struct Stats {
+    int deferred_in = 0;
+    int deferred_out = 0;
+    int deferred_hit = 0;       // 重检后 DWO 数
+    int deferred_stale = 0;     // 超期/失效丢弃数
+    int deferred_overflow = 0;  // 队列溢出丢弃数
+
+    void Reset() {
+      deferred_in = 0;
+      deferred_out = 0;
+      deferred_hit = 0;
+      deferred_stale = 0;
+      deferred_overflow = 0;
+    }
+  };
+
+  DeferredProbeQueue(GModel* model,
+                     const GModelSolver::DeferredRecheckConfig& config)
+      : model_(model), config_(config) {
+    num_vars_ = model_->num_vars;
+    max_dom_size_ = model_->max_dom_size;
+    words_per_var_ = (max_dom_size_ + kBitsPerWord - 1) / kBitsPerWord;
+    in_queue_bits_.resize(static_cast<size_t>(num_vars_) * words_per_var_, 0);
+  }
+
+  bool Enabled() const { return config_.enabled; }
+  bool Empty() const { return deferred_.empty(); }
+
+  const Stats& GetStats() const { return stats_; }
+  void NotifyDeferredHit() { stats_.deferred_hit++; }
+
+  bool Enqueue(int var_id,
+               int value,
+               int nb_epoch_snapshot,
+               int retry,
+               int enqueue_round) {
+    if (!config_.enabled) return false;
+    if (var_id < 0 || var_id >= num_vars_) return false;
+    if (value < 0 || value >= max_dom_size_) return false;
+
+    if (model_->IsAssigned(var_id)) return false;
+    if (!HasValue(var_id, value)) return false;
+
+    if (config_.max_queue_size > 0 &&
+        deferred_.size() >= static_cast<size_t>(config_.max_queue_size)) {
+      stats_.deferred_overflow++;
+      return false;
+    }
+    if (config_.max_retries > 0 && retry >= config_.max_retries) {
+      stats_.deferred_stale++;
+      return false;
+    }
+
+    const int idx = var_id * words_per_var_ + value / kBitsPerWord;
+    const uint32_t mask = 1u << (value % kBitsPerWord);
+    if (in_queue_bits_[idx] & mask) return false;
+
+    deferred_.push_back(
+        DeferredProbe{var_id, value, nb_epoch_snapshot, retry, enqueue_round});
+    in_queue_bits_[idx] |= mask;
+    stats_.deferred_in++;
+    return true;
+  }
+
+  void CollectReadyTasks(const std::vector<int>& nb_epoch,
+                         int current_round,
+                         int max_count,
+                         std::vector<ProbeTask>& out_tasks,
+                         std::vector<uint8_t>& out_from_deferred,
+                         std::vector<int>& out_prev_retry) {
+    if (!config_.enabled) return;
+    if (max_count <= 0) return;
+
+    std::vector<DeferredProbe> kept;
+    kept.reserve(deferred_.size());
+
+    for (const auto& dp : deferred_) {
+      if (config_.max_age_rounds > 0 &&
+          current_round - dp.enqueue_round > config_.max_age_rounds) {
+        ClearInQueueBit(dp.var_id, dp.value);
+        stats_.deferred_stale++;
+        continue;
+      }
+
+      if (model_->IsAssigned(dp.var_id) || !HasValue(dp.var_id, dp.value)) {
+        ClearInQueueBit(dp.var_id, dp.value);
+        stats_.deferred_stale++;
+        continue;
+      }
+
+      const bool ready =
+          dp.var_id >= 0 && dp.var_id < static_cast<int>(nb_epoch.size()) &&
+          nb_epoch[dp.var_id] > dp.nb_epoch_snapshot;
+      if (ready && static_cast<int>(out_tasks.size()) < max_count) {
+        out_tasks.emplace_back(dp.var_id, dp.value,
+                               static_cast<int>(out_tasks.size()));
+        out_from_deferred.push_back(1);
+        out_prev_retry.push_back(dp.retry);
+        ClearInQueueBit(dp.var_id, dp.value);
+        stats_.deferred_out++;
+        continue;
+      }
+
+      kept.push_back(dp);
+    }
+
+    deferred_.swap(kept);
+  }
+
+ private:
+  bool HasValue(int var, int val) const {
+    const int word_idx = val / kBitsPerWord;
+    const int bit_idx = val % kBitsPerWord;
+    const int base_idx = model_->GetBitDomIndex(var, 0);
+    const u32* bitDom = model_->GetBitDom();
+    return (bitDom[base_idx + word_idx] & (1u << bit_idx)) != 0;
+  }
+
+  void ClearInQueueBit(int var_id, int value) {
+    const int idx = var_id * words_per_var_ + value / kBitsPerWord;
+    const uint32_t mask = 1u << (value % kBitsPerWord);
+    in_queue_bits_[idx] &= ~mask;
+  }
+
+  GModel* model_;
+  GModelSolver::DeferredRecheckConfig config_;
+  int num_vars_ = 0;
+  int max_dom_size_ = 0;
+  int words_per_var_ = 0;
+  std::vector<DeferredProbe> deferred_;
+  std::vector<uint32_t> in_queue_bits_;
+  Stats stats_;
+};
+
+// ============================================================================
 // EnforceSAC1 - GPU SAC1 预处理（使用 Batch Probe 基础设施）
 // ============================================================================
 int GModelSolver::EnforceSAC1(GpuSearchStatistics& stats) {
@@ -751,6 +902,18 @@ int GModelSolver::EnforceSAC3(GpuSearchStatistics& stats) {
   stage2_manager.SetChunkSize(1);
   stage2_manager.EnablePrecheck(true);
 
+  // P0-1c：UNKNOWN probes 延后复查队列（邻域 epoch）
+  DeferredProbeQueue deferred_queue(model_, deferred_recheck_config_);
+  std::vector<int> nb_epoch(model_->num_vars, 0);
+  auto BumpNeighborhoodEpoch = [&](int changed_var) {
+    if (changed_var < 0 || changed_var >= model_->num_vars) return;
+    nb_epoch[changed_var]++;
+    for (const int* p = neighbor_csr_.GetNeighborsBegin(changed_var);
+         p != neighbor_csr_.GetNeighborsEnd(changed_var); ++p) {
+      nb_epoch[*p]++;
+    }
+  };
+
   // 预分配任务容量
   const int max_batch_size = 1024;
   stage2_manager.ReserveTaskCapacity(max_batch_size);
@@ -758,7 +921,12 @@ int GModelSolver::EnforceSAC3(GpuSearchStatistics& stats) {
   bool early_stopped = false;
   std::vector<ProbeTask> tasks;
   tasks.reserve(max_batch_size);
+  std::vector<uint8_t> task_from_deferred;
+  task_from_deferred.reserve(max_batch_size);
+  std::vector<int> task_prev_retry;
+  task_prev_retry.reserve(max_batch_size);
   std::vector<int> failed_vars, failed_values;
+  std::vector<int> unknown_vars, unknown_values;
 
   UnifiedTrail* trail = model_->trail_;
   std::vector<char> gac_modified_flags;
@@ -827,12 +995,24 @@ int GModelSolver::EnforceSAC3(GpuSearchStatistics& stats) {
     return !tasks.empty();
   };
 
-  // 辅助 lambda：执行一批 probe 并返回是否有删值
+  // 辅助 lambda：执行一批 probe 并返回是否有删值（同时收集 UNKNOWN probes）
   auto ExecuteBatch = [&](std::vector<int>& out_failed_vars,
-                          std::vector<int>& out_failed_values) -> bool {
+                          std::vector<int>& out_failed_values,
+                          std::vector<int>& out_unknown_vars,
+                          std::vector<int>& out_unknown_values) -> bool {
     out_failed_vars.clear();
     out_failed_values.clear();
+    out_unknown_vars.clear();
+    out_unknown_values.clear();
     unsigned long long precheck_short_circuits = 0;
+
+    bool has_deferred = false;
+    for (uint8_t f : task_from_deferred) {
+      if (f) {
+        has_deferred = true;
+        break;
+      }
+    }
 
     // 决定使用哪个 Stage
     StageSelection stage;
@@ -842,6 +1022,11 @@ int GModelSolver::EnforceSAC3(GpuSearchStatistics& stats) {
       stats.sac_stage = stage;
     } else {
       stage = sac_stage_mode_;
+      stats.sac_stage = stage;
+    }
+    // 若本批次包含“已知长尾”的 deferred probes，则强制走 Stage2
+    if (has_deferred && sac_stage_mode_ == StageSelection::kAuto) {
+      stage = StageSelection::kStage2;
       stats.sac_stage = stage;
     }
 
@@ -856,7 +1041,8 @@ int GModelSolver::EnforceSAC3(GpuSearchStatistics& stats) {
       for (const auto& t : tasks) {
         stage2_manager.AddTask(t.var_id, t.value);
       }
-      stage2_manager.ExecutePersistentBlocks(out_failed_vars, out_failed_values);
+      stage2_manager.ExecutePersistentBlocks(out_failed_vars, out_failed_values,
+                                             &out_unknown_vars, &out_unknown_values);
       precheck_short_circuits = stage2_manager.GetLastPrecheckShortCircuitCount();
       stage2_manager.Clear();
     }
@@ -864,6 +1050,38 @@ int GModelSolver::EnforceSAC3(GpuSearchStatistics& stats) {
     stats.sac_probes += static_cast<int>(tasks.size());
 
     return !out_failed_vars.empty();
+  };
+
+  // P0-1c: UNKNOWN → deferred queue（先入队，再由邻域 epoch 触发复查）
+  auto EnqueueUnknownToDeferred = [&](int enqueue_round) {
+    if (!deferred_queue.Enabled() || unknown_vars.empty()) return;
+
+    std::unordered_map<uint64_t, int> task_index;
+    task_index.reserve(tasks.size() * 2);
+    for (int i = 0; i < static_cast<int>(tasks.size()); ++i) {
+      uint64_t key =
+          (static_cast<uint64_t>(tasks[i].var_id) << 32) |
+          static_cast<uint32_t>(tasks[i].value);
+      task_index[key] = i;
+    }
+
+    for (size_t i = 0; i < unknown_vars.size(); ++i) {
+      const int var = unknown_vars[i];
+      const int val = unknown_values[i];
+      if (var < 0 || var >= model_->num_vars) continue;
+
+      uint64_t key = (static_cast<uint64_t>(var) << 32) |
+                     static_cast<uint32_t>(val);
+      const auto it = task_index.find(key);
+      const int idx = (it == task_index.end()) ? -1 : it->second;
+
+      const bool from_deferred =
+          (idx >= 0) ? (task_from_deferred[idx] != 0) : false;
+      const int prev_retry = (idx >= 0) ? task_prev_retry[idx] : 0;
+      const int retry = from_deferred ? (prev_retry + 1) : 0;
+
+      deferred_queue.Enqueue(var, val, nb_epoch[var], retry, enqueue_round);
+    }
   };
 
   // 辅助 lambda：处理删值并切换到队列模式
@@ -892,6 +1110,11 @@ int GModelSolver::EnforceSAC3(GpuSearchStatistics& stats) {
         failed_var_flags[var] = 1;
         failed_unique_vars.push_back(var);
       }
+    }
+
+    // 删值触发邻域 epoch 递增（驱动 deferred probes 复查）
+    for (int v : failed_unique_vars) {
+      BumpNeighborhoodEpoch(v);
     }
 
     // 执行 GAC
@@ -933,6 +1156,7 @@ int GModelSolver::EnforceSAC3(GpuSearchStatistics& stats) {
         gac_modified_vars.push_back(v);
       }
       for (int v : gac_modified_vars) {
+        BumpNeighborhoodEpoch(v);
         probe_queue->EnqueueNeighborhood(v);
         gac_modified_flags[v] = 0;
       }
@@ -987,13 +1211,19 @@ int GModelSolver::EnforceSAC3(GpuSearchStatistics& stats) {
     // 收集任务
     if (!CollectLinearBatch()) break;
 
+    // 本批次不是 deferred probes
+    task_from_deferred.assign(tasks.size(), 0);
+    task_prev_retry.assign(tasks.size(), 0);
+
     if (verbose_ && batch_count % 10 == 1) {
       std::cout << "[SAC3 Linear Batch " << batch_count << "] "
                 << tasks.size() << " probes" << std::endl;
     }
 
     // 执行 batch probe
-    bool has_deletions = ExecuteBatch(failed_vars, failed_values);
+    bool has_deletions = ExecuteBatch(failed_vars, failed_values,
+                                      unknown_vars, unknown_values);
+    EnqueueUnknownToDeferred(batch_count);
 
     if (has_deletions) {
       // 发生删值，切换到队列模式
@@ -1017,9 +1247,7 @@ int GModelSolver::EnforceSAC3(GpuSearchStatistics& stats) {
                 << probe_queue->Size() << std::endl;
     }
 
-    while (!probe_queue->Empty()) {
-      batch_count++;
-
+    while (true) {
       // 早停检查
       if (sac_config_.early_stop_enabled) {
         double elapsed_ms = sac_timer.elapsed();
@@ -1034,9 +1262,35 @@ int GModelSolver::EnforceSAC3(GpuSearchStatistics& stats) {
         }
       }
 
-      // 批量出队
-      probe_queue->DequeueBatch(max_batch_size, tasks);
-      if (tasks.empty()) continue;
+      tasks.clear();
+      task_from_deferred.clear();
+      task_prev_retry.clear();
+
+      // [1] 优先调度 deferred ready tasks
+      if (deferred_queue.Enabled()) {
+        deferred_queue.CollectReadyTasks(nb_epoch, batch_count, max_batch_size,
+                                         tasks, task_from_deferred,
+                                         task_prev_retry);
+      }
+
+      // [2] regular probe queue 填充 batch（保持 GPU 吞吐）
+      if (static_cast<int>(tasks.size()) < max_batch_size && !probe_queue->Empty()) {
+        std::vector<ProbeTask> extra;
+        probe_queue->DequeueBatch(max_batch_size - static_cast<int>(tasks.size()),
+                                  extra);
+        for (const auto& t : extra) {
+          tasks.push_back(t);
+          task_from_deferred.push_back(0);
+          task_prev_retry.push_back(0);
+        }
+      }
+
+      if (tasks.empty()) {
+        if (probe_queue->Empty()) break;
+        continue;
+      }
+
+      batch_count++;
 
       if (verbose_ && batch_count % 10 == 1) {
         std::cout << "[SAC3 Queue Batch " << batch_count << "] "
@@ -1045,9 +1299,34 @@ int GModelSolver::EnforceSAC3(GpuSearchStatistics& stats) {
       }
 
       // 执行 batch probe
-      bool has_deletions = ExecuteBatch(failed_vars, failed_values);
+      bool has_deletions = ExecuteBatch(failed_vars, failed_values,
+                                        unknown_vars, unknown_values);
+      EnqueueUnknownToDeferred(batch_count);
 
       if (has_deletions) {
+        // 统计 deferred hit（重检后 DWO）
+        if (deferred_queue.Enabled()) {
+          std::unordered_map<uint64_t, int> task_index;
+          task_index.reserve(tasks.size() * 2);
+          for (int i = 0; i < static_cast<int>(tasks.size()); ++i) {
+            uint64_t key =
+                (static_cast<uint64_t>(tasks[i].var_id) << 32) |
+                static_cast<uint32_t>(tasks[i].value);
+            task_index[key] = i;
+          }
+          for (size_t i = 0; i < failed_vars.size(); ++i) {
+            const int var = failed_vars[i];
+            const int val = failed_values[i];
+            uint64_t key = (static_cast<uint64_t>(var) << 32) |
+                           static_cast<uint32_t>(val);
+            const auto it = task_index.find(key);
+            const int idx = (it == task_index.end()) ? -1 : it->second;
+            if (idx >= 0 && task_from_deferred[idx] != 0) {
+              deferred_queue.NotifyDeferredHit();
+            }
+          }
+        }
+
         // 处理删值
         failed_unique_vars.clear();
         for (size_t i = 0; i < failed_vars.size(); ++i) {
@@ -1077,6 +1356,11 @@ int GModelSolver::EnforceSAC3(GpuSearchStatistics& stats) {
             failed_var_flags[var] = 1;
             failed_unique_vars.push_back(var);
           }
+        }
+
+        // 删值触发邻域 epoch 递增（驱动 deferred probes 复查）
+        for (int v : failed_unique_vars) {
+          BumpNeighborhoodEpoch(v);
         }
 
         // 入队邻域
@@ -1114,6 +1398,7 @@ int GModelSolver::EnforceSAC3(GpuSearchStatistics& stats) {
             gac_modified_vars.push_back(v);
           }
           for (int v : gac_modified_vars) {
+            BumpNeighborhoodEpoch(v);
             probe_queue->EnqueueNeighborhood(v);
             gac_modified_flags[v] = 0;
           }
@@ -1141,6 +1426,15 @@ int GModelSolver::EnforceSAC3(GpuSearchStatistics& stats) {
               << std::endl;
     std::cout << "  Precheck 短路: " << total_precheck_short_circuits << std::endl;
     std::cout << "  时间: " << stats.sac_time << "s" << std::endl;
+    if (deferred_queue.Enabled()) {
+      const auto& dqs = deferred_queue.GetStats();
+      std::cout << "  Deferred: in=" << dqs.deferred_in
+                << ", out=" << dqs.deferred_out
+                << ", hit=" << dqs.deferred_hit
+                << ", stale=" << dqs.deferred_stale
+                << ", overflow=" << dqs.deferred_overflow
+                << std::endl;
+    }
   }
 
   return total_deletions;

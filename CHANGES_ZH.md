@@ -26,12 +26,84 @@
 
 ---
 
+### P0-1a：停滞检测（Stagnation Detection）
+
+**背景**：比 `max_iterations` 硬截断更智能的长尾检测，用多指标判定"停滞"。
+
+**检测指标**：
+- `Δdeletions`：连续 k 轮 deletions==0（停滞计数）
+- `frontier_popcount`：活跃约束数
+- `deletions / work_cnt`：单位工作产出率
+
+**交付内容**：
+- `WorldWorkspace` 添加字段：`stagnation_count`, `last_deletions`, `last_frontier_popcount`, `work_cnt`
+- `Batch2PersistentControl` 添加配置：`stagnation_threshold`, `min_productivity`, `enable_stagnation_check`
+- `Batch2PersistentManager` 添加 API：`SetStagnationThreshold()`, `SetMinProductivity()`, `EnableStagnationCheck()`
+- `RunGACToFixpoint_BlockSync` 每轮后检测停滞条件，触发时提前退出并标记 UNKNOWN
+
+**修改文件**：
+- `include/solver/gpu/batch_probe_manager.h`: WorldWorkspace 停滞字段、Control 停滞配置、Manager API
+- `src/solver/gpu/batch_probe_manager.cu`: 传递停滞参数到 control
+- `src/solver/gpu/GModel.cu`: RunGACToFixpoint_BlockSync 停滞检测逻辑
+- `docs/planning/TODO_SACGPU_NEXT.md`: 更新 P0-1 子任务
+
+**验收**：`batch_test_v2.py --tier=0` 通过（8/12 匹配，与之前一致）
+
+---
+
+### P0-1b：时间片调度基础设施（Timeslice Scheduling Infrastructure）
+
+**背景**：为长尾 probe 提供"工作量子"限制，防止单个 probe 阻塞整个批次。
+
+**交付内容**：
+- `GACTimesliceState` 结构体（预留完整暂停/恢复用）
+- `WorldWorkspace` 添加字段：`total_constraints_checked`, `quantum_exceeded`
+- `Batch2PersistentControl` 添加配置：`quantum_cid`, `enable_quantum_check`
+- `Batch2PersistentManager` 添加 API：`SetQuantumCid()`, `EnableQuantumCheck()`
+- `RunGACToFixpoint_BlockSync` 添加工作量子检查逻辑
+
+**修改文件**：
+- `include/solver/gpu/batch_probe_manager.h`: GACTimesliceState、WorldWorkspace 时间片字段、Control/Manager API
+- `src/solver/gpu/batch_probe_manager.cu`: 传递时间片参数到 control
+- `src/solver/gpu/GModel.cu`: RunGACToFixpoint_BlockSync 工作量子检查
+
+**当前状态**：基础设施完成，默认关闭（`enable_quantum_check=0`）。完整的 yield/resume 逻辑待 Batch-3A 载体稳定后实现。
+
+**验收**：`batch_test_v2.py --tier=0` 通过（8/12 匹配，与之前一致）
+
+---
+
+### P0-1c：延后复查队列（Deferred Recheck Queue）
+
+**背景**：P0-1a/P0-1b 让 Stage2 能识别并提前退出长尾 probe（标记 `kUNKNOWN`），但 SAC3 顶层此前只收集 `kDWO`，
+导致 UNKNOWN probes 被直接丢弃，无法在邻域发生删值变化后重检。
+
+**交付内容**：
+- `GModelSolver::DeferredRecheckConfig`：deferred queue 的运行时配置（开关/上限/重检次数/超期）。
+- `DeferredProbeQueue`（在 `EnforceSAC3()` 内部集成）：UNKNOWN probes 入队，邻域 epoch 变化后出队复查。
+- `Batch2PersistentManager::ExecutePersistentBlocks()` 增强接口：额外返回 UNKNOWN probes 列表（var/value）。
+- SAC3 主循环集成：
+  - 维护 `nb_epoch[var]`（邻域 epoch），当删值/GAC 级联删值发生时对 `var` 及其邻居递增；
+  - queue 模式下优先调度 deferred ready probes，并用 regular queue 补满 batch；
+  - 统计 `deferred_in/out/hit/stale/overflow`（verbose 输出）。
+
+**修改文件**：
+- `include/GModelSolver.h`: 新增 `DeferredRecheckConfig`
+- `src/solver/gpu/GModelSolver.cu`: `DeferredProbeQueue` + `EnforceSAC3()` 集成
+- `include/solver/gpu/batch_probe_manager.h`: Stage2 manager 增强接口（返回 UNKNOWN probes）
+- `src/solver/gpu/batch_probe_manager.cu`: 收集 UNKNOWN probes 并返回给 host
+
+**验收**：`batch_test_v2.py --tier=0` 通过（8/12 匹配，与之前一致；4 个超时为既有性能问题）
+
+---
+
 ### SACGPU 下一阶段 TODO 备忘
 
 - 新增 `docs/planning/TODO_SACGPU_NEXT.md`：整理 P0-P3 的实施清单（UNKNOWN 语义、NSAC mask、
   Batch-3A 接入、bitGEMM 路线与 `bmma_sync(b1, AND+POPC)` 插入点），作为后续迭代备忘录。
 - 补充：在 P1-1 增加依赖关系说明（P0-1/P0-3），在 P3-2 明确 BMMA 对 “world 列矩阵 packing 载体稳定”
   的前提要求。
+- 补充：细化 P0-1c“延后复查队列（Deferred Recheck）”方案（版本/邻域 epoch 两档实现），并更新现状快照避免与代码状态不一致。
 
 ---
 

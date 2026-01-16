@@ -273,7 +273,32 @@ struct WorldWorkspace {
   int iterations = 0;
   int frontier_nonempty = 0;       // 1 = 非空
 
+  // ========== P0-1a：停滞检测字段 ==========
+  int stagnation_count = 0;        // 连续零删值轮次
+  int last_deletions = 0;          // 上轮删值数（截断为 int 足够）
+  int last_frontier_popcount = 0;  // 上轮前沿大小
+  int work_cnt = 0;                // 当前轮工作量（约束检查数）
+
+  // ========== P0-1b：时间片调度字段 ==========
+  int total_constraints_checked = 0;  // 累计处理的约束数
+  int quantum_exceeded = 0;           // 1 = 已超过工作量子
+
   __host__ __device__ WorldWorkspace() = default;
+};
+
+// ============================================================================
+// P0-1b: GACTimesliceState - GAC 时间片状态（用于暂停/恢复）
+// ============================================================================
+struct GACTimesliceState {
+  int iterations = 0;               // 当前迭代次数
+  int scanner_index = 0;            // frontier 扫描位置
+  int local_word = 0;               // 当前扫描的 word 索引
+  int local_offset = 0;             // 当前 word 内的 bit 偏移
+  unsigned long long deletions = 0; // 累计删值数
+  int stagnation_count = 0;         // 停滞计数
+  int total_constraints_checked = 0; // 累计约束检查数
+
+  __host__ __device__ GACTimesliceState() = default;
 };
 
 // ============================================================================
@@ -396,6 +421,15 @@ struct Batch2PersistentControl {
   int max_iterations_per_probe;   // 每个 probe 的最大迭代次数
   int chunk_size;                 // 每次拉取的任务数（批量拉取优化）
 
+  // ========== P0-1a：停滞检测配置 ==========
+  int stagnation_threshold;       // 连续多少轮零删值判定为停滞（默认 3）
+  float min_productivity;         // 最低产出率阈值 (deletions/work_cnt)（默认 0.001）
+  int enable_stagnation_check;    // 是否启用停滞检测（默认 1）
+
+  // ========== P0-1b：时间片调度配置 ==========
+  int quantum_cid;                // 工作量子：每个 probe 最多检查的约束数（0=无限制）
+  int enable_quantum_check;       // 是否启用工作量子检查（默认 0）
+
   // ========== Precheck 统计 ==========
   unsigned long long* precheck_short_circuit_count;  // precheck 短路次数（原子递增）
 
@@ -415,6 +449,11 @@ struct Batch2PersistentControl {
         enable_precheck(0),
         max_iterations_per_probe(1000),
         chunk_size(1),
+        stagnation_threshold(3),        // P0-1a: 默认 3 轮
+        min_productivity(0.001f),       // P0-1a: 默认 0.1% 产出率
+        enable_stagnation_check(1),     // P0-1a: 默认启用
+        quantum_cid(0),                 // P0-1b: 默认无限制
+        enable_quantum_check(0),        // P0-1b: 默认关闭
         precheck_short_circuit_count(nullptr) {}
 };
 
@@ -436,6 +475,12 @@ class Batch2PersistentManager {
   // 执行 Persistent Blocks（一次 kernel 调用处理所有任务）
   int ExecutePersistentBlocks(std::vector<int>& failed_vars,
                               std::vector<int>& failed_values);
+  // 执行 Persistent Blocks（增强版：额外返回 UNKNOWN probes）
+  // unknown_vars/unknown_values 为 nullptr 表示不收集 UNKNOWN probes。
+  int ExecutePersistentBlocks(std::vector<int>& failed_vars,
+                              std::vector<int>& failed_values,
+                              std::vector<int>* unknown_vars,
+                              std::vector<int>* unknown_values);
 
   void Clear();
 
@@ -485,13 +530,29 @@ class Batch2PersistentManager {
   void SetMaxIterationsPerProbe(int max_iters) { max_iterations_per_probe_ = max_iters; }
   int GetMaxIterationsPerProbe() const { return max_iterations_per_probe_; }
 
+  // P0-1a NEW: 停滞检测配置
+  void SetStagnationThreshold(int threshold) { stagnation_threshold_ = threshold; }
+  int GetStagnationThreshold() const { return stagnation_threshold_; }
+  void SetMinProductivity(float min_prod) { min_productivity_ = min_prod; }
+  float GetMinProductivity() const { return min_productivity_; }
+  void EnableStagnationCheck(bool enabled) { stagnation_check_enabled_ = enabled; }
+  bool IsStagnationCheckEnabled() const { return stagnation_check_enabled_; }
+
+  // P0-1b NEW: 时间片调度配置
+  void SetQuantumCid(int quantum) { quantum_cid_ = quantum; }
+  int GetQuantumCid() const { return quantum_cid_; }
+  void EnableQuantumCheck(bool enabled) { quantum_check_enabled_ = enabled; }
+  bool IsQuantumCheckEnabled() const { return quantum_check_enabled_; }
+
  private:
   void AllocateMemory();
   void FreeMemory();
   void SaveSnapshot();
   void LaunchPersistentBlocksKernel();
   int CollectResults(std::vector<int>& failed_vars,
-                     std::vector<int>& failed_values);
+                     std::vector<int>& failed_values,
+                     std::vector<int>* unknown_vars,
+                     std::vector<int>* unknown_values);
 
   GModel* model_ = nullptr;
   int num_blocks_ = 0;
@@ -541,6 +602,15 @@ class Batch2PersistentManager {
   // P0-1 NEW: 三态统计
   ProbeStatistics last_statistics_;
   int max_iterations_per_probe_ = 1000;  // 默认预算
+
+  // P0-1a NEW: 停滞检测配置
+  int stagnation_threshold_ = 3;         // 连续多少轮零删值判定为停滞
+  float min_productivity_ = 0.001f;      // 最低产出率阈值
+  bool stagnation_check_enabled_ = true; // 是否启用停滞检测
+
+  // P0-1b NEW: 时间片调度配置
+  int quantum_cid_ = 0;                  // 工作量子（0=无限制）
+  bool quantum_check_enabled_ = false;   // 是否启用工作量子检查
 
   bool memory_allocated_ = false;
 };

@@ -32,8 +32,11 @@ updated: 2026-01-16
 
 - ✅ Probe-level 扁平化：Batch-2 Stage1/Stage2/Auto + Precheck 已落地。
 - ✅ SAC1（dirty-set + 早停）与 SAC3（probe 队列驱动）已落地；搜索中的轻量 MSAC 已落地。
+- ✅ P0-1：Stage2 已支持 `ProbeStatus {kOK,kDWO,kUNKNOWN}` 与统计闭环；仅对 `kDWO` 删值。
+- ✅ P0-1a：Stage2 已支持停滞检测（stagnation-based soft budget）。
+- ✅ P0-1b：Stage2 已支持工作量子（quantum）检查基础设施（默认关闭）。
+- ✅ P0-1c：SAC3 已接入 deferred recheck（UNKNOWN 入队，邻域 epoch 变化后重检）。
 - ⚠️ “真 NSAC”的 `allowed-constraints mask` 未落地（当前仍是“邻域激活”，但不做子图过滤）。
-- ⚠️ `UNKNOWN` 语义与预算统计未闭环（存在 `max_iterations_per_probe`，但缺少显式 UNKNOWN 状态）。
 - ⚠️ Batch-3A（约束聚合）内核与 Manager 已有实现/测试，但未接入 solver 主路径。
 - ❌ bitGEMM（lane→world 的内核形态 / DomSoA 数据布局）未落地。
 - ❌ `bmma_sync(b1, AND+POPC)` 未落地（仅在计划文档中提及）。
@@ -42,13 +45,76 @@ updated: 2026-01-16
 
 ### P0：必须先做（稳定性/正确性/闭环）
 
-- [ ] **P0-1：显式 `UNKNOWN` 语义与统计闭环**
-  - 目标：probe 执行若 hit budget，则标记 `UNKNOWN`，结果一律“不删”。
+- [x] **P0-1：显式 `UNKNOWN` 语义与统计闭环**（基础已完成 0c87a46）
+  - 目标：probe 执行若 hit budget，则标记 `UNKNOWN`，结果一律"不删"。
   - 交付：
-    - `ProbeStatus { OK, DWO, UNKNOWN }`（Stage1/Stage2/Batch3A 统一口径）
-    - 统计：unknown_rate、budget_hit_count、p95/p99 iters/work
-    - solver 回写：仅对 `DWO` 执行 `RemoveValue`。
+    - `ProbeStatus { OK, DWO, UNKNOWN }`（Stage1/Stage2/Batch3A 统一口径）✅
+    - 统计：unknown_rate、budget_hit_count、p95/p99 iters/work ✅
+    - solver 回写：仅对 `DWO` 执行 `RemoveValue`。✅
   - 验收：启用极小 budget 时不误删；关闭 budget 时结果与当前一致。
+
+- [x] **P0-1a：停滞检测（Stagnation Detection）**（已完成）
+  - 目标：用多指标判定"长尾"，而非硬 max_iters 截断。
+  - 检测指标：
+    - `Δdeletions`：连续 k 轮 deletions==0（停滞）✅
+    - `frontier_popcount`：活跃约束数很大但删除几乎没有 ✅
+    - `deletions / work_cnt`：单位工作产出低于阈值 ✅
+  - 交付：
+    - `WorldWorkspace` 添加字段：`stagnation_count`, `last_deletions`, `last_frontier_popcount`, `work_cnt` ✅
+    - `Batch2PersistentControl` 添加配置：`stagnation_threshold`, `min_productivity`, `enable_stagnation_check` ✅
+    - `RunGACToFixpoint_BlockSync` 每轮后检查停滞 ✅
+  - 验收：`batch_test_v2.py --tier=0` 通过
+
+- [x] **P0-1b：时间片调度基础设施**（部分完成）
+  - 目标：每个 world 处理固定量子后让出，长尾不阻塞整批。
+  - 已完成：
+    - `GACTimesliceState` 结构体（预留暂停/恢复）✅
+    - `WorldWorkspace` 添加 `total_constraints_checked`, `quantum_exceeded` ✅
+    - `Batch2PersistentControl` 添加 `quantum_cid`, `enable_quantum_check` ✅
+    - `RunGACToFixpoint_BlockSync` 工作量子检查逻辑 ✅
+  - 待完成：
+    - 完整 yield/resume 逻辑（需 Batch-3A 载体稳定）
+    - Host 端循环处理 yield 的 probe
+  - 验收：最慢 probe 不超过平均的 5 倍
+
+- [x] **P0-1c：延后复查队列（Deferred Recheck）**（V1 邻域 epoch 已落地）
+  - 目标：UNKNOWN 的 probe 不丢弃，放入"待复查队列"，邻域变化时重跑。
+  - 背景：P0-1a（停滞检测）/P0-1b（工作量子）会产生 UNKNOWN；如果 UNKNOWN 直接丢弃，会导致“长尾值永远不复查”，
+    剪枝收益不足，最终在难例上体现为搜索/预处理超时。
+  - 关键设计（建议分两档实现，先做 V1）：
+    - **V1（推荐，低开销）**：邻域 epoch（neighbourhood epoch）
+      - `var_version[v]`：每次 `RemoveValue(v,*)` 后递增。
+      - `nb_epoch[i]`：当 `i` 的任一邻居变量发生删值时递增（可复用 `EnqueueNeighborhood()` 的邻接遍历）。
+      - DeferredProbe 记录：`{var_id, value, nb_epoch_snapshot, retry, enqueue_round}`。
+      - 复查条件：`nb_epoch[var_id] > nb_epoch_snapshot` 才重跑（允许少量 false positive；false negative 只会少删，仍 sound）。
+    - **V2（更精确，但更重）**：邻域版本快照（per-probe snapshot）
+      - DeferredProbe 记录邻域变量的 `var_version` 快照（`neighbours(var_id)` 的版本数组）。
+      - 复查条件：`any neighbor var_version > snapshot`。
+  - 交付：
+    - `include/GModelSolver.h`：添加版本/epoch 追踪容器与运行时开关、统计结构。
+    - `src/solver/gpu/GModelSolver.cu`：
+      - 添加 `DeferredProbeQueue`（上限、重检次数、超期清理）。
+      - 集成到 `EnforceSAC3()`：每轮优先取 `deferred_queue.CollectReadyTasks()`，否则再从 `ProbeQueue` 出队。
+      - 三态处理：`kDWO` → 删值 + 版本/epoch 递增 + 邻域入队；`kUNKNOWN` → 入 deferred queue；`kOK` → 无操作。
+    - `include/solver/gpu/batch_probe_manager.h`/`src/solver/gpu/batch_probe_manager.cu`：补齐“host 能拿到每个 task 的三态结果”
+      的最小接口（例如返回 unknown 列表或暴露 `task_status` 只读视图），避免 UNKNOWN 任务在 host 层丢失。
+    - 统计闭环：`deferred_in/out/hit/stale/retry` 与 “UNKNOWN → deferred → DWO” 的转化率。
+  - 运行时开关（建议）：
+    - `enable_deferred_queue`：总开关（关闭时回退到当前行为）。
+    - `max_deferred_retries` / `max_deferred_queue_size` / `max_deferred_age_rounds`：防止队列膨胀与无限重检。
+  - 验收：UNKNOWN 的值在邻域变化后被重新检测
+
+- [ ] **P0-1d：失败概率优先（Failure Priority）**
+  - 目标：高失败概率的值先 probe，快速产生删值。
+  - 建议：先完成 P0-1c 并补齐统计闭环，再推进 P0-1d；优先做“软优先级（bucketed queue）”而非完整堆/优先队列。
+  - 估计方法：
+    - Cheap precheck 的支持计数
+    - 历史 DWO 率（同变量其他值的失败率）
+    - 邻域约束紧密度
+  - 交付：
+    - `ProbePool` 添加优先级队列
+    - probe 入队时计算 `failure_score`
+  - 验收：相同时间内 DWO 发现数量提升
 
 - [ ] **P0-2：NSAC 的 `allowed-constraints mask`（真邻域子图）**
   - 目标：singleton test 的传播严格限制在 `Xi + N(Xi)` 诱导子图（NSACQ/NSAC）。

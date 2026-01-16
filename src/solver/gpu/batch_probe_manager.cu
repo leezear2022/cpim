@@ -1171,6 +1171,15 @@ void Batch2PersistentManager::LaunchPersistentBlocksKernel() {
   d_control_->max_iterations_per_probe = max_iterations_per_probe_;  // P0-1 NEW: 使用成员变量
   d_control_->chunk_size = chunk_size_;
 
+  // P0-1a NEW: 停滞检测参数
+  d_control_->stagnation_threshold = stagnation_threshold_;
+  d_control_->min_productivity = min_productivity_;
+  d_control_->enable_stagnation_check = stagnation_check_enabled_ ? 1 : 0;
+
+  // P0-1b NEW: 时间片调度参数
+  d_control_->quantum_cid = quantum_cid_;
+  d_control_->enable_quantum_check = quantum_check_enabled_ ? 1 : 0;
+
   // Precheck 统计（如果 precheck 启用）
   if (precheck_enabled_ && d_precheck_short_circuit_count_) {
     *d_precheck_short_circuit_count_ = 0;  // 重置计数器
@@ -1195,9 +1204,14 @@ void Batch2PersistentManager::LaunchPersistentBlocksKernel() {
 }
 
 int Batch2PersistentManager::CollectResults(std::vector<int>& failed_vars,
-                                            std::vector<int>& failed_values) {
+                                            std::vector<int>& failed_values,
+                                            std::vector<int>* unknown_vars,
+                                            std::vector<int>* unknown_values) {
   const int num_tasks = static_cast<int>(task_queue_.size());
   int num_failed = 0;
+
+  if (unknown_vars != nullptr) unknown_vars->clear();
+  if (unknown_values != nullptr) unknown_values->clear();
 
   // P0-1 NEW: 重置三态统计
   last_statistics_.Reset();
@@ -1217,6 +1231,12 @@ int Batch2PersistentManager::CollectResults(std::vector<int>& failed_vars,
           break;
         case ProbeStatus::kUNKNOWN:
           // 预算超限，不删值（保守处理）
+          if (unknown_vars != nullptr) {
+            unknown_vars->push_back(task_queue_[i].var_id);
+          }
+          if (unknown_values != nullptr) {
+            unknown_values->push_back(task_queue_[i].value);
+          }
           last_statistics_.unknown_count++;
           last_statistics_.budget_hit_count++;
           break;
@@ -1272,8 +1292,18 @@ int Batch2PersistentManager::CollectResults(std::vector<int>& failed_vars,
 int Batch2PersistentManager::ExecutePersistentBlocks(
     std::vector<int>& failed_vars,
     std::vector<int>& failed_values) {
+  return ExecutePersistentBlocks(failed_vars, failed_values, nullptr, nullptr);
+}
+
+int Batch2PersistentManager::ExecutePersistentBlocks(
+    std::vector<int>& failed_vars,
+    std::vector<int>& failed_values,
+    std::vector<int>* unknown_vars,
+    std::vector<int>* unknown_values) {
   failed_vars.clear();
   failed_values.clear();
+  if (unknown_vars != nullptr) unknown_vars->clear();
+  if (unknown_values != nullptr) unknown_values->clear();
 
   const int num_tasks = static_cast<int>(task_queue_.size());
   if (num_tasks == 0) {
@@ -1314,7 +1344,7 @@ int Batch2PersistentManager::ExecutePersistentBlocks(
   LaunchPersistentBlocksKernel();
 
   // 收集结果
-  int num_failed = CollectResults(failed_vars, failed_values);
+  int num_failed = CollectResults(failed_vars, failed_values, unknown_vars, unknown_values);
 
   VLOG(1) << "Persistent Blocks completed: " << num_failed << " / "
           << num_tasks << " probes failed"

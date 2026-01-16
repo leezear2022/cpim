@@ -2073,16 +2073,26 @@ bool CheckValueSupportBitSup_BlockSync(
 }
 
 // RunGACToFixpoint_BlockSync - 单 block 版本 GAC 到不动点
+// P0-1a: 添加停滞检测参数
+// P0-1b: 添加时间片调度参数
 __device__
 void RunGACToFixpoint_BlockSync(
     const GModelData& model,
     WorldWorkspace* ws,
     int bitmap_size_words,
     int max_iterations,
-    u32* shared_mem) {
+    u32* shared_mem,
+    int stagnation_threshold = 3,       // P0-1a: 停滞阈值
+    float min_productivity = 0.001f,    // P0-1a: 最低产出率
+    bool enable_stagnation_check = true,// P0-1a: 是否启用停滞检测
+    int quantum_cid = 0,                // P0-1b: 工作量子（0=无限制）
+    bool enable_quantum_check = false   // P0-1b: 是否启用工作量子检查
+    ) {
 
   __shared__ u32* frontier_cur;
   __shared__ u32* frontier_next;
+  __shared__ int stagnated;  // P0-1a: 停滞标志（shared 以便广播）
+  __shared__ int quantum_exceeded;  // P0-1b: 工作量子超限标志
 
   if (threadIdx.x == 0) {
     ws->inconsistent_flag = 0;
@@ -2092,6 +2102,18 @@ void RunGACToFixpoint_BlockSync(
     ws->frontier_nonempty = 1;
     frontier_cur = ws->frontier_A;
     frontier_next = ws->frontier_B;
+
+    // P0-1a: 初始化停滞检测字段
+    ws->stagnation_count = 0;
+    ws->last_deletions = 0;
+    ws->last_frontier_popcount = 0;
+    ws->work_cnt = 0;
+    stagnated = 0;
+
+    // P0-1b: 初始化时间片字段
+    ws->total_constraints_checked = 0;
+    ws->quantum_exceeded = 0;
+    quantum_exceeded = 0;
   }
   __syncthreads();
 
@@ -2107,6 +2129,25 @@ void RunGACToFixpoint_BlockSync(
       break;
     }
 
+    // P0-1a: 检查停滞标志
+    if (stagnated) {
+      break;
+    }
+
+    // P0-1b: 检查工作量子超限标志
+    if (quantum_exceeded) {
+      break;
+    }
+
+    // P0-1a: 记录本轮开始时的 deletions
+    __shared__ unsigned long long round_start_deletions;
+    __shared__ int round_work_cnt;
+    if (threadIdx.x == 0) {
+      round_start_deletions = ws->deletions;
+      round_work_cnt = 0;
+    }
+    __syncthreads();
+
     while (true) {
       __shared__ int cid_shared;
       if (threadIdx.x == 0) {
@@ -2120,6 +2161,11 @@ void RunGACToFixpoint_BlockSync(
       const int cid = cid_shared;
       if (cid < 0 || cid >= model.num_constraints) {
         break;
+      }
+
+      // P0-1a: 计数工作量
+      if (threadIdx.x == 0) {
+        round_work_cnt++;
       }
 
       PropagateResult r = ExecuteConstraintCheck_BpC_Workspace(
@@ -2150,13 +2196,54 @@ void RunGACToFixpoint_BlockSync(
     __syncthreads();
 
     if (threadIdx.x == 0) {
+      // P0-1a: 计算本轮 deletions 和 frontier popcount
+      const int round_deletions = static_cast<int>(ws->deletions - round_start_deletions);
+      ws->work_cnt += round_work_cnt;
+
+      int frontier_popcount = 0;
       ws->frontier_nonempty = 0;
       for (int w = 0; w < bitmap_size_words; ++w) {
-        if (frontier_next[w] != 0u) {
+        const u32 word = frontier_next[w];
+        if (word != 0u) {
           ws->frontier_nonempty = 1;
-          break;
+          frontier_popcount += __popc(word);
         }
       }
+
+      // P0-1a: 停滞检测
+      if (enable_stagnation_check && ws->frontier_nonempty) {
+        // 检测条件 1: 连续零删值轮次
+        if (round_deletions == 0) {
+          ws->stagnation_count++;
+        } else {
+          ws->stagnation_count = 0;  // 有删值则重置
+        }
+
+        // 检测条件 2: 产出率过低（大量工作但几乎无删值）
+        const float productivity = (round_work_cnt > 0)
+            ? static_cast<float>(round_deletions) / round_work_cnt
+            : 0.0f;
+
+        // 判定停滞
+        if (ws->stagnation_count >= stagnation_threshold ||
+            (round_work_cnt > 10 && productivity < min_productivity && frontier_popcount > 10)) {
+          // 标记为停滞，将在下一轮迭代开始时退出
+          stagnated = 1;
+        }
+      }
+
+      // P0-1b: 工作量子检查（累计约束检查数）
+      ws->total_constraints_checked += round_work_cnt;
+      if (enable_quantum_check && quantum_cid > 0 && ws->frontier_nonempty) {
+        if (ws->total_constraints_checked >= quantum_cid) {
+          // 超过工作量子，标记并退出
+          quantum_exceeded = 1;
+          ws->quantum_exceeded = 1;
+        }
+      }
+
+      ws->last_deletions = round_deletions;
+      ws->last_frontier_popcount = frontier_popcount;
       ws->scanner_index = 0;
       ws->iterations++;
 
@@ -2572,22 +2659,28 @@ void Batch2ProbeKernel_PersistentBlocks(
     __syncthreads();
 
     // [6] GAC 传播（直接调用 RunGACToFixpoint_BlockSync）
+    // P0-1a: 传递停滞检测参数
+    // P0-1b: 传递时间片调度参数
     RunGACToFixpoint_BlockSync(
         model, ws, bitmap_size_words,
-        control->max_iterations_per_probe, shared_mem);
+        control->max_iterations_per_probe, shared_mem,
+        control->stagnation_threshold,      // P0-1a
+        control->min_productivity,          // P0-1a
+        control->enable_stagnation_check,   // P0-1a
+        control->quantum_cid,               // P0-1b
+        control->enable_quantum_check);     // P0-1b
 
     // [7] 写回结果和统计
     if (threadIdx.x == 0) {
       const bool is_dwo = (ws->inconsistent_flag == 1);
       control->results[task_id] = !is_dwo;
 
-      // P0-1 NEW: 设置三态状态
+      // P0-1/P0-1a: 设置三态状态（包括停滞检测）
       if (control->task_status != nullptr) {
         if (is_dwo) {
           control->task_status[task_id] = 1;  // kDWO: 可删值
-        } else if (control->max_iterations_per_probe > 0 &&
-                   ws->iterations >= control->max_iterations_per_probe) {
-          // 预算超限但没有 DWO：UNKNOWN（不删值，保守处理）
+        } else if (ws->frontier_nonempty == 1) {
+          // 未收敛（停滞或迭代超限）：UNKNOWN
           control->task_status[task_id] = 2;  // kUNKNOWN
         } else {
           control->task_status[task_id] = 0;  // kOK: 正常收敛

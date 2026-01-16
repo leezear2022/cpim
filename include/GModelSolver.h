@@ -125,6 +125,22 @@ class GModelSolver {
   void SetSACConfig(const SACConfig& config) { sac_config_ = config; }
   const SACConfig& GetSACConfig() const { return sac_config_; }
 
+  // ========== SAC3: 延后复查队列（P0-1c） ==========
+  // UNKNOWN probe 不丢弃：当邻域发生删值变化时再重跑，以回收剪枝机会并抑制长尾。
+  struct DeferredRecheckConfig {
+    bool enabled = true;        // 总开关（关闭则回退到当前行为：UNKNOWN 直接丢弃）
+    int max_retries = 3;        // 单个 (var,value) 最多重检次数
+    int max_queue_size = 1000;  // 队列上限（超过则丢弃新入队）
+    int max_age_rounds = 200;   // 入队超过该轮数仍未复查则丢弃（0=不限制）
+  };
+
+  void SetDeferredRecheckConfig(const DeferredRecheckConfig& config) {
+    deferred_recheck_config_ = config;
+  }
+  const DeferredRecheckConfig& GetDeferredRecheckConfig() const {
+    return deferred_recheck_config_;
+  }
+
   // MSAC 配置（搜索中的条件触发 SAC）
   void SetMSACConfig(const GpuMSACConfig& config) { msac_config_ = config; }
   const GpuMSACConfig& GetMSACConfig() const { return msac_config_; }
@@ -157,6 +173,9 @@ class GModelSolver {
   GpuMSACConfig msac_config_;             // MSAC 配置
   int last_level_failures_ = 0;           // 上层失败次数（用于计算失败率）
   int last_level_positives_ = 0;          // 上层正向节点数
+
+  // SAC3 延后复查队列配置（P0-1c）
+  DeferredRecheckConfig deferred_recheck_config_;
 
   // 递归搜索（DFS + MAC）
   // 返回 true 表示找到解或达到最大解数量

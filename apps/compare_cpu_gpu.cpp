@@ -25,6 +25,18 @@ ABSL_FLAG(bool, gpu_only, false, "Run GPU solver only");
 ABSL_FLAG(bool, sac, false, "Enable SAC preprocessing for GPU solver");
 ABSL_FLAG(std::string, sac_stage, "auto", "SAC stage selection: auto, stage1, stage2");
 ABSL_FLAG(std::string, sac_mode, "sac1", "SAC mode: sac1 (dirty set) or sac3 (probe queue)");
+ABSL_FLAG(bool, sac_failure_priority, false,
+          "Enable SAC3 failure-priority scheduling (bucketed queue)");
+ABSL_FLAG(int, sac_failure_priority_buckets, 8,
+          "SAC3 failure-priority buckets (suggest: 4/8/16)");
+ABSL_FLAG(double, sac_failure_priority_w_dom, 1.0,
+          "SAC3 failure-priority weight: domain shrink term");
+ABSL_FLAG(double, sac_failure_priority_w_deg, 1.0,
+          "SAC3 failure-priority weight: degree term");
+ABSL_FLAG(double, sac_failure_priority_w_hist, 1.0,
+          "SAC3 failure-priority weight: historical DWO-rate term");
+ABSL_FLAG(int, sac_failure_priority_min_hist_probes, 16,
+          "SAC3 failure-priority: min probes for hist term");
 
 using namespace cpim;
 
@@ -128,6 +140,18 @@ GpuSearchStatistics RunGPUSolver(const model::IntermediateModel& im_model,
     solver.SetSAC1Preprocessing(true);
     solver.SetSACStageMode(sac_stage);
     solver.SetSACMode(sac_mode);
+
+    // P0-1d: 失败概率优先调度（仅影响 SAC3）
+    if (sac_mode == SACMode::kSAC3) {
+      GModelSolver::FailurePriorityConfig fp;
+      fp.enabled = absl::GetFlag(FLAGS_sac_failure_priority);
+      fp.num_buckets = absl::GetFlag(FLAGS_sac_failure_priority_buckets);
+      fp.w_dom = static_cast<float>(absl::GetFlag(FLAGS_sac_failure_priority_w_dom));
+      fp.w_deg = static_cast<float>(absl::GetFlag(FLAGS_sac_failure_priority_w_deg));
+      fp.w_hist = static_cast<float>(absl::GetFlag(FLAGS_sac_failure_priority_w_hist));
+      fp.min_hist_probes = absl::GetFlag(FLAGS_sac_failure_priority_min_hist_probes);
+      solver.SetFailurePriorityConfig(fp);
+    }
   }
 
   // 求解
@@ -177,6 +201,7 @@ int main(int argc, char** argv) {
     std::cerr << "  --sac             启用 SAC 预处理（GPU）" << std::endl;
     std::cerr << "  --sac_stage=X     SAC Stage 选择: auto|stage1|stage2" << std::endl;
     std::cerr << "  --sac_mode=X      SAC 模式: sac1|sac3" << std::endl;
+    std::cerr << "  --sac_failure_priority   SAC3: 失败概率优先调度（分桶队列）" << std::endl;
     return 1;
   }
 

@@ -1,6 +1,6 @@
 ---
 status: active
-updated: 2026-01-16
+updated: 2026-01-17
 ---
 
 # TODO：SACGPU / Batch-AC 下一阶段工作备忘（2026-01）
@@ -36,6 +36,7 @@ updated: 2026-01-16
 - ✅ P0-1a：Stage2 已支持停滞检测（stagnation-based soft budget）。
 - ✅ P0-1b：Stage2 已支持工作量子（quantum）检查基础设施（默认关闭）。
 - ✅ P0-1c：SAC3 已接入 deferred recheck（UNKNOWN 入队，邻域 epoch 变化后重检）。
+- ✅ P0-1d（V1）：SAC3 ProbeQueue 支持 failure-priority 分桶调度（dom/deg/hist DWO，默认关闭）。
 - ⚠️ “真 NSAC”的 `allowed-constraints mask` 未落地（当前仍是“邻域激活”，但不做子图过滤）。
 - ⚠️ Batch-3A（约束聚合）内核与 Manager 已有实现/测试，但未接入 solver 主路径。
 - ❌ bitGEMM（lane→world 的内核形态 / DomSoA 数据布局）未落地。
@@ -104,17 +105,26 @@ updated: 2026-01-16
     - `max_deferred_retries` / `max_deferred_queue_size` / `max_deferred_age_rounds`：防止队列膨胀与无限重检。
   - 验收：UNKNOWN 的值在邻域变化后被重新检测
 
-- [ ] **P0-1d：失败概率优先（Failure Priority）**
+- [x] **P0-1d：失败概率优先（Failure Priority）**（V1 分桶调度已落地，待数据验证/调参）
   - 目标：高失败概率的值先 probe，快速产生删值。
-  - 建议：先完成 P0-1c 并补齐统计闭环，再推进 P0-1d；优先做“软优先级（bucketed queue）”而非完整堆/优先队列。
-  - 估计方法：
-    - Cheap precheck 的支持计数
-    - 历史 DWO 率（同变量其他值的失败率）
-    - 邻域约束紧密度
-  - 交付：
-    - `ProbePool` 添加优先级队列
-    - probe 入队时计算 `failure_score`
-  - 验收：相同时间内 DWO 发现数量提升
+  - 定位：这是 **host 侧调度/排序策略**，与 Stage2 的 `UNKNOWN` 语义（P0-1）/停滞检测（P0-1a）/量子检查（P0-1b）
+    以及 deferred recheck（P0-1c）**一起形成闭环**：
+    - 先跑“更可能 DWO”的 probe → 早删值 → 队列更快收缩、后续传播更轻；
+    - 对“明显长尾/无产出”的 probe：Stage2 提前标 `UNKNOWN` → 进入 deferred queue → **邻域删值变化后再重检**（暂停≠放弃，仍 sound）。
+  - 建议实现路线：优先做 **软优先级（bucketed queue）**，避免堆/优先队列的维护开销与原子热点。
+    - V1（低风险）：只用 var 级 cheap 特征（`dom_size`/`degree`/历史 DWO 率）打分并分桶。
+    - V2（可选）：引入更细粒度的 value 级信号（例如“支持稀疏度”/popcount 近似），但必须明确其计算/搬运开销。
+  - 估计信号（从便宜到昂贵）：
+    - `score_dom_deg = degree(var) / max(1, dom_size(var))`（约束更紧密的 var 先跑）
+    - `score_hist = EMA(dwo)`（同 var 历史 probe 的 DWO 命中率）
+    - `score_precheck`（可选）：cheap precheck 的统计信号（例如短路命中率，或扩展为“支持计数”）
+  - 交付（建议落点）：
+    - `src/solver/gpu/GModelSolver.cu` 的 `ProbeQueue`：从 FIFO 改为 `N` 个 bucket 的 `deque`（保持 `in_queue_bits_` 去重不变）
+    - `GModelSolver`：新增运行时开关/桶数/权重，并输出 per-bucket 命中率统计（用于验证“更可能 DWO”）
+  - 验收（可观测）：
+    - 相同 budget/time 下，`dwo_count/time_ms` 上升或 `total_probes_checked` 下降
+    - per-bucket `dwo_hit_rate` 单调递减（否则说明评分无效）
+    - `enable_failure_priority=false` 时行为回退到当前 FIFO（便于消融）
 
 - [ ] **P0-2：NSAC 的 `allowed-constraints mask`（真邻域子图）**
   - 目标：singleton test 的传播严格限制在 `Xi + N(Xi)` 诱导子图（NSACQ/NSAC）。

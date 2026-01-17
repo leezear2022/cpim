@@ -1,6 +1,7 @@
 #include "GModelSolver.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <deque>
 #include <iostream>
 #include <stdexcept>
@@ -404,12 +405,32 @@ class ProbeQueue {
  public:
   static constexpr int kBitsPerWord = 32;
 
-  ProbeQueue(GModel* model, const NeighborCSR& neighbor_csr)
-      : model_(model), num_vars_(model->num_vars), neighbor_csr_(neighbor_csr) {
+  ProbeQueue(GModel* model,
+             const NeighborCSR& neighbor_csr,
+             const GModelSolver::FailurePriorityConfig& config,
+             const std::vector<int>* var_probe_count,
+             const std::vector<int>* var_dwo_count)
+      : model_(model),
+        num_vars_(model->num_vars),
+        neighbor_csr_(neighbor_csr),
+        config_(config),
+        var_probe_count_(var_probe_count),
+        var_dwo_count_(var_dwo_count) {
     // 计算每变量需要的 word 数
     words_per_var_ = (model_->max_dom_size + kBitsPerWord - 1) / kBitsPerWord;
     // 分配位打包数组：num_vars * words_per_var
     in_queue_bits_.resize(num_vars_ * words_per_var_, 0);
+
+    if (config_.enabled) {
+      num_buckets_ = std::clamp(config_.num_buckets, 1, 16);
+      buckets_.resize(num_buckets_);
+
+      // 预计算 max_degree（用于归一化）
+      max_degree_ = 1;
+      for (int v = 0; v < num_vars_; ++v) {
+        max_degree_ = std::max(max_degree_, neighbor_csr_.GetDegree(v));
+      }
+    }
   }
 
   // 检查值是否在域中（直接位域检查）
@@ -445,8 +466,14 @@ class ProbeQueue {
     const uint32_t mask = 1u << (val % kBitsPerWord);
     if (in_queue_bits_[idx] & mask) return false;  // 已在队列中
 
-    queue_.emplace_back(var, val);
+    if (config_.enabled) {
+      const int bucket = ComputeBucket(var);
+      buckets_[bucket].emplace_back(var, val);
+    } else {
+      queue_.emplace_back(var, val);
+    }
     in_queue_bits_[idx] |= mask;
+    size_++;
     return true;
   }
 
@@ -466,12 +493,27 @@ class ProbeQueue {
   }
 
   // 批量出队（返回实际出队数量）
-  int DequeueBatch(int max_count, std::vector<ProbeTask>& tasks) {
+  // bucket_out：若非空，则为每个出队 task 记录其 bucket（仅对 regular queue 生效；deferred task 在上层标记为 -1）
+  int DequeueBatch(int max_count,
+                   std::vector<ProbeTask>& tasks,
+                   std::vector<int8_t>* bucket_out = nullptr) {
     tasks.clear();
+    if (bucket_out != nullptr) bucket_out->clear();
     int count = 0;
-    while (!queue_.empty() && count < max_count) {
-      auto [var, val] = queue_.front();
-      queue_.pop_front();
+    while (!Empty() && count < max_count) {
+      int var = -1;
+      int val = -1;
+      int bucket = 0;
+      if (config_.enabled) {
+        bucket = PopHighestBucket(&var, &val);
+        if (var < 0 || val < 0) break;
+      } else {
+        auto [v, a] = queue_.front();
+        queue_.pop_front();
+        var = v;
+        val = a;
+      }
+      size_--;
 
       // 位打包清除标记
       const int idx = var * words_per_var_ + val / kBitsPerWord;
@@ -483,30 +525,100 @@ class ProbeQueue {
       if (!HasValue(var, val)) continue;
 
       tasks.emplace_back(var, val, static_cast<int>(tasks.size()));
+      if (bucket_out != nullptr) {
+        bucket_out->push_back(static_cast<int8_t>(bucket));
+      }
       count++;
     }
     return count;
   }
 
   // 队列是否为空
-  bool Empty() const { return queue_.empty(); }
+  bool Empty() const { return size_ == 0; }
 
   // 队列大小
-  size_t Size() const { return queue_.size(); }
+  size_t Size() const { return size_; }
 
   // 清空队列
   void Clear() {
     queue_.clear();
+    for (auto& q : buckets_) q.clear();
     std::fill(in_queue_bits_.begin(), in_queue_bits_.end(), 0);
+    size_ = 0;
   }
 
  private:
+  int ComputeBucket(int var) const {
+    if (!config_.enabled || num_buckets_ <= 1) return 0;
+
+    const int dom_size = model_->GetDomainSize(var);
+    const int degree = neighbor_csr_.GetDegree(var);
+
+    float dom_term = 0.0f;
+    if (model_->max_dom_size > 0) {
+      dom_term = static_cast<float>(model_->max_dom_size - dom_size) /
+                 static_cast<float>(model_->max_dom_size);
+    }
+
+    const float deg_term = static_cast<float>(degree) /
+                           static_cast<float>(std::max(1, max_degree_));
+
+    float hist_term = 0.0f;
+    if (var_probe_count_ != nullptr && var_dwo_count_ != nullptr &&
+        var >= 0 && var < static_cast<int>(var_probe_count_->size()) &&
+        var < static_cast<int>(var_dwo_count_->size())) {
+      const int probes = (*var_probe_count_)[var];
+      const int dwo = (*var_dwo_count_)[var];
+      if (probes >= std::max(1, config_.min_hist_probes)) {
+        hist_term = static_cast<float>(dwo) / static_cast<float>(probes);
+      }
+    }
+
+    const float denom = config_.w_dom + config_.w_deg + config_.w_hist;
+    float score = 0.0f;
+    if (denom > 0.0f) {
+      score = (config_.w_dom * dom_term +
+               config_.w_deg * deg_term +
+               config_.w_hist * hist_term) / denom;
+    }
+    score = std::clamp(score, 0.0f, 0.999999f);
+
+    int bucket = static_cast<int>(score * static_cast<float>(num_buckets_));
+    bucket = std::clamp(bucket, 0, num_buckets_ - 1);
+    return bucket;
+  }
+
+  int PopHighestBucket(int* var, int* val) {
+    for (int b = num_buckets_ - 1; b >= 0; --b) {
+      auto& q = buckets_[b];
+      if (!q.empty()) {
+        auto [v, a] = q.front();
+        q.pop_front();
+        *var = v;
+        *val = a;
+        return b;
+      }
+    }
+    // 防御性：理论上不会发生（Empty() 已检查）
+    *var = -1;
+    *val = -1;
+    return 0;
+  }
+
   GModel* model_;
   int num_vars_;
   int words_per_var_;                        // = (max_dom_size + 31) / 32
   std::deque<std::pair<int, int>> queue_;    // FIFO 队列
+  std::vector<std::deque<std::pair<int, int>>> buckets_;  // bucketed queues
   std::vector<uint32_t> in_queue_bits_;      // 位打包：[num_vars * words_per_var]
   const NeighborCSR& neighbor_csr_;          // 共享 CSR 邻接表引用
+
+  size_t size_ = 0;
+  GModelSolver::FailurePriorityConfig config_;
+  const std::vector<int>* var_probe_count_ = nullptr;
+  const std::vector<int>* var_dwo_count_ = nullptr;
+  int num_buckets_ = 1;
+  int max_degree_ = 1;
 };
 
 // ============================================================================
@@ -925,8 +1037,23 @@ int GModelSolver::EnforceSAC3(GpuSearchStatistics& stats) {
   task_from_deferred.reserve(max_batch_size);
   std::vector<int> task_prev_retry;
   task_prev_retry.reserve(max_batch_size);
+  std::vector<int8_t> task_bucket;
+  task_bucket.reserve(max_batch_size);
   std::vector<int> failed_vars, failed_values;
   std::vector<int> unknown_vars, unknown_values;
+
+  // P0-1d：失败概率优先（按 var 统计历史 DWO 命中率，用于 probe 入队分桶）
+  std::vector<int> var_probe_count(model_->num_vars, 0);
+  std::vector<int> var_dwo_count(model_->num_vars, 0);
+  const bool failure_priority_enabled =
+      failure_priority_config_.enabled && failure_priority_config_.num_buckets > 1;
+  std::vector<int> bucket_total;
+  std::vector<int> bucket_dwo;
+  if (failure_priority_enabled) {
+    const int n = std::clamp(failure_priority_config_.num_buckets, 1, 16);
+    bucket_total.assign(n, 0);
+    bucket_dwo.assign(n, 0);
+  }
 
   UnifiedTrail* trail = model_->trail_;
   std::vector<char> gac_modified_flags;
@@ -1132,7 +1259,8 @@ int GModelSolver::EnforceSAC3(GpuSearchStatistics& stats) {
 
     // 创建 ProbeQueue（延迟初始化，使用构造时的共享 CSR 成员）
     if (probe_queue == nullptr) {
-      probe_queue = new ProbeQueue(model_, neighbor_csr_);
+      probe_queue = new ProbeQueue(model_, neighbor_csr_, failure_priority_config_,
+                                   &var_probe_count, &var_dwo_count);
       if (verbose_) {
         std::cout << "[SAC3] 检测到删值，切换到队列模式" << std::endl;
       }
@@ -1225,6 +1353,18 @@ int GModelSolver::EnforceSAC3(GpuSearchStatistics& stats) {
                                       unknown_vars, unknown_values);
     EnqueueUnknownToDeferred(batch_count);
 
+    // P0-1d：更新历史统计（用于后续分桶/调度）
+    for (const auto& t : tasks) {
+      if (t.var_id >= 0 && t.var_id < model_->num_vars) {
+        var_probe_count[t.var_id]++;
+      }
+    }
+    for (int v : failed_vars) {
+      if (v >= 0 && v < model_->num_vars) {
+        var_dwo_count[v]++;
+      }
+    }
+
     if (has_deletions) {
       // 发生删值，切换到队列模式
       int result = HandleDeletionsAndSwitchToQueue();
@@ -1265,6 +1405,7 @@ int GModelSolver::EnforceSAC3(GpuSearchStatistics& stats) {
       tasks.clear();
       task_from_deferred.clear();
       task_prev_retry.clear();
+      task_bucket.clear();
 
       // [1] 优先调度 deferred ready tasks
       if (deferred_queue.Enabled()) {
@@ -1272,16 +1413,21 @@ int GModelSolver::EnforceSAC3(GpuSearchStatistics& stats) {
                                          tasks, task_from_deferred,
                                          task_prev_retry);
       }
+      task_bucket.assign(tasks.size(), static_cast<int8_t>(-1));
 
       // [2] regular probe queue 填充 batch（保持 GPU 吞吐）
       if (static_cast<int>(tasks.size()) < max_batch_size && !probe_queue->Empty()) {
         std::vector<ProbeTask> extra;
-        probe_queue->DequeueBatch(max_batch_size - static_cast<int>(tasks.size()),
-                                  extra);
-        for (const auto& t : extra) {
-          tasks.push_back(t);
+        std::vector<int8_t> extra_bucket;
+        probe_queue->DequeueBatch(
+            max_batch_size - static_cast<int>(tasks.size()),
+            extra,
+            &extra_bucket);
+        for (int i = 0; i < static_cast<int>(extra.size()); ++i) {
+          tasks.push_back(extra[i]);
           task_from_deferred.push_back(0);
           task_prev_retry.push_back(0);
+          task_bucket.push_back(extra_bucket.empty() ? 0 : extra_bucket[i]);
         }
       }
 
@@ -1302,6 +1448,46 @@ int GModelSolver::EnforceSAC3(GpuSearchStatistics& stats) {
       bool has_deletions = ExecuteBatch(failed_vars, failed_values,
                                         unknown_vars, unknown_values);
       EnqueueUnknownToDeferred(batch_count);
+
+      // P0-1d：更新历史统计（用于后续分桶/调度）
+      for (const auto& t : tasks) {
+        if (t.var_id >= 0 && t.var_id < model_->num_vars) {
+          var_probe_count[t.var_id]++;
+        }
+      }
+      for (int v : failed_vars) {
+        if (v >= 0 && v < model_->num_vars) {
+          var_dwo_count[v]++;
+        }
+      }
+      if (failure_priority_enabled) {
+        for (int8_t b : task_bucket) {
+          if (b >= 0 && b < static_cast<int8_t>(bucket_total.size())) {
+            bucket_total[b]++;
+          }
+        }
+        if (!failed_vars.empty()) {
+          std::unordered_map<uint64_t, int8_t> bucket_by_task;
+          bucket_by_task.reserve(tasks.size() * 2);
+          for (int i = 0; i < static_cast<int>(tasks.size()); ++i) {
+            const int8_t b = task_bucket[i];
+            if (b < 0) continue;
+            uint64_t key = (static_cast<uint64_t>(tasks[i].var_id) << 32) |
+                           static_cast<uint32_t>(tasks[i].value);
+            bucket_by_task[key] = b;
+          }
+          for (size_t i = 0; i < failed_vars.size(); ++i) {
+            uint64_t key = (static_cast<uint64_t>(failed_vars[i]) << 32) |
+                           static_cast<uint32_t>(failed_values[i]);
+            const auto it = bucket_by_task.find(key);
+            if (it == bucket_by_task.end()) continue;
+            const int8_t b = it->second;
+            if (b >= 0 && b < static_cast<int8_t>(bucket_dwo.size())) {
+              bucket_dwo[b]++;
+            }
+          }
+        }
+      }
 
       if (has_deletions) {
         // 统计 deferred hit（重检后 DWO）
@@ -1434,6 +1620,18 @@ int GModelSolver::EnforceSAC3(GpuSearchStatistics& stats) {
                 << ", stale=" << dqs.deferred_stale
                 << ", overflow=" << dqs.deferred_overflow
                 << std::endl;
+    }
+    if (failure_priority_enabled) {
+      std::cout << "  FailurePriority buckets (high->low): ";
+      for (int b = static_cast<int>(bucket_total.size()) - 1; b >= 0; --b) {
+        const int total = bucket_total[b];
+        const int dwo = bucket_dwo[b];
+        const double hit = (total > 0) ? (100.0 * dwo / total) : 0.0;
+        std::cout << "[" << b << ": " << dwo << "/" << total
+                  << " (" << hit << "%)]";
+        if (b != 0) std::cout << " ";
+      }
+      std::cout << std::endl;
     }
   }
 

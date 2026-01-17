@@ -1331,6 +1331,13 @@ int Batch2PersistentManager::ExecutePersistentBlocks(
     effective_num_blocks_ = num_blocks_;
   }
 
+  // 防御性：确保任务/结果数组容量足够（sac_benchmark 的 full_sac 会一次性提交全域任务）
+  // 否则会导致 cudaMemcpy 越界写，进而在 kernel launch 时报 "invalid argument"。
+  if (num_tasks > max_tasks_) {
+    const int new_capacity = std::max(num_tasks, max_tasks_ * 2);
+    ReserveTaskCapacity(new_capacity);
+  }
+
   CHECK(memory_allocated_) << "Batch2PersistentManager memory not allocated";
 
   VLOG(1) << "ExecutePersistentBlocks: " << num_tasks << " tasks, "

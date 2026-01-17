@@ -1,5 +1,29 @@
 # 修改清单（中文）
 
+## 2026-01-17
+
+### P0-1d：失败概率优先（Failure Priority / bucketed queue）
+
+**目标**：优先执行“更可能 DWO”的 probes，让删值尽早发生，从而减少后续传播成本并抑制长尾；只改变调度顺序，
+不改变 soundness 语义（仍然只对 `kDWO` 删值，`kUNKNOWN` 不删）。
+
+**交付内容**：
+- `GModelSolver::FailurePriorityConfig`：运行时开关与权重/桶数配置
+- `EnforceSAC3()`：queue mode 下支持按 bucket 出队，并在 verbose 下输出各 bucket 的 DWO 命中率统计
+- `apps/compare_cpu_gpu.cpp`：增加参数用于启用/调参：
+  - `--sac_failure_priority`
+  - `--sac_failure_priority_buckets`
+  - `--sac_failure_priority_w_dom / --sac_failure_priority_w_deg / --sac_failure_priority_w_hist`
+  - `--sac_failure_priority_min_hist_probes`
+
+**修改文件**：
+- `include/GModelSolver.h`
+- `src/solver/gpu/GModelSolver.cu`
+- `apps/compare_cpu_gpu.cpp`
+- `docs/planning/TODO_SACGPU_NEXT.md`
+
+---
+
 ## 2026-01-16
 
 ### P0-1：显式 UNKNOWN 语义与统计闭环（基础设施）
@@ -94,6 +118,20 @@
 - `src/solver/gpu/batch_probe_manager.cu`: 收集 UNKNOWN probes 并返回给 host
 
 **验收**：`batch_test_v2.py --tier=0` 通过（8/12 匹配，与之前一致；4 个超时为既有性能问题）
+
+---
+
+### 修复：`sac_benchmark` Full SAC 下的 kernel launch `invalid argument`
+
+**问题**：`sac_benchmark --mode=full_sac` 会一次性提交大量 probes；Stage2（Persistent Blocks）
+在 auto-tune 重新分配 workspaces 后，可能出现 `num_tasks > max_tasks_`，导致任务数组 `cudaMemcpy`
+越界写，最终在 kernel launch 时报 `invalid argument`。
+
+**修复**：在 `Batch2PersistentManager::ExecutePersistentBlocks()` 中加入防御性扩容：当
+`num_tasks > max_tasks_` 时自动 `ReserveTaskCapacity()`，确保任务/结果数组容量充足。
+
+**修改文件**：
+- `src/solver/gpu/batch_probe_manager.cu`
 
 ---
 

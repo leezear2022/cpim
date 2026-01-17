@@ -141,6 +141,25 @@ class GModelSolver {
     return deferred_recheck_config_;
   }
 
+  // ========== SAC3: 失败概率优先调度（P0-1d） ==========
+  // 目标：把“更可能 DWO”的 probe 更早跑完，让删值尽早发生，从而降低后续传播成本并抑制长尾。
+  // 注意：这只改变 probe 的调度顺序，不改变 soundness 语义（只对 kDWO 删值）。
+  struct FailurePriorityConfig {
+    bool enabled = false;       // 总开关（关闭则回退 FIFO）
+    int num_buckets = 8;        // 分桶数量（建议 4/8/16）
+    float w_dom = 1.0f;         // 域收缩项权重（dom 越小越优先）
+    float w_deg = 1.0f;         // 度数项权重（degree 越大越优先）
+    float w_hist = 1.0f;        // 历史 DWO 率权重（同 var 的 probe 命中率）
+    int min_hist_probes = 16;   // 历史统计生效的最小样本数
+  };
+
+  void SetFailurePriorityConfig(const FailurePriorityConfig& config) {
+    failure_priority_config_ = config;
+  }
+  const FailurePriorityConfig& GetFailurePriorityConfig() const {
+    return failure_priority_config_;
+  }
+
   // MSAC 配置（搜索中的条件触发 SAC）
   void SetMSACConfig(const GpuMSACConfig& config) { msac_config_ = config; }
   const GpuMSACConfig& GetMSACConfig() const { return msac_config_; }
@@ -176,6 +195,7 @@ class GModelSolver {
 
   // SAC3 延后复查队列配置（P0-1c）
   DeferredRecheckConfig deferred_recheck_config_;
+  FailurePriorityConfig failure_priority_config_;
 
   // 递归搜索（DFS + MAC）
   // 返回 true 表示找到解或达到最大解数量

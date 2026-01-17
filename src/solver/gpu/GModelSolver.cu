@@ -1001,6 +1001,22 @@ int GModelSolver::EnforceSAC3(GpuSearchStatistics& stats) {
 
   // 使用构造时构建的共享邻接表（neighbor_csr_ 成员）
 
+  // P0-2: NSAC allowed-constraints mask 初始化
+  if (nsac_mask_config_.enabled) {
+    if (!model_->IsAllowedMasksBuilt()) {
+      Timer mask_timer;
+      model_->BuildAllowedMasks();
+      if (verbose_) {
+        std::cout << "[SAC3] NSAC mask built in " << mask_timer.elapsed()
+                  << " ms (bitmap_words=" << model_->GetGModelDataView().constraint_bitmap_words
+                  << ")" << std::endl;
+      }
+    }
+    model_->SetNSACMaskEnabled(true);
+  } else {
+    model_->SetNSACMaskEnabled(false);
+  }
+
   // 创建 AutoStageSelector
   AutoStageSelector stage_selector(model_, 32);
 

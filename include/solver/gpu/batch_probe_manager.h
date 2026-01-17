@@ -430,6 +430,11 @@ struct Batch2PersistentControl {
   int quantum_cid;                // 工作量子：每个 probe 最多检查的约束数（0=无限制）
   int enable_quantum_check;       // 是否启用工作量子检查（默认 0）
 
+  // ========== P0-2：NSAC allowed-constraints mask ==========
+  const u32* allowed_masks;       // [num_vars * constraint_bitmap_words]（nullptr=禁用）
+  int constraint_bitmap_words;    // (num_constraints + 31) / 32
+  int focal_var;                  // 当前 probe 的 focal variable（用于选择 mask 行）
+
   // ========== Precheck 统计 ==========
   unsigned long long* precheck_short_circuit_count;  // precheck 短路次数（原子递增）
 
@@ -454,6 +459,9 @@ struct Batch2PersistentControl {
         enable_stagnation_check(1),     // P0-1a: 默认启用
         quantum_cid(0),                 // P0-1b: 默认无限制
         enable_quantum_check(0),        // P0-1b: 默认关闭
+        allowed_masks(nullptr),         // P0-2: 默认禁用
+        constraint_bitmap_words(0),     // P0-2
+        focal_var(-1),                  // P0-2: -1 表示未设置
         precheck_short_circuit_count(nullptr) {}
 };
 

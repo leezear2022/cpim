@@ -37,6 +37,8 @@ ABSL_FLAG(double, sac_failure_priority_w_hist, 1.0,
           "SAC3 failure-priority weight: historical DWO-rate term");
 ABSL_FLAG(int, sac_failure_priority_min_hist_probes, 16,
           "SAC3 failure-priority: min probes for hist term");
+ABSL_FLAG(bool, sac_nsac_mask, true,
+          "Enable NSAC allowed-constraints mask (restrict propagation to neighborhood)");
 
 using namespace cpim;
 
@@ -151,6 +153,11 @@ GpuSearchStatistics RunGPUSolver(const model::IntermediateModel& im_model,
       fp.w_hist = static_cast<float>(absl::GetFlag(FLAGS_sac_failure_priority_w_hist));
       fp.min_hist_probes = absl::GetFlag(FLAGS_sac_failure_priority_min_hist_probes);
       solver.SetFailurePriorityConfig(fp);
+
+      // P0-2: NSAC allowed-constraints mask
+      GModelSolver::NSACMaskConfig nsac_mask;
+      nsac_mask.enabled = absl::GetFlag(FLAGS_sac_nsac_mask);
+      solver.SetNSACMaskConfig(nsac_mask);
     }
   }
 
@@ -202,6 +209,7 @@ int main(int argc, char** argv) {
     std::cerr << "  --sac_stage=X     SAC Stage 选择: auto|stage1|stage2" << std::endl;
     std::cerr << "  --sac_mode=X      SAC 模式: sac1|sac3" << std::endl;
     std::cerr << "  --sac_failure_priority   SAC3: 失败概率优先调度（分桶队列）" << std::endl;
+    std::cerr << "  --sac_nsac_mask          P0-2: NSAC allowed-constraints mask（默认启用）" << std::endl;
     return 1;
   }
 

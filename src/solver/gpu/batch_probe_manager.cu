@@ -1180,6 +1180,16 @@ void Batch2PersistentManager::LaunchPersistentBlocksKernel() {
   d_control_->quantum_cid = quantum_cid_;
   d_control_->enable_quantum_check = quantum_check_enabled_ ? 1 : 0;
 
+  // P0-2 NEW: NSAC allowed-constraints mask
+  if (model_->IsNSACMaskEnabled() && model_->IsAllowedMasksBuilt()) {
+    const auto& data = model_->GetGModelDataView();
+    d_control_->allowed_masks = data.allowed_masks;
+    d_control_->constraint_bitmap_words = data.constraint_bitmap_words;
+  } else {
+    d_control_->allowed_masks = nullptr;
+    d_control_->constraint_bitmap_words = 0;
+  }
+
   // Precheck 统计（如果 precheck 启用）
   if (precheck_enabled_ && d_precheck_short_circuit_count_) {
     *d_precheck_short_circuit_count_ = 0;  // 重置计数器

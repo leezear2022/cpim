@@ -76,6 +76,10 @@ struct GModelData {
   const int2*  constraint_scopes;
   const uint3* d_subscription;
   const int*   d_subscription_offset;
+
+  // P0-2: NSAC allowed-constraints mask
+  const u32*   allowed_masks;           // [num_vars * constraint_bitmap_words]
+  int          constraint_bitmap_words; // (num_constraints + 31) / 32
 };
 
 // ============================================================================
@@ -177,6 +181,16 @@ class GModel {
   int bitmap_size_words = 0;                // Bitmap 字数 = (num_constraints + 31) / 32
 
   // ========================================================================
+  // P0-2: NSAC allowed-constraints mask（统一内存）
+  // 用途：限制 singleton test 的传播范围到 Xi + N(Xi) 诱导子图
+  // 布局：d_allowed_masks[focal_var * constraint_bitmap_words + cid/32]
+  //       位 (cid % 32) = 1 表示约束 cid 对 focal_var 的 probe 是 allowed
+  // ========================================================================
+  u32* d_allowed_masks = nullptr;           // [num_vars * constraint_bitmap_words]
+  int constraint_bitmap_words = 0;          // = (num_constraints + 31) / 32
+  bool nsac_mask_enabled = false;           // 运行时开关
+
+  // ========================================================================
   // 持久化 Kernel 控制资源（Cooperative Groups）
   // ========================================================================
   PersistentGACControl* d_persistent_control = nullptr;  // 持久化控制块
@@ -233,6 +247,22 @@ class GModel {
 
   // 获取 GModel 数据视图（传入 kernel 使用）
   GModelData GetGModelDataView() const;
+
+  // ========================================================================
+  // P0-2: NSAC allowed-constraints mask
+  // ========================================================================
+
+  // 构建 NSAC allowed-constraints mask（一次性预计算）
+  // 对每个变量 Xi，计算其邻域 S_i = {Xi} ∪ neighbors(Xi)
+  // 约束 cid(u,v) 在 Xi 的 allowed_mask 中置位当且仅当 u,v ∈ S_i
+  void BuildAllowedMasks();
+
+  // 检查 NSAC mask 是否已构建
+  bool IsAllowedMasksBuilt() const { return d_allowed_masks != nullptr; }
+
+  // 设置 NSAC mask 启用状态
+  void SetNSACMaskEnabled(bool enabled) { nsac_mask_enabled = enabled; }
+  bool IsNSACMaskEnabled() const { return nsac_mask_enabled; }
 
   // ========================================================================
   // Phase 1.2: Trail 回溯支持（单层域 + Trail）

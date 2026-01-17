@@ -142,7 +142,7 @@ class GModelSolver {
   }
 
   // ========== SAC3: 失败概率优先调度（P0-1d） ==========
-  // 目标：把“更可能 DWO”的 probe 更早跑完，让删值尽早发生，从而降低后续传播成本并抑制长尾。
+  // 目标：把"更可能 DWO"的 probe 更早跑完，让删值尽早发生，从而降低后续传播成本并抑制长尾。
   // 注意：这只改变 probe 的调度顺序，不改变 soundness 语义（只对 kDWO 删值）。
   struct FailurePriorityConfig {
     bool enabled = false;       // 总开关（关闭则回退 FIFO）
@@ -158,6 +158,21 @@ class GModelSolver {
   }
   const FailurePriorityConfig& GetFailurePriorityConfig() const {
     return failure_priority_config_;
+  }
+
+  // ========== P0-2: NSAC allowed-constraints mask ==========
+  // singleton test 的传播严格限制在 Xi + N(Xi) 诱导子图（真正的 NSAC）
+  // 启用后会预计算每个 focal variable 的 allowed constraints 位图，
+  // GPU 端 frontier 扩张时做 bit AND 过滤，严格限制传播范围。
+  struct NSACMaskConfig {
+    bool enabled = true;  // 总开关（关闭则回退到全图传播）
+  };
+
+  void SetNSACMaskConfig(const NSACMaskConfig& config) {
+    nsac_mask_config_ = config;
+  }
+  const NSACMaskConfig& GetNSACMaskConfig() const {
+    return nsac_mask_config_;
   }
 
   // MSAC 配置（搜索中的条件触发 SAC）
@@ -196,6 +211,7 @@ class GModelSolver {
   // SAC3 延后复查队列配置（P0-1c）
   DeferredRecheckConfig deferred_recheck_config_;
   FailurePriorityConfig failure_priority_config_;
+  NSACMaskConfig nsac_mask_config_;  // P0-2: NSAC allowed-constraints mask
 
   // 递归搜索（DFS + MAC）
   // 返回 true 表示找到解或达到最大解数量

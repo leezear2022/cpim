@@ -4,6 +4,7 @@
 #include <cstring>  // for memset (统一内存直接操作)
 #include <iostream>
 #include <stdexcept>
+#include <unordered_set>  // P0-2: BuildAllowedMasks
 #include <utility>
 #include <vector>
 
@@ -149,6 +150,11 @@ GModel::GModel(GModel&& other) noexcept
       cuArray3D_BitSup(other.cuArray3D_BitSup),
       assigned_size_(other.assigned_size_) {
   // Take ownership of resources
+  // P0-2: NSAC allowed-constraints mask
+  d_allowed_masks = other.d_allowed_masks;
+  constraint_bitmap_words = other.constraint_bitmap_words;
+  nsac_mask_enabled = other.nsac_mask_enabled;
+
   other.bitDom = nullptr;
   other.d_cur_dom_size = nullptr;
   other.trail_ = nullptr;
@@ -161,6 +167,10 @@ GModel::GModel(GModel&& other) noexcept
   other.constraint_scopes = nullptr;
   other.cuArray3D_BitSup = nullptr;
   other.assigned_size_ = 0;
+  // P0-2
+  other.d_allowed_masks = nullptr;
+  other.constraint_bitmap_words = 0;
+  other.nsac_mask_enabled = false;
 }
 
 GModel& GModel::operator=(GModel&& other) noexcept {
@@ -199,6 +209,12 @@ GModel& GModel::operator=(GModel&& other) noexcept {
     cuArray3D_BitSup = other.cuArray3D_BitSup;
     assigned_size_ = other.assigned_size_;
 
+    // P0-2: NSAC allowed-constraints mask
+    if (d_allowed_masks) cudaFree(d_allowed_masks);
+    d_allowed_masks = other.d_allowed_masks;
+    constraint_bitmap_words = other.constraint_bitmap_words;
+    nsac_mask_enabled = other.nsac_mask_enabled;
+
     other.bitDom = nullptr;
     other.d_cur_dom_size = nullptr;
     other.trail_ = nullptr;
@@ -211,6 +227,10 @@ GModel& GModel::operator=(GModel&& other) noexcept {
     other.constraint_scopes = nullptr;
     other.cuArray3D_BitSup = nullptr;
     other.assigned_size_ = 0;
+    // P0-2
+    other.d_allowed_masks = nullptr;
+    other.constraint_bitmap_words = 0;
+    other.nsac_mask_enabled = false;
   }
   return *this;
 }
@@ -2645,10 +2665,25 @@ void Batch2ProbeKernel_PersistentBlocks(
       const int start = model.d_subscription_offset[var_id];
       const int end = model.d_subscription_offset[var_id + 1];
 
+      // P0-2: NSAC mask 过滤 - 只激活邻域内的约束
+      const u32* allowed_masks = control->allowed_masks;
+      const int cbw = control->constraint_bitmap_words;
+      const int focal_var = var_id;  // focal_var 就是被 probe 的变量
+
       // 所有线程并行处理邻接约束
       for (int i = start + threadIdx.x; i < end; i += blockDim.x) {
         const int cid = model.d_subscription[i].z;
-        atomicOr(&ws->frontier_A[cid / 32], 1u << (cid % 32));
+        // P0-2: 检查 NSAC mask（如果启用）
+        bool allowed = true;
+        if (allowed_masks != nullptr && cbw > 0) {
+          const int word_idx = cid / 32;
+          const int bit_idx = cid % 32;
+          const u32 mask_word = allowed_masks[focal_var * cbw + word_idx];
+          allowed = (mask_word & (1u << bit_idx)) != 0;
+        }
+        if (allowed) {
+          atomicOr(&ws->frontier_A[cid / 32], 1u << (cid % 32));
+        }
       }
 
       // thread 0 设置 frontier_nonempty 标志
@@ -2780,6 +2815,11 @@ void GModel::FreeGPUResources() {
     cudaFree(d_queue_bitmap_B);
     d_queue_bitmap_B = nullptr;
   }
+  // P0-2: NSAC allowed-constraints mask
+  if (d_allowed_masks) {
+    cudaFree(d_allowed_masks);
+    d_allowed_masks = nullptr;
+  }
 }
 
 // ============================================================================
@@ -2814,6 +2854,88 @@ void GModel::FreeGPUResources_Persistent() {
   FreeGPUResources();
 }
 
+// ============================================================================
+// P0-2: NSAC allowed-constraints mask 预计算
+// ============================================================================
+
+void GModel::BuildAllowedMasks() {
+  if (d_allowed_masks != nullptr) {
+    return;  // 已经构建
+  }
+
+  // 计算位图字数
+  constraint_bitmap_words = (num_constraints + 31) / 32;
+  const size_t total_words = static_cast<size_t>(num_vars) * constraint_bitmap_words;
+
+  if (total_words == 0) {
+    LOG(WARNING) << "[GModel::BuildAllowedMasks] No constraints, skipping mask build";
+    return;
+  }
+
+  // 分配统一内存
+  cudaError_t err = cudaMallocManaged(&d_allowed_masks, total_words * sizeof(u32));
+  if (err != cudaSuccess) {
+    LOG(ERROR) << "[GModel::BuildAllowedMasks] Failed to allocate d_allowed_masks: "
+               << cudaGetErrorString(err);
+    throw std::runtime_error(
+        "[GModel::BuildAllowedMasks] Failed to allocate d_allowed_masks: " +
+        std::string(cudaGetErrorString(err)));
+  }
+
+  // 初始化为 0
+  memset(d_allowed_masks, 0, total_words * sizeof(u32));
+
+  // 构建每个变量的邻域集合（使用 var_to_constraints）
+  // 对于每个 focal_var Xi：
+  //   S_i = {Xi} ∪ { 所有与 Xi 共享约束的变量 }
+  // 对于每个约束 cid(u, v)：
+  //   如果 u ∈ S_i 且 v ∈ S_i，则设置 allowed_mask[Xi][cid]
+
+  for (int focal_var = 0; focal_var < num_vars; ++focal_var) {
+    // 构建 S_i（邻域集合）
+    std::unordered_set<int> neighborhood;
+    neighborhood.insert(focal_var);
+
+    // 遍历 focal_var 参与的所有约束
+    if (focal_var < static_cast<int>(var_to_constraints.size())) {
+      for (int cid : var_to_constraints[focal_var]) {
+        // 添加约束中的所有变量到邻域
+        if (cid < static_cast<int>(constraint_scopes_cpu.size())) {
+          for (int v : constraint_scopes_cpu[cid]) {
+            neighborhood.insert(v);
+          }
+        }
+      }
+    }
+
+    // 遍历所有约束，检查是否两端都在 S_i 中
+    for (int cid = 0; cid < num_constraints; ++cid) {
+      if (cid >= static_cast<int>(constraint_scopes_cpu.size())) continue;
+
+      const auto& scope = constraint_scopes_cpu[cid];
+      if (scope.size() != 2) continue;  // 只处理二元约束
+
+      const int u = scope[0];
+      const int v = scope[1];
+
+      // 如果 u 和 v 都在邻域中，设置位
+      if (neighborhood.count(u) && neighborhood.count(v)) {
+        const int word_idx = cid / 32;
+        const int bit_idx = cid % 32;
+        d_allowed_masks[focal_var * constraint_bitmap_words + word_idx] |=
+            (1u << bit_idx);
+      }
+    }
+  }
+
+  // 同步确保 CPU 写入完成
+  cudaDeviceSynchronize();
+
+  LOG(INFO) << "[GModel::BuildAllowedMasks] Built NSAC masks: "
+            << num_vars << " vars × " << constraint_bitmap_words << " words = "
+            << (total_words * sizeof(u32)) << " bytes";
+}
+
 GModelData GModel::GetGModelDataView() const {
   GModelData md;
   md.num_vars = num_vars;
@@ -2829,6 +2951,11 @@ GModelData GModel::GetGModelDataView() const {
   md.constraint_scopes = constraint_scopes;
   md.d_subscription = d_subscription;
   md.d_subscription_offset = d_subscription_offset;
+
+  // P0-2: NSAC allowed-constraints mask
+  md.allowed_masks = d_allowed_masks;
+  md.constraint_bitmap_words = constraint_bitmap_words;
+
   return md;
 }
 

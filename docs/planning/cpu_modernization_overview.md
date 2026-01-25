@@ -48,7 +48,7 @@
 - 过渡到 Modern CMake：使用 `target_sources`、`target_include_directories`、`target_link_libraries` 管理依赖，清理重复条目，增加 `CMAKE_CXX_STANDARD 20` 和统一警告级别。
 - 建立测试与基准体系：在 `tests/` 引入 GTest，配合轻量级 XCSP3 样例覆盖新的策略与数据结构；添加 `ctest`/`benchmark` 钩子。
 - 日志与配置抽象：统一 Logger 接口（适配 glog/空实现），支持按需开关调试输出；提供配置文件或命令行解析模块化配置。
-- 风格与文档：统一命名、删除死代码、补充 Doxygen 或 Markdown 说明；在 `gemini_doc` 继续维护设计决策记录。
+- 风格与文档：统一命名、删除死代码、补充 Doxygen 或 Markdown 说明；将讨论稿/实验记录归档在 `docs/archive/`（例如 `docs/archive/batch_ac_versions/`），避免与现行实现混淆。
 
 ### 3. 建议的实施路线
 1. **基础清理**：去除 `using namespace`、枚举强类型化、修复 `switch` fallthrough、补齐 `[[nodiscard]]` 等低风险改动，同时引入统一编码规范。
@@ -62,6 +62,6 @@
 - **编译器/标准库要求**：推荐默认 C++20，评估 Clang/GCC/MSVC 支持；对协程、`std::expected` 等特性视团队与环境逐步启用。
 - **迁移策略**：采用 feature flag/配置切换，逐模块迁移，保留旧路径以便回退；关键改动后运行 `ctest` 与基准对照。
 - **性能监控**：为 Trail、残基、SoA 等大变更准备基准工具，记录 CPU/GPU 模式下的差异，避免性能回退。
-- **知识沉淀**：持续补充 `gemini_doc`，记录设计决策、实验结果与 TODO，降低团队沟通成本。
+- **知识沉淀**：持续补充 `docs/archive/` 的讨论稿/实验记录，记录设计决策、实验结果与 TODO，降低团队沟通成本。
 
 > 以上内容整合自 `code_improvement_suggestions.md`、`cpp_modernization_suggestions.md`、`cpu_modernization_survey.md` 与 `gemini_proposal.md`，仅作为后续重构讨论的统一参考稿。

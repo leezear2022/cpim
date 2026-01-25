@@ -1,6 +1,6 @@
 ---
 status: active
-updated: 2026-01-17
+updated: 2026-01-25
 ---
 
 # TODO：SACGPU / Batch-AC 下一阶段工作备忘（2026-01）
@@ -37,10 +37,24 @@ updated: 2026-01-17
 - ✅ P0-1b：Stage2 已支持工作量子（quantum）检查基础设施（默认关闭）。
 - ✅ P0-1c：SAC3 已接入 deferred recheck（UNKNOWN 入队，邻域 epoch 变化后重检）。
 - ✅ P0-1d（V1）：SAC3 ProbeQueue 支持 failure-priority 分桶调度（dom/deg/hist DWO，默认关闭）。
-- ⚠️ “真 NSAC”的 `allowed-constraints mask` 未落地（当前仍是“邻域激活”，但不做子图过滤）。
-- ⚠️ Batch-3A（约束聚合）内核与 Manager 已有实现/测试，但未接入 solver 主路径。
+- ✅ P0-2：NSAC `allowed-constraints mask` 已落地（singleton test 传播限制到 `Xi + N(Xi)` 诱导子图）。
+- ✅ Batch-3A（约束聚合）已接入 solver 主路径（gating + 运行时开关）；但在当前测试用例上评估慢 10–25x，
+  建议默认关闭，仅保留用于消融/复测。
 - ❌ bitGEMM（lane→world 的内核形态 / DomSoA 数据布局）未落地。
 - ❌ `bmma_sync(b1, AND+POPC)` 未落地（仅在计划文档中提及）。
+
+### 2.1 对照 `SACGPU_DESIGN.md` 的 “flatten” 三层现状
+
+- ✅ **Probe-level flatten**：已落地（Batch-2 Stage2 persistent blocks + Stage auto）。
+- ✅/⚠️ **Constraint-level flatten**：Batch-3A 已可跑且已接主路径，但当前评测显示慢 10–25x，默认应保持关闭。
+- ❌ **Word/value-level flatten**：Batch-3D（更细粒度任务打散）尚未进入主线实现。
+
+### 2.2 Preprocess 评测/回归基线现状（面向“推理能力”口径）
+
+- ✅ 已建立 “可中断/可续跑/CSV 输出” 的 preprocess 跑批工具链（`select_sac_preprocess_benches.py`、`batch_sac_benchmark.py`）。
+- ✅ 已引入更适合“每次改动都跑”的 **回归/性能哨兵 suite**（`--suite=regression/perf`）。
+- ⚠️ `status=TIMEOUT` 在 preprocess CSV 里通常表示 **`max_sac_rounds` 用尽未收敛**，不等价于 wall-time 超时（wall-time 由 `--timeout` 控制）。
+- ⚠️ 已知异常样例（用于扫描时 exclude）：`benchmarks/graphs/graphw-*`（解析/输出不稳定）；`benchmarks/marc/large-92-unsat_ext.xml` 在 Orin 8G 上可能 OOM。
 
 ## 3. TODO 清单（按优先级与依赖排序）
 
@@ -126,43 +140,65 @@ updated: 2026-01-17
     - per-bucket `dwo_hit_rate` 单调递减（否则说明评分无效）
     - `enable_failure_priority=false` 时行为回退到当前 FIFO（便于消融）
 
-- [ ] **P0-2：NSAC 的 `allowed-constraints mask`（真邻域子图）**
+- [x] **P0-2：NSAC 的 `allowed-constraints mask`（真邻域子图）**（已落地）
   - 目标：singleton test 的传播严格限制在 `Xi + N(Xi)` 诱导子图（NSACQ/NSAC）。
   - 交付：
-    - CPU 端预计算 `allowed_cmask[focal_var][cid]`（位图 words）
-    - GPU 端：frontier init / `PropagateVarToNextBitmap` 增加过滤（按 focal_var 选择 mask）
+    - CPU 端预计算 `allowed_masks[focal_var][cid]`（位图 words）
+    - GPU 端：frontier init + frontier 扩张（`PropagateVarToNextBitmap`）按 focal_var 做 mask 过滤
   - 验收：在同一 budget 下，平均 probe iters/work 下降；UNKNOWN 比例可控；结果 sound。
 
-- [ ] **P0-3：统一观测入口（最小可用）**
+- [x] **P0-3：统一观测入口（最小可用）**（已落地）
   - 目标：能用同一套统计口径对比 Stage1/Stage2/SAC1/SAC3/（未来 Batch3A）。
   - 交付：
     - 至少支持：每批 probes 的 `num_probes / dwo / unknown / avg/p95 iters / time_ms`
     - Python 脚本输出 CSV（tier0 即可）。
+  - 现状（已完成）：
+    - `apps/sac_benchmark.cpp` 增加 preprocess 模式：`--mode=sac1_preprocess` / `--mode=sac3_preprocess`，并统一输出字段：
+      `Total time/Total probes/Total deletions/Avg/P95/Max iterations/Unknown probes/Status`。
+    - `tests/python/select_sac_preprocess_benches.py` / `tests/python/batch_sac_benchmark.py` 支持 `--mode`，CSV 增加 `mode/p95_iterations` 字段。
+    - 现在 suite/脚本可直接 A/B：`full_sac(stage2)` vs `sac3_preprocess(flatten nsacq/sacq)`（同一口径、同一解析器）。
 
 ### P1：主线增强（把长尾变可控、把并行度吃满）
 
-- [ ] **P1-1：把 Batch-3A 接入 solver 主路径（可选加速器）**
+- [x] **P1-1：把 Batch-3A 接入 solver 主路径（可选加速器）**（最小风险接入已落地）
   - 目标：在“欠饱和/负载不均衡”场景，允许用 Batch-3A（约束聚合）顶上。
   - 依赖：
     - **P0-1**（`UNKNOWN` 语义）：否则无法定义“budget hit → 不删 → 回退”的安全行为。
     - **P0-3**（统计基础设施）：否则无法做“欠饱和检测 → 启用/回退策略”的数据闭环。
+  - 最小风险 gating（本次落地）：
+    - `nsac_mask_enabled=true` 时 **禁用 Batch-3A 并回退 Stage2**，保证默认路径始终是“真 NSAC”。
+    - 提供运行时开关 `--sac_use_batch3a`（仅在 `nsac_mask=false` 时可生效）。
+    - Batch-3A 结束后若 `active_world_mask` 仍有 bit，则视为 `UNKNOWN`（不删、可进入 deferred recheck）。
   - 启用条件（建议先保守）：
     - `bitSup` 可放入 shared memory（已有判断）
     - `world_mask popcount` 均值/分位数达到阈值（避免聚合无收益）
   - 回退：不满足条件时回退 Stage2（Persistent Blocks）。
   - 验收：在长尾实例上 p99 时间下降或吞吐更稳定；结果一致。
+  - 现状评估：在当前测试用例上 A/B 测试显示 Batch-3A 相比 Stage2 慢 10–25x，建议保持 default-off，
+    仅保留 `--sac_use_batch3a` 用于消融与未来复测（以数据驱动决定是否继续投入）。
   - 代码落点（建议）：
     - solver 侧入口：`src/solver/gpu/GModelSolver.cu`（SAC1/SAC3/MSAC 的 stage 选择点）
     - manager/kernel：`include/solver/gpu/batch_probe_manager.h`、`src/solver/gpu/batch_probe_manager.cu`、
       `src/solver/gpu/GModel.cu`（Batch3A wrapper/kernel）
 
-- [ ] **P1-2：预算双阀门（per-probe + 外层 queue）工程化**
-  - 目标：让 SAC3/MSAC 在难例上可控结束，并把 UNKNOWN 语义贯穿到统计与回退策略。
-  - 交付：queue-level budget（max_total_probes/max_queue_len/max_requeue 等）。
+- [x] **P1-2：预算双阀门（per-probe + 外层 queue）工程化**（已落地）
+  - 目标：让 SAC3 在难例上可控结束，并把 UNKNOWN 语义贯穿到统计与回退策略（宁可少删，不许多删）。
+  - 交付（已完成）：
+    - `include/GModelSolver.h`：新增 `GModelSolver::SacQueueBudgetConfig`（max_total_probes/max_queue_size/max_total_requeues/max_requeues_per_var）。
+    - `src/solver/gpu/GModelSolver.cu`：
+      - SAC3 支持 `max_total_probes`（到达上限则 early_stop，语义与现有 TIMEOUT 对齐）。
+      - ProbeQueue 支持 `max_queue_size`（溢出丢弃新入队）与 requeue 上限（停止/跳过邻域扩张）。
+    - `apps/sac_benchmark.cpp`：preprocess 模式增加可配置 flags（`--sac_max_total_probes/--sac_max_queue_size/...`）。
+  - 验收：budget 打开/关闭均不影响 soundness；开启极小预算时只会少删（早停/丢弃入队），不会多删。
 
-- [ ] **P1-3：ProbePool 2.0（跨变量混 batch + 分桶）**
-  - 目标：解决“单变量域小导致 GPU 欠饱和”；并对难 probe 降预算避免拖慢。
-  - 交付：target batch size、简单分桶（按 dom_size/历史 iters）。
+- [x] **P1-3：ProbePool 2.0（跨变量混 batch + 分桶）**（已落地：Stage 选择“分桶缓存”）
+  - 目标：解决“任务规模变化导致 AutoStageSelector 缓存污染”，避免出现“第一次大 batch → 后续小 batch 也被迫 Stage2”
+    的欠饱和/高开销情况。
+  - 交付（已完成）：
+    - `include/solver/gpu/batch_probe_manager.h` / `src/solver/gpu/batch_probe_manager.cu`：
+      - `AutoStageSelector::DecideCached()` 改为 **按任务量分桶缓存（medium/large）**；
+      - 每次调用先走 `DecideByTaskCount()`：小任务直接 Stage1，不再受缓存影响。
+  - 备注：该改动对 SAC1/SAC3/MSAC 的 “Stage 1 vs Stage 2” 自适应选择更鲁棒；无需改动 kernel 语义。
 
 ### P2：bitGEMM/算子形态（以数据驱动决定是否推进重构）
 
@@ -194,4 +230,5 @@ updated: 2026-01-17
 ## 4. 最小回归清单（每次合并前必跑）
 
 - `python3 tests/python/batch_test_v2.py --tier=0`
+- `python3 tests/python/batch_test_v3.py --tier=0`（CPIM CPU vs CPIM GPU vs OR-Tools CP）
 - `tests/cpp/test_stage2_persistent.cpp` / `tests/cpp/test_batch3a.cpp`（按需）

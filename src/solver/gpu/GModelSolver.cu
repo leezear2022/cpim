@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <deque>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -119,8 +120,11 @@ GpuSearchStatistics GModelSolver::Solve(int time_limit) {
   }
 
   // 递归搜索
-  const double start_time = timer.elapsed() / 1000.0;
-  Search(0, stats, time_limit, start_time);
+  const auto deadline =
+      (time_limit > 0)
+          ? (std::chrono::steady_clock::now() + std::chrono::milliseconds(time_limit))
+          : std::chrono::steady_clock::time_point::max();
+  Search(0, stats, time_limit, deadline);
 
   stats.solve_time = timer.elapsed() / 1000.0;
   stats.num_solutions = static_cast<int>(solutions_.size());
@@ -142,15 +146,11 @@ GpuSearchStatistics GModelSolver::Solve(int time_limit) {
 }
 
 bool GModelSolver::Search(int level, GpuSearchStatistics& stats, int time_limit,
-                          double start_time) {
+                          std::chrono::steady_clock::time_point deadline) {
   // 超时检查
-  if (time_limit > 0) {
-    Timer temp_timer;
-    const double elapsed = temp_timer.elapsed() / 1000.0 - start_time;
-    if (elapsed * 1000 >= time_limit) {
-      stats.time_out = true;
-      return true;  // 停止搜索
-    }
+  if (time_limit > 0 && std::chrono::steady_clock::now() >= deadline) {
+    stats.time_out = true;
+    return true;  // 停止搜索
   }
 
   // Phase 1.2: 移除 level 参数
@@ -197,7 +197,8 @@ bool GModelSolver::Search(int level, GpuSearchStatistics& stats, int time_limit,
 
     // GAC 传播
     Timer gac_timer;
-    GacStats gac_stats = model_->EnforceGAC(false);  // 不打印详细信息
+    // 增量 GAC：只激活刚赋值变量的邻接约束，减少搜索阶段传播开销
+    GacStats gac_stats = model_->EnforceGAC(false, var);  // 不打印详细信息
     stats.gac_time += gac_timer.elapsed() / 1000.0;
     stats.gac_iterations += gac_stats.iterations;
     stats.gac_deletions += gac_stats.deletions;
@@ -242,7 +243,7 @@ bool GModelSolver::Search(int level, GpuSearchStatistics& stats, int time_limit,
     last_level_positives_ = 0;
 
     // 递归搜索
-    const bool should_stop = Search(new_level, stats, time_limit, start_time);
+    const bool should_stop = Search(new_level, stats, time_limit, deadline);
 
     // 恢复上层统计
     last_level_failures_ = prev_failures;
@@ -405,21 +406,30 @@ class ProbeQueue {
  public:
   static constexpr int kBitsPerWord = 32;
 
+  struct BudgetStats {
+    int dropped_by_queue_cap = 0;  // max_queue_size 丢弃数
+    int requeue_skipped = 0;       // 重入队上限导致的跳过数（按变量）
+    int total_requeues = 0;        // 已发生的重入队次数（按变量事件计数）
+  };
+
   ProbeQueue(GModel* model,
              const NeighborCSR& neighbor_csr,
              const GModelSolver::FailurePriorityConfig& config,
+             const GModelSolver::SacQueueBudgetConfig& budget_config,
              const std::vector<int>* var_probe_count,
              const std::vector<int>* var_dwo_count)
       : model_(model),
         num_vars_(model->num_vars),
         neighbor_csr_(neighbor_csr),
         config_(config),
+        budget_config_(budget_config),
         var_probe_count_(var_probe_count),
         var_dwo_count_(var_dwo_count) {
     // 计算每变量需要的 word 数
     words_per_var_ = (model_->max_dom_size + kBitsPerWord - 1) / kBitsPerWord;
     // 分配位打包数组：num_vars * words_per_var
     in_queue_bits_.resize(num_vars_ * words_per_var_, 0);
+    requeue_count_.assign(num_vars_, 0);
 
     if (config_.enabled) {
       num_buckets_ = std::clamp(config_.num_buckets, 1, 16);
@@ -466,6 +476,12 @@ class ProbeQueue {
     const uint32_t mask = 1u << (val % kBitsPerWord);
     if (in_queue_bits_[idx] & mask) return false;  // 已在队列中
 
+    if (budget_config_.enabled && budget_config_.max_queue_size > 0 &&
+        static_cast<int>(size_) >= budget_config_.max_queue_size) {
+      budget_stats_.dropped_by_queue_cap++;
+      return false;
+    }
+
     if (config_.enabled) {
       const int bucket = ComputeBucket(var);
       buckets_[bucket].emplace_back(var, val);
@@ -485,6 +501,23 @@ class ProbeQueue {
          p != neighbor_csr_.GetNeighborsEnd(var); ++p) {
       const int neighbor = *p;
       if (model_->IsAssigned(neighbor)) continue;
+
+      // P1-2: 重入队预算（以“邻域事件”为粒度，避免 requeue 爆炸）
+      if (budget_config_.enabled) {
+        if (budget_config_.max_total_requeues > 0 &&
+            budget_stats_.total_requeues >= budget_config_.max_total_requeues) {
+          // 达到总重入队上限：停止继续扩张（sound but incomplete）
+          return;
+        }
+        if (budget_config_.max_requeues_per_var > 0 &&
+            requeue_count_[neighbor] >= budget_config_.max_requeues_per_var) {
+          budget_stats_.requeue_skipped++;
+          continue;
+        }
+        requeue_count_[neighbor]++;
+        budget_stats_.total_requeues++;
+      }
+
       for (int val = model_->GetFirstValue(neighbor); val != -1;
            val = model_->GetNextValue(neighbor, val)) {
         Enqueue(neighbor, val);
@@ -539,11 +572,14 @@ class ProbeQueue {
   // 队列大小
   size_t Size() const { return size_; }
 
+  const BudgetStats& GetBudgetStats() const { return budget_stats_; }
+
   // 清空队列
   void Clear() {
     queue_.clear();
     for (auto& q : buckets_) q.clear();
     std::fill(in_queue_bits_.begin(), in_queue_bits_.end(), 0);
+    std::fill(requeue_count_.begin(), requeue_count_.end(), 0);
     size_ = 0;
   }
 
@@ -615,6 +651,9 @@ class ProbeQueue {
 
   size_t size_ = 0;
   GModelSolver::FailurePriorityConfig config_;
+  GModelSolver::SacQueueBudgetConfig budget_config_;  // P1-2: 外层队列预算（拷贝）
+  std::vector<int> requeue_count_;                    // [num_vars] 重入队次数（按变量）
+  BudgetStats budget_stats_;
   const std::vector<int>* var_probe_count_ = nullptr;
   const std::vector<int>* var_dwo_count_ = nullptr;
   int num_buckets_ = 1;
@@ -780,6 +819,13 @@ int GModelSolver::EnforceSAC1(GpuSearchStatistics& stats) {
   int round = 0;
   unsigned long long total_precheck_short_circuits = 0;  // precheck 短路总数
 
+  // P0-3: reset probe-level stats cache (used by preprocess benchmark)
+  last_sac_probe_iterations_.clear();
+  last_sac_total_iterations_ = 0;
+  last_sac_max_iterations_ = 0;
+  last_sac_unknown_probes_ = 0;
+  last_sac_early_stopped_ = false;
+
   if (verbose_) {
     std::cout << "\n=== SAC1 预处理开始 ===" << std::endl;
   }
@@ -798,6 +844,17 @@ int GModelSolver::EnforceSAC1(GpuSearchStatistics& stats) {
   Batch2PersistentManager stage2_manager(model_, -1);  // auto num_blocks
   stage2_manager.SetChunkSize(1);
   stage2_manager.EnablePrecheck(true);  // 启用 cheap precheck
+  stage2_manager.EnableStats(collect_sac_probe_stats_);
+
+  auto AppendProbeIterations = [&](const std::vector<int>& iters) {
+    if (!collect_sac_probe_stats_ || iters.empty()) return;
+    last_sac_probe_iterations_.insert(last_sac_probe_iterations_.end(),
+                                      iters.begin(), iters.end());
+    for (int v : iters) {
+      last_sac_total_iterations_ += v;
+      if (v > last_sac_max_iterations_) last_sac_max_iterations_ = v;
+    }
+  };
 
   // 预分配任务容量（减少运行时重新分配）
   const int estimated_tasks = model_->num_vars * model_->max_dom_size;
@@ -892,6 +949,7 @@ int GModelSolver::EnforceSAC1(GpuSearchStatistics& stats) {
       }
       stage1_manager.ExecuteMicroBatch(failed_vars, failed_values);
       precheck_short_circuits = stage1_manager.GetLastPrecheckShortCircuitCount();
+      AppendProbeIterations(stage1_manager.GetLastProbeIterations());
       stage1_manager.Clear();
     } else {
       // 使用 Stage 2 (Persistent Blocks)
@@ -900,6 +958,8 @@ int GModelSolver::EnforceSAC1(GpuSearchStatistics& stats) {
       }
       stage2_manager.ExecutePersistentBlocks(failed_vars, failed_values);
       precheck_short_circuits = stage2_manager.GetLastPrecheckShortCircuitCount();
+      AppendProbeIterations(stage2_manager.GetLastProbeIterations());
+      last_sac_unknown_probes_ += stage2_manager.GetLastStatistics().unknown_count;
       stage2_manager.Clear();
     }
     total_precheck_short_circuits += precheck_short_circuits;
@@ -972,6 +1032,7 @@ int GModelSolver::EnforceSAC1(GpuSearchStatistics& stats) {
   stats.sac_deletions = total_deletions;
   stats.sac_rounds = round;
   stats.sac_time = sac_timer.elapsed() / 1000.0;
+  last_sac_early_stopped_ = early_stopped;
 
   if (verbose_) {
     std::cout << "=== SAC1 预处理完成" << (early_stopped ? "（早停）" : "") << " ===" << std::endl;
@@ -994,6 +1055,13 @@ int GModelSolver::EnforceSAC3(GpuSearchStatistics& stats) {
   int total_deletions = 0;
   int batch_count = 0;
   unsigned long long total_precheck_short_circuits = 0;
+
+  // P0-3: reset probe-level stats cache (used by preprocess benchmark)
+  last_sac_probe_iterations_.clear();
+  last_sac_total_iterations_ = 0;
+  last_sac_max_iterations_ = 0;
+  last_sac_unknown_probes_ = 0;
+  last_sac_early_stopped_ = false;
 
   if (verbose_) {
     std::cout << "\n=== SAC3 预处理开始（无删值快路径优化）===" << std::endl;
@@ -1029,6 +1097,36 @@ int GModelSolver::EnforceSAC3(GpuSearchStatistics& stats) {
   Batch2PersistentManager stage2_manager(model_, -1);
   stage2_manager.SetChunkSize(1);
   stage2_manager.EnablePrecheck(true);
+  stage2_manager.EnableStats(collect_sac_probe_stats_);
+
+  auto AppendProbeIterations = [&](const std::vector<int>& iters) {
+    if (!collect_sac_probe_stats_ || iters.empty()) return;
+    last_sac_probe_iterations_.insert(last_sac_probe_iterations_.end(),
+                                      iters.begin(), iters.end());
+    for (int v : iters) {
+      last_sac_total_iterations_ += v;
+      if (v > last_sac_max_iterations_) last_sac_max_iterations_ = v;
+    }
+  };
+
+  // P1-1: Batch-3A 约束聚合作为可选加速器（默认关闭）
+  // 最小风险 gating：NSAC mask 开启时禁用 Batch-3A，强制回退 Stage2（保证“真 NSAC”语义一致）。
+  const bool batch3a_requested = batch3a_config_.enabled;
+  const bool nsac_enabled = model_->IsNSACMaskEnabled();
+  std::unique_ptr<Batch3AManager> batch3a_manager;
+  if (batch3a_requested) {
+    if (nsac_enabled) {
+      if (verbose_) {
+        std::cout << "[SAC3] NSAC mask enabled, Batch-3A disabled (fallback Stage2)"
+                  << std::endl;
+      }
+    } else {
+      const int max_worlds = std::clamp(batch3a_config_.max_worlds, 1, 32);
+      batch3a_manager = std::make_unique<Batch3AManager>(model_, -1, max_worlds);
+      batch3a_manager->SetActivationStrategy(1);  // NEIGHBOR_ACTIVATION
+      batch3a_manager->SetMaxIterations(stage2_manager.GetMaxIterationsPerProbe());
+    }
+  }
 
   // P0-1c：UNKNOWN probes 延后复查队列（邻域 epoch）
   DeferredProbeQueue deferred_queue(model_, deferred_recheck_config_);
@@ -1088,6 +1186,8 @@ int GModelSolver::EnforceSAC3(GpuSearchStatistics& stats) {
   // Phase 2: 仅当删值发生时切换到队列模式
   // =========================================================================
   ProbeQueue* probe_queue = nullptr;  // 延迟创建
+  ProbeQueue::BudgetStats probe_queue_budget_stats;
+  bool has_probe_queue_budget_stats = false;
   bool use_queue_mode = false;
 
   // 线性扫描状态
@@ -1108,9 +1208,9 @@ int GModelSolver::EnforceSAC3(GpuSearchStatistics& stats) {
   };
 
   // 辅助 lambda：从线性扫描收集下一批任务
-  auto CollectLinearBatch = [&]() -> bool {
+  auto CollectLinearBatch = [&](int max_count) -> bool {
     tasks.clear();
-    while (tasks.size() < static_cast<size_t>(max_batch_size)) {
+    while (tasks.size() < static_cast<size_t>(max_count)) {
       // 找到下一个有效的 (var, val) 对
       while (linear_var < model_->num_vars) {
         // 跳过已赋值变量（单例变量无需 SAC probe）
@@ -1173,12 +1273,41 @@ int GModelSolver::EnforceSAC3(GpuSearchStatistics& stats) {
       stats.sac_stage = stage;
     }
 
+    // P1-1: Batch-3A 可选加速器（仅在非 NSAC 且 batch 规模合适时启用）
+    const int num_tasks = static_cast<int>(tasks.size());
+    const bool can_use_batch3a =
+        (batch3a_manager != nullptr) &&
+        !has_deferred &&
+        (num_tasks >= batch3a_config_.min_worlds) &&
+        (num_tasks <= batch3a_manager->GetMaxWorlds()) &&
+        batch3a_manager->IsSuitableForBatch3A();
+
+    if (can_use_batch3a) {
+      for (const auto& t : tasks) {
+        batch3a_manager->AddTask(t.var_id, t.value);
+      }
+      batch3a_manager->Execute(out_failed_vars, out_failed_values,
+                               &out_unknown_vars, &out_unknown_values);
+      precheck_short_circuits = 0;
+      last_sac_unknown_probes_ += static_cast<int>(out_unknown_vars.size());
+
+      // 统计：标记本批次使用了 Batch-3A（Stage 字段仍保留 Stage2 语义，便于兼容现有打印）
+      stats.sac_stage = StageSelection::kStage2;
+      stats.sac_batch3a_batches += 1;
+      stats.sac_batch3a_probes += num_tasks;
+      stats.sac_batch3a_unknown += static_cast<int>(out_unknown_vars.size());
+
+      stats.sac_probes += num_tasks;
+      return !out_failed_vars.empty();
+    }
+
     if (stage == StageSelection::kStage1) {
       for (const auto& t : tasks) {
         stage1_manager.AddTask(t.var_id, t.value);
       }
       stage1_manager.ExecuteMicroBatch(out_failed_vars, out_failed_values);
       precheck_short_circuits = stage1_manager.GetLastPrecheckShortCircuitCount();
+      AppendProbeIterations(stage1_manager.GetLastProbeIterations());
       stage1_manager.Clear();
     } else {
       for (const auto& t : tasks) {
@@ -1187,6 +1316,8 @@ int GModelSolver::EnforceSAC3(GpuSearchStatistics& stats) {
       stage2_manager.ExecutePersistentBlocks(out_failed_vars, out_failed_values,
                                              &out_unknown_vars, &out_unknown_values);
       precheck_short_circuits = stage2_manager.GetLastPrecheckShortCircuitCount();
+      AppendProbeIterations(stage2_manager.GetLastProbeIterations());
+      last_sac_unknown_probes_ += static_cast<int>(out_unknown_vars.size());
       stage2_manager.Clear();
     }
     total_precheck_short_circuits += precheck_short_circuits;
@@ -1276,6 +1407,7 @@ int GModelSolver::EnforceSAC3(GpuSearchStatistics& stats) {
     // 创建 ProbeQueue（延迟初始化，使用构造时的共享 CSR 成员）
     if (probe_queue == nullptr) {
       probe_queue = new ProbeQueue(model_, neighbor_csr_, failure_priority_config_,
+                                   sac_queue_budget_config_,
                                    &var_probe_count, &var_dwo_count);
       if (verbose_) {
         std::cout << "[SAC3] 检测到删值，切换到队列模式" << std::endl;
@@ -1341,6 +1473,15 @@ int GModelSolver::EnforceSAC3(GpuSearchStatistics& stats) {
     // 早停检查
     if (sac_config_.early_stop_enabled) {
       double elapsed_ms = sac_timer.elapsed();
+      if (sac_config_.max_rounds > 0 && batch_count > sac_config_.max_rounds) {
+        if (verbose_) {
+          std::cout << "[SAC3] 达到最大批次数 (" << sac_config_.max_rounds
+                    << ")，停止" << std::endl;
+        }
+        early_stopped = true;
+        batch_count = sac_config_.max_rounds;
+        break;
+      }
       if (elapsed_ms >= sac_config_.time_budget_ms) {
         if (verbose_) {
           std::cout << "[SAC3] 时间预算耗尽 (" << elapsed_ms
@@ -1352,8 +1493,26 @@ int GModelSolver::EnforceSAC3(GpuSearchStatistics& stats) {
       }
     }
 
+    // P1-2: 外层预算（总 probe 数上限）
+    int linear_max_batch = max_batch_size;
+    if (sac_queue_budget_config_.enabled &&
+        sac_queue_budget_config_.max_total_probes > 0) {
+      const int remaining =
+          sac_queue_budget_config_.max_total_probes - stats.sac_probes;
+      if (remaining <= 0) {
+        if (verbose_) {
+          std::cout << "[SAC3] 达到总 probe 上限 ("
+                    << sac_queue_budget_config_.max_total_probes
+                    << ")，停止" << std::endl;
+        }
+        early_stopped = true;
+        break;
+      }
+      linear_max_batch = std::min(linear_max_batch, remaining);
+    }
+
     // 收集任务
-    if (!CollectLinearBatch()) break;
+    if (!CollectLinearBatch(linear_max_batch)) break;
 
     // 本批次不是 deferred probes
     task_from_deferred.assign(tasks.size(), 0);
@@ -1407,6 +1566,14 @@ int GModelSolver::EnforceSAC3(GpuSearchStatistics& stats) {
       // 早停检查
       if (sac_config_.early_stop_enabled) {
         double elapsed_ms = sac_timer.elapsed();
+        if (sac_config_.max_rounds > 0 && batch_count >= sac_config_.max_rounds) {
+          if (verbose_) {
+            std::cout << "[SAC3] 达到最大批次数 (" << sac_config_.max_rounds
+                      << ")，停止" << std::endl;
+          }
+          early_stopped = true;
+          break;
+        }
         if (elapsed_ms >= sac_config_.time_budget_ms) {
           if (verbose_) {
             std::cout << "[SAC3] 时间预算耗尽 (" << elapsed_ms
@@ -1418,6 +1585,24 @@ int GModelSolver::EnforceSAC3(GpuSearchStatistics& stats) {
         }
       }
 
+      // P1-2: 外层预算（总 probe 数上限）
+      int queue_max_batch = max_batch_size;
+      if (sac_queue_budget_config_.enabled &&
+          sac_queue_budget_config_.max_total_probes > 0) {
+        const int remaining =
+            sac_queue_budget_config_.max_total_probes - stats.sac_probes;
+        if (remaining <= 0) {
+          if (verbose_) {
+            std::cout << "[SAC3] 达到总 probe 上限 ("
+                      << sac_queue_budget_config_.max_total_probes
+                      << ")，停止" << std::endl;
+          }
+          early_stopped = true;
+          break;
+        }
+        queue_max_batch = std::min(queue_max_batch, remaining);
+      }
+
       tasks.clear();
       task_from_deferred.clear();
       task_prev_retry.clear();
@@ -1425,18 +1610,18 @@ int GModelSolver::EnforceSAC3(GpuSearchStatistics& stats) {
 
       // [1] 优先调度 deferred ready tasks
       if (deferred_queue.Enabled()) {
-        deferred_queue.CollectReadyTasks(nb_epoch, batch_count, max_batch_size,
+        deferred_queue.CollectReadyTasks(nb_epoch, batch_count, queue_max_batch,
                                          tasks, task_from_deferred,
                                          task_prev_retry);
       }
       task_bucket.assign(tasks.size(), static_cast<int8_t>(-1));
 
       // [2] regular probe queue 填充 batch（保持 GPU 吞吐）
-      if (static_cast<int>(tasks.size()) < max_batch_size && !probe_queue->Empty()) {
+      if (static_cast<int>(tasks.size()) < queue_max_batch && !probe_queue->Empty()) {
         std::vector<ProbeTask> extra;
         std::vector<int8_t> extra_bucket;
         probe_queue->DequeueBatch(
-            max_batch_size - static_cast<int>(tasks.size()),
+            queue_max_batch - static_cast<int>(tasks.size()),
             extra,
             &extra_bucket);
         for (int i = 0; i < static_cast<int>(extra.size()); ++i) {
@@ -1611,6 +1796,8 @@ int GModelSolver::EnforceSAC3(GpuSearchStatistics& stats) {
 
   // 清理 ProbeQueue（如果已创建）
   if (probe_queue != nullptr) {
+    probe_queue_budget_stats = probe_queue->GetBudgetStats();
+    has_probe_queue_budget_stats = true;
     delete probe_queue;
     probe_queue = nullptr;
   }
@@ -1618,6 +1805,7 @@ int GModelSolver::EnforceSAC3(GpuSearchStatistics& stats) {
   stats.sac_deletions = total_deletions;
   stats.sac_rounds = batch_count;
   stats.sac_time = sac_timer.elapsed() / 1000.0;
+  last_sac_early_stopped_ = early_stopped;
 
   if (verbose_) {
     std::cout << "=== SAC3 预处理完成" << (early_stopped ? "（早停）" : "")
@@ -1627,6 +1815,11 @@ int GModelSolver::EnforceSAC3(GpuSearchStatistics& stats) {
     std::cout << "  模式: " << (use_queue_mode ? "队列模式" : "快路径（无队列）")
               << std::endl;
     std::cout << "  Precheck 短路: " << total_precheck_short_circuits << std::endl;
+    if (stats.sac_batch3a_batches > 0) {
+      std::cout << "  Batch3A: batches=" << stats.sac_batch3a_batches
+                << ", probes=" << stats.sac_batch3a_probes
+                << ", unknown=" << stats.sac_batch3a_unknown << std::endl;
+    }
     std::cout << "  时间: " << stats.sac_time << "s" << std::endl;
     if (deferred_queue.Enabled()) {
       const auto& dqs = deferred_queue.GetStats();
@@ -1648,6 +1841,13 @@ int GModelSolver::EnforceSAC3(GpuSearchStatistics& stats) {
         if (b != 0) std::cout << " ";
       }
       std::cout << std::endl;
+    }
+    if (sac_queue_budget_config_.enabled && has_probe_queue_budget_stats) {
+      std::cout << "  QueueBudget: dropped_by_queue_cap="
+                << probe_queue_budget_stats.dropped_by_queue_cap
+                << ", requeue_skipped=" << probe_queue_budget_stats.requeue_skipped
+                << ", total_requeues=" << probe_queue_budget_stats.total_requeues
+                << std::endl;
     }
   }
 

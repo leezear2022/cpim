@@ -715,6 +715,7 @@ set_tests_properties(test_batch3a PROPERTIES
 add_executable(sac_benchmark
   apps/sac_benchmark.cpp
   src/solver/gpu/GModel.cu
+  src/solver/gpu/GModelSolver.cu
   src/solver/gpu/batch_probe_manager.cu
   src/model/gmodel_adapter.cu
   src/model/gmodel_validator.cu

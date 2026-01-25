@@ -699,14 +699,19 @@ class AutoStageSelector {
                                     int num_blocks = -1);
 
   // 清除缓存，下次调用 DecideCached 将重新采样
-  void ClearCache() { cache_valid_ = false; }
+  void ClearCache() {
+    cache_medium_valid_ = false;
+    cache_large_valid_ = false;
+  }
 
   // 检查是否有缓存
-  bool HasCache() const { return cache_valid_; }
+  bool HasCache() const { return cache_medium_valid_ || cache_large_valid_; }
 
   // 获取缓存的决策结果（如果有）
   const StageSelectionResult* GetCachedResult() const {
-    return cache_valid_ ? &cached_result_ : nullptr;
+    if (cache_large_valid_) return &cached_large_result_;
+    if (cache_medium_valid_) return &cached_medium_result_;
+    return nullptr;
   }
 
   // 设置阈值参数
@@ -724,8 +729,10 @@ class AutoStageSelector {
   double low_iterations_threshold_ = 3.0;  // 迭代数低于此值倾向 Stage 2
 
   // ========== 缓存 ==========
-  bool cache_valid_ = false;           // 缓存是否有效
-  StageSelectionResult cached_result_; // 缓存的决策结果
+  bool cache_medium_valid_ = false;            // 中等任务量缓存是否有效
+  bool cache_large_valid_ = false;             // 大任务量缓存是否有效
+  StageSelectionResult cached_medium_result_;  // 中等任务量的缓存结果
+  StageSelectionResult cached_large_result_;   // 大任务量的缓存结果
 
   // 获取设备 SM 数量
   int GetNumSMs() const;
@@ -834,9 +841,19 @@ class Batch3AManager {
   // 执行约束聚合批量探测
   // @param failed_vars: 输出失败的变量 ID 列表
   // @param failed_values: 输出失败的值列表
+  // @param unknown_vars: 输出 UNKNOWN 的变量 ID 列表（可为 nullptr）
+  // @param unknown_values: 输出 UNKNOWN 的值列表（可为 nullptr）
   // @return: 失败任务数
   int Execute(std::vector<int>& failed_vars,
-              std::vector<int>& failed_values);
+              std::vector<int>& failed_values,
+              std::vector<int>* unknown_vars,
+              std::vector<int>* unknown_values);
+
+  // 兼容旧接口：不收集 UNKNOWN probes
+  int Execute(std::vector<int>& failed_vars,
+              std::vector<int>& failed_values) {
+    return Execute(failed_vars, failed_values, nullptr, nullptr);
+  }
 
   // ========== 配置 ==========
   void SetActivationStrategy(int strategy) { activation_strategy_ = strategy; }
@@ -875,7 +892,9 @@ class Batch3AManager {
   // 收集结果
   int CollectResults(int num_worlds,
                      std::vector<int>& failed_vars,
-                     std::vector<int>& failed_values);
+                     std::vector<int>& failed_values,
+                     std::vector<int>* unknown_vars,
+                     std::vector<int>* unknown_values);
 
   // ========== Host 端数据 ==========
   GModel* model_ = nullptr;

@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <chrono>
 
 #include "GModel.cuh"
 #include "solver/gpu/batch_probe_manager.h"
@@ -64,6 +65,11 @@ struct GpuSearchStatistics {
   int sac_rounds = 0;        // SAC 轮次
   double sac_time = 0.0;     // SAC 总时间（秒）
   StageSelection sac_stage = StageSelection::kAuto;  // SAC 使用的 Stage
+
+  // P1-1: Batch-3A 接入主路径（统计）
+  int sac_batch3a_batches = 0;   // 使用 Batch-3A 的 batch 数
+  int sac_batch3a_probes = 0;    // Batch-3A 执行的 probes 数
+  int sac_batch3a_unknown = 0;   // Batch-3A 返回的 UNKNOWN probes 数
 };
 
 // ============================================================================
@@ -175,6 +181,42 @@ class GModelSolver {
     return nsac_mask_config_;
   }
 
+  // ========== P1-1: Batch-3A 接入 SAC3 主路径 ==========
+  // 作为可选加速器：在满足条件时用约束聚合（Batch-3A）替换 Stage2。
+  // 最小风险 gating：当 NSAC mask 开启时，Batch-3A 自动禁用并回退到 Stage2。
+  struct Batch3AConfig {
+    bool enabled = false;   // 总开关（默认关闭）
+    int min_worlds = 8;     // 小于此值不启用（聚合收益不足）
+    int max_worlds = 32;    // 单次并发 world 上限（Batch-3A 限制）
+  };
+
+  void SetBatch3AConfig(const Batch3AConfig& config) {
+    batch3a_config_ = config;
+  }
+  const Batch3AConfig& GetBatch3AConfig() const {
+    return batch3a_config_;
+  }
+
+  // ========== P1-2: 外层队列预算（queue-level budget） ==========
+  // 目标：让 SAC3/MSAC 在难例上可控结束（sound but incomplete），
+  // 防止 probe 队列/重入队爆炸导致长尾失控。
+  //
+  // 语义：预算触发只会减少“继续 probe 的数量/范围”，不会导致误删（仍只对 kDWO 删值）。
+  struct SacQueueBudgetConfig {
+    bool enabled = false;          // 总开关（默认关闭；开启时才生效）
+    int max_total_probes = 0;      // 总 probe 数上限（0=不限制；达到则早停）
+    int max_queue_size = 0;        // regular queue 上限（0=不限制；超过则丢弃新入队）
+    int max_total_requeues = 0;    // 总重入队次数上限（0=不限制；超过则停止扩张邻域）
+    int max_requeues_per_var = 0;  // 单变量最大重入队次数（0=不限制）
+  };
+
+  void SetSacQueueBudgetConfig(const SacQueueBudgetConfig& config) {
+    sac_queue_budget_config_ = config;
+  }
+  const SacQueueBudgetConfig& GetSacQueueBudgetConfig() const {
+    return sac_queue_budget_config_;
+  }
+
   // MSAC 配置（搜索中的条件触发 SAC）
   void SetMSACConfig(const GpuMSACConfig& config) { msac_config_ = config; }
   const GpuMSACConfig& GetMSACConfig() const { return msac_config_; }
@@ -186,6 +228,25 @@ class GModelSolver {
   // 执行 SAC3 预处理（队列驱动，probe 粒度）
   // 返回删除的值的数量；如果检测到不一致返回 -1
   int EnforceSAC3(GpuSearchStatistics& stats);
+
+  // ========== P0-3: 统一观测入口（最小可用）==========
+  // 用于 preprocess/benchmark 口径的统计闭环：把每个 probe 的 iterations 汇总起来，
+  // 便于输出 avg/p95/max iterations、unknown probes 等指标。
+  //
+  // 注意：
+  // - 默认关闭（避免在求解/搜索阶段引入额外 host 侧收集开销）。
+  // - 开启后，会在 SAC1/SAC3 内部启用 Stage2 的 stats 收集，并把每批次的 probe_iterations
+  //   追加到 last_sac_probe_iterations_。
+  void EnableSacProbeStats(bool enabled) { collect_sac_probe_stats_ = enabled; }
+  bool IsSacProbeStatsEnabled() const { return collect_sac_probe_stats_; }
+
+  const std::vector<int>& GetLastSacProbeIterations() const {
+    return last_sac_probe_iterations_;
+  }
+  int64_t GetLastSacTotalIterations() const { return last_sac_total_iterations_; }
+  int GetLastSacMaxIterations() const { return last_sac_max_iterations_; }
+  int GetLastSacUnknownProbes() const { return last_sac_unknown_probes_; }
+  bool WasLastSacEarlyStopped() const { return last_sac_early_stopped_; }
 
  private:
   GModel* model_;                         // GModel 指针（不拥有）
@@ -212,11 +273,21 @@ class GModelSolver {
   DeferredRecheckConfig deferred_recheck_config_;
   FailurePriorityConfig failure_priority_config_;
   NSACMaskConfig nsac_mask_config_;  // P0-2: NSAC allowed-constraints mask
+  Batch3AConfig batch3a_config_;     // P1-1: Batch-3A 可选加速器
+  SacQueueBudgetConfig sac_queue_budget_config_;  // P1-2: 外层队列预算
+
+  // ========== P0-3: SAC preprocess 统计缓存 ==========
+  bool collect_sac_probe_stats_ = false;
+  std::vector<int> last_sac_probe_iterations_;
+  int64_t last_sac_total_iterations_ = 0;
+  int last_sac_max_iterations_ = 0;
+  int last_sac_unknown_probes_ = 0;
+  bool last_sac_early_stopped_ = false;
 
   // 递归搜索（DFS + MAC）
   // 返回 true 表示找到解或达到最大解数量
   bool Search(int level, GpuSearchStatistics& stats, int time_limit,
-              double start_time);
+              std::chrono::steady_clock::time_point deadline);
 
   // MSAC 辅助函数
   // 判断是否应该执行 MSAC

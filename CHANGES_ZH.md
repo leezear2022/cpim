@@ -1,5 +1,157 @@
 # 修改清单（中文）
 
+## 2026-01-25
+
+### P0-3：统一观测入口落地（full_sac vs SAC1/SAC3 preprocess 同口径）
+
+**动机**：此前 preprocess 跑批主要基于 `sac_benchmark --mode=full_sac`（Stage2 全域扫一轮/多轮），
+但 `GModelSolver::EnforceSAC1/EnforceSAC3`（flatten SACQ/NSACQ 的主线实现）没有可直接跑批/可解析的入口，
+导致“改了 SAC3 但测不到”，P0-3 统计闭环缺口未补齐。
+
+**交付内容**：
+- `apps/sac_benchmark.cpp`：
+  - 新增 preprocess 模式：`--mode=sac1_preprocess` / `--mode=sac3_preprocess`
+  - 统一输出可解析字段：`Total time/Total probes/Total deletions/Avg/P95/Max iterations/Unknown probes/Status`
+- `include/GModelSolver.h` / `src/solver/gpu/GModelSolver.cu`：
+  - 新增 `EnableSacProbeStats()` 观测开关与 `GetLastSac*()` 统计读取接口（默认关闭，避免影响搜索阶段）
+  - SAC3 增加 `max_rounds` 的 soft-budget 截断（与 `full_sac --max_sac_rounds` 的 TIMEOUT 语义对齐）
+- `tests/python/select_sac_preprocess_benches.py` / `tests/python/batch_sac_benchmark.py`：
+  - 支持 `--mode=full_sac/sac1_preprocess/sac3_preprocess`
+  - CSV 增加 `mode` 与 `p95_iterations` 字段，并改用 `(mode,nsac,max_rounds,path)` 作为 resume key
+- 文档同步：
+  - 更新 `docs/planning/TODO_SACGPU_NEXT.md`：P0-3 标记完成并说明 A/B 对照路径
+  - 更新 `docs/guides/SAC_PREPROCESS_GUIDE.md`：补充 `--mode=sac3_preprocess` 用法与 `P95 iterations` 指标
+  - 更新 `docs/planning/SACGPU_NEXT_ACTIONS_10MIN_TIMEOUT.md`：补齐 `--mode` 并移除“P0-3 未完成”的过时段落
+
+**工程修复**：
+- `CMakeLists.txt`：`sac_benchmark` 增加链接 `src/solver/gpu/GModelSolver.cu`（否则新增模式会出现链接缺符号）。
+
+**测试结果**：
+- `python3 tests/python/batch_test_v2.py --tier=0`：8/12 (66%)，与历史基线一致，无退化（不匹配项仍为 CPIM 超时）。
+
+### P1：外层队列预算 + Stage 选择分桶缓存（长尾可控/并行度吃满）
+
+**动机**：在 flatten SACQ/NSACQ（SAC3 preprocess）路径上，除了 per-probe 的 `UNKNOWN`/停滞/量子外，还需要
+host 侧的“外层队列预算”来避免 requeue/queue 爆炸；同时 AutoStageSelector 的单一全局缓存会被首次 batch 的规模污染，
+导致后续小 batch 仍走 Stage2（欠饱和/高开销），或反过来大 batch 仍走 Stage1。
+
+**交付内容**：
+- `include/GModelSolver.h` / `src/solver/gpu/GModelSolver.cu`：
+  - 新增 `GModelSolver::SacQueueBudgetConfig`（`max_total_probes/max_queue_size/max_total_requeues/max_requeues_per_var`）
+  - SAC3 支持 `max_total_probes` 截断（达到上限 early_stop；只会少删，不会多删）
+  - ProbeQueue 支持 queue cap 与 requeue cap（溢出丢弃入队/停止扩张），并在 verbose 下输出 budget 统计
+- `include/solver/gpu/batch_probe_manager.h` / `src/solver/gpu/batch_probe_manager.cu`：
+  - `AutoStageSelector::DecideCached()` 改为 **按任务量分桶缓存（medium/large）**
+  - 每次调用先走 `DecideByTaskCount()`：小任务直接 Stage1，不再受缓存污染
+- `apps/sac_benchmark.cpp`：preprocess 模式增加 queue-budget flags，便于消融与 hard-case 控制
+
+**测试结果**：
+- `python3 tests/python/batch_test_v2.py --tier=0`：8/12 (66%)，与历史基线一致，无退化（不匹配项仍为 CPIM 超时）。
+
+### Suite：Regression 用例去重/控时（便于日常跑通）
+
+**动机**：`benchmarks/marc/large-80-unsat_ext.xml` 的 preprocess 本体很快（~200ms），但解析/建模 wall-time 可达 ~60s，
+会导致 `--timeout=60` 的 regression 批跑不稳定（即使算法没卡住）。
+
+**调整**：
+- `tests/python/sac_preprocess_tier_definitions.py`：
+  - `SAC_PREPROCESS_REGRESSION` 移除 `large-80-unsat_ext.xml`（仍保留在 `perf`）
+  - 增加 `composed-25-1-2-0_ext.xml` 作为“快速 UNSAT/DWO”回归样例
+
+## 2026-01-21
+
+### Preprocess：补齐“回归/性能哨兵”评测集（suite）+ 澄清 SAC vs NSAC 口径
+
+**动机**：tier0/1/2 更偏“展示集”（数据驱动生成、可能随筛选刷新），不一定适合作为“每次改动都跑”的回归与关键节点性能对照。
+同时，近期评测 CSV 容易把 `status=TIMEOUT` 误解为 wall-time 超时；并且很多跑批默认 `nsac_mask=1`，
+需要在教程里明确“跑的是 SAC 外框 + NSAC 传播半径”。
+
+**交付内容**：
+- `tests/python/sac_preprocess_tier_definitions.py`：新增手工精选 suite
+  - `SAC_PREPROCESS_REGRESSION`：日常回归覆盖（高删值/高 probes/SAC-DWO/0 删值收敛/较高耗时）
+  - `SAC_PREPROCESS_PERF_SENTINELS`：关键节点性能哨兵（吞吐/延迟/内存压力）
+  - `SAC_PREPROCESS_STRESS`：压力样例（例如 Jetson 上可能 OOM 的大实例）
+  - `SAC_PREPROCESS_KNOWN_BAD`：已知解析/输出问题样例（扫描时建议 exclude）
+- `tests/python/batch_sac_benchmark.py`：新增 `--suite` 参数（可直接跑 regression/perf/stress 等）
+- `docs/guides/SAC_PREPROCESS_GUIDE.md`：
+  - 新增“这里跑的是 SAC 还是 NSAC？”解释
+  - 增加 `--suite=regression/perf` 的推荐命令模板
+
+**修改文件**：
+- `tests/python/sac_preprocess_tier_definitions.py`
+- `tests/python/batch_sac_benchmark.py`
+- `docs/guides/SAC_PREPROCESS_GUIDE.md`
+- `CHANGES_ZH.md`
+
+## 2026-01-19
+
+### Docs：对齐“下一步工作”与最新评测结论（区分 e2e 与 preprocess 口径）
+
+**背景**：近期评测表明 Batch-3A 在现有用例上 A/B 测试慢 10–25x；同时部分 hard bench 的 e2e TIMEOUT 主要发生在搜索阶段。
+但本阶段的研究目标更偏向“preprocess/推理能力（SAC/MSAC/NSAC）的速度与上限”，需要把评测口径从 e2e 求解切回 preprocess，
+并挑选“删值多/传播深”的实例。
+
+**交付内容**：
+- 更新 `docs/planning/NEXT_STEPS_2026_01.md`：把主线明确为“preprocess 指标闭环（P0-3）+ 构建对 SAC 有意义的评测集”，并把 e2e 搜索仅作为 sanity/回归口径；同时将 Batch-3A/bitGEMM/BMMA 后置为设门槛的研究路线。
+- 更新 `docs/planning/TODO_SACGPU_NEXT.md`：在现状快照与 P1-1 条目中补充 Batch-3A 的评测结论，建议默认关闭仅保留消融开关。
+- 新增 preprocess 评测集筛选/跑批脚本：
+  - `tests/python/select_sac_preprocess_benches.py`：扫描 `benchmarks/` 跑 `sac_benchmark --mode=full_sac`，输出 CSV 并生成 `SAC_PREPROCESS_TIER0/1/2`
+    - 支持 `--resume/--flush-every`：可中断/续跑，进度周期性落盘（原子写入）
+    - 支持 `--shuffle/--limit/--include/--exclude`：可抽样或按目录定向筛选
+  - `tests/python/batch_sac_benchmark.py`：按 preprocess tier 批量运行 `sac_benchmark` 并导出 CSV（支持 `--resume/--flush-every`）
+  - `tests/python/sac_preprocess_tier_definitions.py`：预置的 preprocess tier 列表（可用筛选脚本刷新）
+- 新增教程并注册到文档导航：
+  - `docs/guides/SAC_PREPROCESS_GUIDE.md`
+  - `docs/README.md`
+  - `docs/planning/SACGPU_NEXT_ACTIONS_10MIN_TIMEOUT.md`
+
+**修改文件**：
+- `docs/planning/NEXT_STEPS_2026_01.md`
+- `docs/planning/TODO_SACGPU_NEXT.md`
+- `docs/guides/SAC_PREPROCESS_GUIDE.md`
+- `docs/README.md`
+- `docs/planning/SACGPU_NEXT_ACTIONS_10MIN_TIMEOUT.md`
+- `tests/python/select_sac_preprocess_benches.py`
+- `tests/python/batch_sac_benchmark.py`
+- `tests/python/sac_preprocess_tier_definitions.py`
+
+## 2026-01-18
+
+### Search：修复 `time_limit` 超时判断 + 搜索阶段增量 GAC
+
+**目标**：让 `compare_cpu_gpu` 的 GPU 搜索按 `--time_limit` 正确停止；并把每个搜索节点的 GAC
+从“全量激活所有约束”改为“只激活刚赋值变量的邻接约束”，降低搜索阶段传播开销（语义不变）。
+
+**交付内容**：
+- `GModelSolver::Solve()`：计算 deadline 并传入递归搜索
+- `GModelSolver::Search()`：用 `std::chrono::steady_clock` 做超时判断（修复原先每次新建 Timer 导致超时永不触发）
+- 搜索节点传播：`model_->EnforceGAC(false, var)`（增量 GAC）
+
+**修改文件**：
+- `include/GModelSolver.h`
+- `src/solver/gpu/GModelSolver.cu`
+
+### Tests：对齐 TIER1/TIER2 实例数量说明
+
+`tests/python/tier_definitions.py` 的文档注释中，TIER1/TIER2 数量已对齐到当前实际列表
+（TIER1=39，TIER2=79），避免后续跑批时误判“缺例/多例”。
+
+**修改文件**：
+- `tests/python/tier_definitions.py`
+
+### Tests：新增三方对比（CPIM CPU vs CPIM GPU vs OR-Tools CP）
+
+**目标**：在同一套 TIER 用例下，同时跑 CPU/GPU/OR-Tools 三条链路，便于回归与定位
+“CPU/GPU 之间不一致”以及“与 OR-Tools 判定不一致”的实例。
+
+**交付内容**：
+- 新增 `tests/python/batch_test_v3.py`：三方对比测试脚本（默认 GPU 走 `build/compare_cpu_gpu --gpu_only`）
+- 更新 `docs/planning/TODO_SACGPU_NEXT.md`：最小回归清单加入三方对比入口
+
+**修改文件**：
+- `tests/python/batch_test_v3.py`
+- `docs/planning/TODO_SACGPU_NEXT.md`
+
 ## 2026-01-17
 
 ### P0-1d：失败概率优先（Failure Priority / bucketed queue）
@@ -19,6 +171,56 @@
 **修改文件**：
 - `include/GModelSolver.h`
 - `src/solver/gpu/GModelSolver.cu`
+- `apps/compare_cpu_gpu.cpp`
+- `docs/planning/TODO_SACGPU_NEXT.md`
+
+---
+
+### P0-2：NSAC `allowed-constraints mask`（真邻域子图）
+
+**目标**：singleton test 的传播严格限制在 `Xi + N(Xi)` 诱导子图（NSAC），减少传播半径抑制长尾；语义仍然 sound
+（只对 `kDWO` 删值，预算/停滞触发为 `kUNKNOWN` 不删）。
+
+**交付内容**：
+- `GModel::BuildAllowedMasks()`：为每个 focal variable 预计算 allowed constraints 位图
+- Stage2/Stage1 的 BlockSync GAC：在 frontier 扩张（`PropagateVarToNextBitmap`）阶段按 focal var 过滤，避免传播越过邻域子图
+- `GModelSolver::NSACMaskConfig` + `--sac_nsac_mask`：运行时开关（关闭回退到原全图传播）
+
+**修改文件**：
+- `include/GModel.cuh`
+- `src/solver/gpu/GModel.cu`
+- `include/GModelSolver.h`
+- `src/solver/gpu/GModelSolver.cu`
+- `include/solver/gpu/batch_probe_manager.h`
+- `src/solver/gpu/batch_probe_manager.cu`
+- `apps/compare_cpu_gpu.cpp`
+- `docs/planning/TODO_SACGPU_NEXT.md`
+
+**验收**：`batch_test_v2.py --tier=0` 通过（8/12 匹配，与之前一致；4 个超时为既有性能问题）
+
+---
+
+### P1-1：Batch-3A 接入 SAC3 主路径（可选加速器 + NSAC gating）
+
+**目标**：把 Batch-3A（约束聚合）作为 SAC3 的可选后端接入主路径，用于评估其在 `nsac_mask=false` 下的吞吐/长尾收益；
+同时保持默认 NSAC 的语义一致性与可回退性。
+
+**关键策略（最小风险）**：
+- 运行时开关：`--sac_use_batch3a`
+- **NSAC gating**：当 `nsac_mask_enabled=true` 时自动禁用 Batch-3A 并回退 Stage2（保证默认路径始终“真 NSAC”）
+- UNKNOWN 输出：Batch-3A 若在 `max_iterations` 内未收敛（`active_world_mask` 仍有 bit），对这些 probes 标记为 UNKNOWN（不删，可进入 deferred recheck）
+
+**交付内容**：
+- `GModelSolver::Batch3AConfig`：Batch-3A 运行时配置
+- `GModelSolver::EnforceSAC3()`：在满足条件时走 Batch-3A，否则回退原 Stage1/Stage2
+- `Batch3AManager::Execute(..., unknown_vars, unknown_values)`：支持返回 UNKNOWN probes
+- 修复 Batch-3A 初始化 `active_world_mask` 在 `num_worlds==32` 时的移位未定义行为
+
+**修改文件**：
+- `include/GModelSolver.h`
+- `src/solver/gpu/GModelSolver.cu`
+- `include/solver/gpu/batch_probe_manager.h`
+- `src/solver/gpu/batch_probe_manager.cu`
 - `apps/compare_cpu_gpu.cpp`
 - `docs/planning/TODO_SACGPU_NEXT.md`
 

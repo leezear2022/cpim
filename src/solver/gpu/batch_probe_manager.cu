@@ -1826,23 +1826,41 @@ StageSelectionResult AutoStageSelector::DecideWithTimedComparison(
 // ============================================================================
 StageSelectionResult AutoStageSelector::DecideCached(
     const std::vector<ProbeTask>& tasks, int num_blocks) {
-  // 如果缓存有效，直接返回缓存结果
-  if (cache_valid_) {
-    LOG(INFO) << "[AutoStageSelector] Using cached decision: "
-              << (cached_result_.stage == StageSelection::kStage1 ? "Stage 1" : "Stage 2")
-              << " (reason: " << cached_result_.reason << ")";
-    return cached_result_;
+  const int num_tasks = static_cast<int>(tasks.size());
+
+  // 先用“任务量快速决策”兜底：小任务直接选 Stage 1（避免被大任务的缓存污染）
+  StageSelectionResult quick = DecideByTaskCount(num_tasks);
+  if (quick.stage == StageSelection::kStage1) {
+    return quick;
   }
 
-  // 首次调用：执行实测对比
-  LOG(INFO) << "[AutoStageSelector] No cache, running timed comparison...";
-  cached_result_ = DecideWithTimedComparison(tasks, num_blocks);
-  cache_valid_ = true;
+  // Bucketed cache：
+  // - 中等任务量（<=500）：一份缓存
+  // - 大任务量（>500）：一份缓存
+  //
+  // 目的：避免 “第一次采样是大 batch → 后续小/中 batch 也被迫 Stage 2” 或反之。
+  static constexpr int kLargeTaskThreshold = 500;
+  const bool is_large = num_tasks > kLargeTaskThreshold;
 
-  // 标记结果为来自缓存（首次）
-  LOG(INFO) << "[AutoStageSelector] Decision cached for subsequent calls";
+  bool* cache_valid = is_large ? &cache_large_valid_ : &cache_medium_valid_;
+  StageSelectionResult* cached = is_large ? &cached_large_result_ : &cached_medium_result_;
 
-  return cached_result_;
+  if (*cache_valid) {
+    LOG(INFO) << "[AutoStageSelector] Using cached decision (bucket="
+              << (is_large ? "large" : "medium") << "): "
+              << (cached->stage == StageSelection::kStage1 ? "Stage 1" : "Stage 2")
+              << " (reason: " << cached->reason << ")";
+    return *cached;
+  }
+
+  LOG(INFO) << "[AutoStageSelector] No cache (bucket="
+            << (is_large ? "large" : "medium")
+            << "), running timed comparison...";
+  *cached = DecideWithTimedComparison(tasks, num_blocks);
+  *cache_valid = true;
+  LOG(INFO) << "[AutoStageSelector] Decision cached (bucket="
+            << (is_large ? "large" : "medium") << ")";
+  return *cached;
 }
 
 // ============================================================================
@@ -2160,7 +2178,9 @@ void Batch3AManager::InitializeWorlds(int num_worlds) {
   *d_global_iteration_ = 0;
   *d_all_converged_flag_ = 0;
   *d_any_world_active_ = 1;  // 初始所有 world 都活跃
-  *d_active_world_mask_ = (1U << num_worlds) - 1;  // 所有 world 的位掩码
+  // 所有 world 的位掩码（注意：num_worlds==32 时不能做 1U<<32）
+  *d_active_world_mask_ =
+      (num_worlds >= 32) ? 0xFFFFFFFFu : ((1u << num_worlds) - 1u);
 
   // 初始化结果数组（全部为 true，表示一致）
   for (int w = 0; w < num_worlds; ++w) {
@@ -2219,10 +2239,22 @@ void Batch3AManager::LaunchBatch3AKernel(int num_worlds) {
 
 int Batch3AManager::CollectResults(int num_worlds,
                                    std::vector<int>& failed_vars,
-                                   std::vector<int>& failed_values) {
+                                   std::vector<int>& failed_values,
+                                   std::vector<int>* unknown_vars,
+                                   std::vector<int>* unknown_values) {
   int num_failed = 0;
 
+  const u32 active_mask = d_active_world_mask_ ? *d_active_world_mask_ : 0u;
+
   for (int w = 0; w < num_worlds; ++w) {
+    // 未在 max_iterations 内收敛：仍保留在 active_world_mask 中
+    if (active_mask & (1u << w)) {
+      if (unknown_vars != nullptr && unknown_values != nullptr) {
+        unknown_vars->push_back(task_queue_[w].var_id);
+        unknown_values->push_back(task_queue_[w].value);
+      }
+      continue;
+    }
     if (!d_results_[w]) {
       failed_vars.push_back(task_queue_[w].var_id);
       failed_values.push_back(task_queue_[w].value);
@@ -2240,9 +2272,13 @@ int Batch3AManager::CollectResults(int num_worlds,
 }
 
 int Batch3AManager::Execute(std::vector<int>& failed_vars,
-                            std::vector<int>& failed_values) {
+                            std::vector<int>& failed_values,
+                            std::vector<int>* unknown_vars,
+                            std::vector<int>* unknown_values) {
   failed_vars.clear();
   failed_values.clear();
+  if (unknown_vars != nullptr) unknown_vars->clear();
+  if (unknown_values != nullptr) unknown_values->clear();
 
   const int num_tasks = static_cast<int>(task_queue_.size());
   if (num_tasks == 0) {
@@ -2290,7 +2326,18 @@ int Batch3AManager::Execute(std::vector<int>& failed_vars,
 
     // 收集结果
     std::vector<int> batch_failed_vars, batch_failed_values;
-    int batch_failed = CollectResults(batch_size, batch_failed_vars, batch_failed_values);
+    std::vector<int> batch_unknown_vars, batch_unknown_values;
+    std::vector<int>* batch_unknown_vars_ptr = nullptr;
+    std::vector<int>* batch_unknown_values_ptr = nullptr;
+    if (unknown_vars != nullptr && unknown_values != nullptr) {
+      batch_unknown_vars_ptr = &batch_unknown_vars;
+      batch_unknown_values_ptr = &batch_unknown_values;
+    }
+    int batch_failed = CollectResults(batch_size,
+                                      batch_failed_vars,
+                                      batch_failed_values,
+                                      batch_unknown_vars_ptr,
+                                      batch_unknown_values_ptr);
 
     // 合并结果
     for (size_t i = 0; i < batch_failed_vars.size(); ++i) {
@@ -2298,6 +2345,13 @@ int Batch3AManager::Execute(std::vector<int>& failed_vars,
       failed_values.push_back(batch_failed_values[i]);
     }
     total_failed += batch_failed;
+
+    if (unknown_vars != nullptr && unknown_values != nullptr) {
+      for (size_t i = 0; i < batch_unknown_vars.size(); ++i) {
+        unknown_vars->push_back(batch_unknown_vars[i]);
+        unknown_values->push_back(batch_unknown_values[i]);
+      }
+    }
 
     // 恢复 task_queue_
     task_queue_ = saved_queue;

@@ -7,6 +7,7 @@
 - [项目主 README](../README.md) - 构建与运行
 - [测试指南](guides/TESTING_GUIDE.md) - 分层测试体系
 - [应用程序参考](guides/APPS_REFERENCE.md) - 所有可执行程序
+- [SAC preprocess 评测教程](guides/SAC_PREPROCESS_GUIDE.md) - SAC/MSAC/NSAC 评测入口
 
 ## 核心文档
 
@@ -48,6 +49,7 @@
 
 - [现代化计划 V2](planning/MODERNIZATION_PLAN_V2.md) - 总体开发规划
 - [**SAC-GPU 设计**](planning/SACGPU_DESIGN.md) - bitGEMM 化、SACq/NSACq、长尾控制
+- [SACGPU 下一步执行清单（10 分钟超时版）](planning/SACGPU_NEXT_ACTIONS_10MIN_TIMEOUT.md) - 可执行命令清单
 - [Phase 1.5 启发式](planning/PHASE_1.5_HEURISTICS_DESIGN.md) - 变量选择启发式
 - [Propagator 框架](planning/PROPAGATOR_FRAMEWORK_DESIGN.md) - Phase 2 重构计划
 - [自适应引擎](planning/ADAPTIVE_ENGINE_DESIGN.md) - CPU/GPU 切换策略

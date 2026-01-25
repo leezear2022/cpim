@@ -5,12 +5,13 @@
 // Supports:
 //   - Throughput test: batch1, stage2, batch3a (measure probes/sec)
 //   - Full SAC: full_sac (complete SAC convergence until fixed point)
+//   - SAC preprocess: sac1_preprocess / sac3_preprocess (queue-based SAC/NSACQ)
 //
 // Usage:
 //   ./sac_benchmark --input=<file.xml> [options]
 //
 // Options:
-//   --mode=batch1|stage2|batch3a|full_sac|compare
+//   --mode=batch1|stage2|batch3a|full_sac|sac1_preprocess|sac3_preprocess|compare
 //                                 Select mode (default: stage2)
 //   --num_probes=N                Number of probe tasks for throughput (default: 32)
 //   --warmup=N                    Warmup iterations (default: 1)
@@ -32,11 +33,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <iomanip>
 #include <iostream>
 #include <set>
 #include <vector>
 
+#include "GModelSolver.h"
 #include "GModel.cuh"
 #include "model/gmodel_adapter.h"
 #include "model/model_normalizer.h"
@@ -49,7 +52,10 @@
 #endif
 
 DEFINE_string(input, "", "Input XCSP3 file path");
-DEFINE_string(mode, "stage2", "Batch mode: batch1, stage2, batch3a, compare, full_sac");
+DEFINE_string(
+    mode,
+    "stage2",
+    "Benchmark mode: batch1, stage2, batch3a, compare, full_sac, sac1_preprocess, sac3_preprocess");
 DEFINE_int32(num_probes, 32, "Number of probe tasks (for throughput test)");
 DEFINE_int32(warmup, 1, "Warmup iterations");
 DEFINE_int32(iterations, 3, "Benchmark iterations");
@@ -58,6 +64,12 @@ DEFINE_bool(compare, false, "Compare all modes");
 DEFINE_int32(max_sac_rounds, 100, "Max SAC rounds for full_sac mode");
 DEFINE_int32(assign_count, 0, "Number of variables to assign before SAC (simulates MSAC)");
 DEFINE_string(msac_mode, "fast", "MSAC mode: 'fast' (GAC backtrack), 'full' (SAC backtrack, slow), 'parallel' (GPU parallel SAC probe)");
+DEFINE_bool(nsac_mask, true, "Enable NSAC allowed-constraints mask (restrict propagation to neighborhood)");
+DEFINE_bool(sac_queue_budget, false, "Enable SAC queue-level budget (P1-2)");
+DEFINE_int32(sac_max_total_probes, 0, "Max total probes for SAC3 (0=unlimited)");
+DEFINE_int32(sac_max_queue_size, 0, "Max probe queue size for SAC3 (0=unlimited)");
+DEFINE_int32(sac_max_total_requeues, 0, "Max total requeues for SAC3 (0=unlimited)");
+DEFINE_int32(sac_max_requeues_per_var, 0, "Max requeues per var for SAC3 (0=unlimited)");
 
 namespace cpim {
 
@@ -532,6 +544,16 @@ BenchmarkResult RunBatch3ABenchmark(GModel* gmodel,
 // Full SAC convergence result structure
 // ============================================================================
 
+int PercentileInt(const std::vector<int>& values, double p) {
+    if (values.empty()) return 0;
+    const double pp = std::clamp(p, 0.0, 1.0);
+    const size_t n = values.size();
+    const size_t idx = std::min(n - 1, static_cast<size_t>(std::ceil(pp * n) - 1));
+    std::vector<int> tmp(values.begin(), values.end());
+    std::nth_element(tmp.begin(), tmp.begin() + idx, tmp.end());
+    return tmp[idx];
+}
+
 struct FullSACResult {
     std::string mode_name;
     double total_time_ms;
@@ -545,6 +567,15 @@ struct FullSACResult {
     std::vector<int> round_probes;    // Probes per round
     std::vector<int> round_deletions; // Deletions per round
     std::vector<double> round_times;  // Time per round (ms)
+
+    // P0-3: Per-probe iteration statistics
+    int64_t total_iterations = 0;
+    int p95_iterations = 0;
+    int max_iterations = 0;
+    int unknown_count = 0;
+    double avg_iterations() const {
+        return total_probes > 0 ? static_cast<double>(total_iterations) / total_probes : 0.0;
+    }
 };
 
 void PrintFullSACResult(const FullSACResult& result) {
@@ -564,6 +595,13 @@ void PrintFullSACResult(const FullSACResult& result) {
                   (result.converged ? "SAC-consistent (converged)" : "TIMEOUT"))
               << "\n";
 
+    // P0-3: Per-probe iteration statistics
+    std::cout << "  Avg iterations:  " << result.avg_iterations() << "\n";
+    std::cout << "  P95 iterations:  " << result.p95_iterations << "\n";
+    std::cout << "  Max iterations:  " << result.max_iterations << "\n";
+    std::cout << "  Unknown probes:  " << result.unknown_count
+              << " (" << (result.total_probes > 0 ? 100.0 * result.unknown_count / result.total_probes : 0.0) << "%)\n";
+
     if (FLAGS_verbose && !result.round_probes.empty()) {
         std::cout << "\n  Per-round details:\n";
         for (size_t i = 0; i < result.round_probes.size(); ++i) {
@@ -579,9 +617,9 @@ void PrintFullSACResult(const FullSACResult& result) {
 // Full SAC convergence test (using Stage-2 Persistent Blocks)
 // ============================================================================
 
-FullSACResult RunFullSAC_Stage2(GModel* gmodel, int max_rounds, bool verbose) {
+FullSACResult RunFullSAC_Stage2(GModel* gmodel, int max_rounds, bool verbose, bool nsac_mask = true) {
     FullSACResult result;
-    result.mode_name = "Stage-2";
+    result.mode_name = nsac_mask ? "Stage-2 (NSAC)" : "Stage-2 (no NSAC)";
     result.converged = false;
     result.inconsistent = false;
     result.num_rounds = 0;
@@ -591,9 +629,26 @@ FullSACResult RunFullSAC_Stage2(GModel* gmodel, int max_rounds, bool verbose) {
 
     auto total_start = std::chrono::high_resolution_clock::now();
 
+    // P0-2: Initialize NSAC mask if enabled
+    if (nsac_mask) {
+        if (!gmodel->IsAllowedMasksBuilt()) {
+            gmodel->BuildAllowedMasks();
+        }
+        gmodel->SetNSACMaskEnabled(true);
+        std::cout << "  NSAC mask:       enabled (bitmap_words="
+                  << gmodel->GetGModelDataView().constraint_bitmap_words << ")\n";
+    } else {
+        gmodel->SetNSACMaskEnabled(false);
+        std::cout << "  NSAC mask:       disabled\n";
+    }
+
     // Create manager with auto-tuned blocks
     Batch2PersistentManager manager(gmodel, -1);
     manager.SetActivationStrategy(1);  // NEIGHBOR_ACTIVATION
+    manager.EnableStats(true);  // P0-3: Enable per-probe statistics
+
+    std::vector<int> all_probe_iterations;
+    all_probe_iterations.reserve(static_cast<size_t>(result.initial_domain_size));
 
     for (int round = 0; round < max_rounds; ++round) {
         // Collect all (var, val) pairs in current domain
@@ -620,6 +675,20 @@ FullSACResult RunFullSAC_Stage2(GModel* gmodel, int max_rounds, bool verbose) {
         manager.ExecutePersistentBlocks(failed_vars, failed_values);
         auto round_end = std::chrono::high_resolution_clock::now();
         double round_time = std::chrono::duration<double, std::milli>(round_end - round_start).count();
+
+        // P0-3: Collect per-probe iteration statistics
+        const auto& stats = manager.GetLastStatistics();
+        result.total_iterations += stats.total_iterations;
+        if (stats.max_iterations > result.max_iterations) {
+            result.max_iterations = stats.max_iterations;
+        }
+        result.unknown_count += stats.unknown_count;
+        const auto& probe_iters = manager.GetLastProbeIterations();
+        if (!probe_iters.empty()) {
+            all_probe_iterations.insert(all_probe_iterations.end(),
+                                        probe_iters.begin(),
+                                        probe_iters.end());
+        }
 
         manager.Clear();
 
@@ -672,6 +741,7 @@ FullSACResult RunFullSAC_Stage2(GModel* gmodel, int max_rounds, bool verbose) {
     auto total_end = std::chrono::high_resolution_clock::now();
     result.total_time_ms = std::chrono::duration<double, std::milli>(total_end - total_start).count();
     result.final_domain_size = GetTotalDomainSize(gmodel);
+    result.p95_iterations = PercentileInt(all_probe_iterations, 0.95);
 
     return result;
 }
@@ -754,6 +824,117 @@ FullSACResult RunFullSAC_Batch3A(GModel* gmodel, int max_rounds, bool verbose) {
 
     auto total_end = std::chrono::high_resolution_clock::now();
     result.total_time_ms = std::chrono::duration<double, std::milli>(total_end - total_start).count();
+    result.final_domain_size = GetTotalDomainSize(gmodel);
+
+    return result;
+}
+
+// ============================================================================
+// SAC preprocess (SAC1 / SAC3) result structure
+// ============================================================================
+
+struct SacPreprocessResult {
+    std::string mode_name;
+    double total_time_ms = 0.0;
+    int total_probes = 0;
+    int total_deletions = 0;
+    int initial_domain_size = 0;
+    int final_domain_size = 0;
+    bool inconsistent = false;
+    bool early_stopped = false;
+
+    int64_t total_iterations = 0;
+    int p95_iterations = 0;
+    int max_iterations = 0;
+    int unknown_probes = 0;
+
+    double avg_iterations() const {
+        return total_probes > 0 ? static_cast<double>(total_iterations) / total_probes : 0.0;
+    }
+};
+
+void PrintSacPreprocessResult(const SacPreprocessResult& result) {
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << "\n--- SAC Preprocess Result (" << result.mode_name << ") ---\n";
+    std::cout << "  Total time:      " << result.total_time_ms << " ms\n";
+    std::cout << "  Total probes:    " << result.total_probes << "\n";
+    std::cout << "  Total deletions: " << result.total_deletions << "\n";
+    std::cout << "  Domain size:     " << result.initial_domain_size
+              << " -> " << result.final_domain_size
+              << " (reduced " << (result.initial_domain_size - result.final_domain_size) << ")\n";
+    std::cout << "  Status:          "
+              << (result.inconsistent ? "SAC-DWO" :
+                  (result.early_stopped ? "TIMEOUT" : "SAC-consistent"))
+              << "\n";
+    std::cout << "  Avg iterations:  " << result.avg_iterations() << "\n";
+    std::cout << "  P95 iterations:  " << result.p95_iterations << "\n";
+    std::cout << "  Max iterations:  " << result.max_iterations << "\n";
+    std::cout << "  Unknown probes:  " << result.unknown_probes
+              << " (" << (result.total_probes > 0
+                           ? 100.0 * result.unknown_probes / result.total_probes
+                           : 0.0)
+              << "%)\n";
+}
+
+SacPreprocessResult RunSacPreprocessWithSolver(GModel* gmodel,
+                                               bool use_sac3,
+                                               int max_rounds,
+                                               bool verbose,
+                                               bool nsac_mask) {
+    SacPreprocessResult result;
+    result.mode_name = use_sac3 ? (nsac_mask ? "SAC3 (NSACQ-GPU)" : "SAC3 (SACQ-GPU)")
+                                : (nsac_mask ? "SAC1 (NSAC)" : "SAC1 (no NSAC)");
+    result.initial_domain_size = GetTotalDomainSize(gmodel);
+
+    GModelSolver solver(gmodel, verbose);
+
+    GModelSolver::NSACMaskConfig mask_cfg;
+    mask_cfg.enabled = nsac_mask;
+    solver.SetNSACMaskConfig(mask_cfg);
+
+    // Benchmark 默认关闭 Batch-3A，避免把“约束聚合”的开销混入 SAC1/SAC3 对照。
+    GModelSolver::Batch3AConfig b3a_cfg;
+    b3a_cfg.enabled = false;
+    solver.SetBatch3AConfig(b3a_cfg);
+
+    // P1-2: 外层队列预算（仅影响 SAC3）
+    GModelSolver::SacQueueBudgetConfig budget_cfg;
+    budget_cfg.enabled = FLAGS_sac_queue_budget;
+    budget_cfg.max_total_probes = FLAGS_sac_max_total_probes;
+    budget_cfg.max_queue_size = FLAGS_sac_max_queue_size;
+    budget_cfg.max_total_requeues = FLAGS_sac_max_total_requeues;
+    budget_cfg.max_requeues_per_var = FLAGS_sac_max_requeues_per_var;
+    if (budget_cfg.max_total_probes > 0 || budget_cfg.max_queue_size > 0 ||
+        budget_cfg.max_total_requeues > 0 || budget_cfg.max_requeues_per_var > 0) {
+        budget_cfg.enabled = true;
+    }
+    solver.SetSacQueueBudgetConfig(budget_cfg);
+
+    // P0-3: 观测入口需要 per-probe iterations 分布
+    solver.EnableSacProbeStats(true);
+
+    // 为了让 benchmark 的 “TIMEOUT” 语义与 full_sac 对齐：只用 max_rounds 截断；
+    // wall-time 超时由 Python 脚本的 subprocess timeout 控制。
+    auto sac_cfg = solver.GetSACConfig();
+    sac_cfg.early_stop_enabled = true;
+    sac_cfg.max_rounds = max_rounds;
+    sac_cfg.time_budget_ms = 1e18;   // effectively disabled
+    sac_cfg.min_deletion_rate = 0.0; // disable deletion-rate early stop
+    sac_cfg.warmup_rounds = max_rounds;
+    solver.SetSACConfig(sac_cfg);
+
+    GpuSearchStatistics stats;
+    int rc = use_sac3 ? solver.EnforceSAC3(stats) : solver.EnforceSAC1(stats);
+    result.inconsistent = (rc < 0);
+    result.early_stopped = solver.WasLastSacEarlyStopped();
+
+    result.total_time_ms = stats.sac_time * 1000.0;
+    result.total_probes = stats.sac_probes;
+    result.total_deletions = stats.sac_deletions;
+    result.total_iterations = solver.GetLastSacTotalIterations();
+    result.max_iterations = solver.GetLastSacMaxIterations();
+    result.p95_iterations = PercentileInt(solver.GetLastSacProbeIterations(), 0.95);
+    result.unknown_probes = solver.GetLastSacUnknownProbes();
     result.final_domain_size = GetTotalDomainSize(gmodel);
 
     return result;
@@ -843,8 +1024,8 @@ int main(int argc, char* argv[]) {
         }
 
         // Run Full SAC with Stage-2
-        LOG(INFO) << "Running Full SAC with Stage-2...";
-        auto stage2_result = cpim::RunFullSAC_Stage2(gmodel, FLAGS_max_sac_rounds, FLAGS_verbose);
+        LOG(INFO) << "Running Full SAC with Stage-2 (nsac_mask=" << (FLAGS_nsac_mask ? "true" : "false") << ")...";
+        auto stage2_result = cpim::RunFullSAC_Stage2(gmodel, FLAGS_max_sac_rounds, FLAGS_verbose, FLAGS_nsac_mask);
         cpim::PrintFullSACResult(stage2_result);
 
         // Explain the result
@@ -861,6 +1042,38 @@ int main(int argc, char* argv[]) {
         std::cout << "\n========================================\n";
         std::cout << "Full SAC complete!\n";
         std::cout << "========================================\n";
+        return 0;
+    }
+
+    // ========================================
+    // SAC preprocess modes (SAC1 / SAC3)
+    // ========================================
+    if (FLAGS_mode == "sac1_preprocess" || FLAGS_mode == "sac3_preprocess") {
+        std::cout << "\n========================================\n";
+        std::cout << "SAC Preprocess Benchmark (" << FLAGS_mode << ")\n";
+        std::cout << "Instance: " << FLAGS_input << "\n";
+        std::cout << "Max rounds: " << FLAGS_max_sac_rounds << "\n";
+        std::cout << "NSAC mask: " << (FLAGS_nsac_mask ? "enabled" : "disabled") << "\n";
+        if (FLAGS_sac_queue_budget || FLAGS_sac_max_total_probes > 0 ||
+            FLAGS_sac_max_queue_size > 0 || FLAGS_sac_max_total_requeues > 0 ||
+            FLAGS_sac_max_requeues_per_var > 0) {
+            std::cout << "Queue budget: enabled"
+                      << " (max_total_probes=" << FLAGS_sac_max_total_probes
+                      << ", max_queue_size=" << FLAGS_sac_max_queue_size
+                      << ", max_total_requeues=" << FLAGS_sac_max_total_requeues
+                      << ", max_requeues_per_var=" << FLAGS_sac_max_requeues_per_var
+                      << ")\n";
+        }
+        std::cout << "========================================\n";
+
+        const bool use_sac3 = (FLAGS_mode == "sac3_preprocess");
+        auto result = cpim::RunSacPreprocessWithSolver(
+            gmodel,
+            use_sac3,
+            FLAGS_max_sac_rounds,
+            FLAGS_verbose,
+            FLAGS_nsac_mask);
+        cpim::PrintSacPreprocessResult(result);
         return 0;
     }
 

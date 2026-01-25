@@ -676,6 +676,40 @@ void PropagateVarToNextBitmap(
   }
 }
 
+// P0-2: NSAC allowed-constraints mask 过滤版（用于 singleton test 的子图传播）
+// 仅当 allowed_masks != nullptr 且 focal_var 合法时生效；否则等价于全量传播。
+__device__ __forceinline__
+void PropagateVarToNextBitmap(
+    int var,
+    const GModelData& model,
+    u32* next_bitmap,
+    const u32* allowed_masks,
+    int constraint_bitmap_words,
+    int focal_var) {
+
+  const int start = model.d_subscription_offset[var];
+  const int end = model.d_subscription_offset[var + 1];
+
+  const bool mask_enabled =
+      (allowed_masks != nullptr) &&
+      (constraint_bitmap_words > 0) &&
+      (focal_var >= 0 && focal_var < model.num_vars);
+
+  for (int i = start; i < end; ++i) {
+    const int cid = model.d_subscription[i].z;  // uint3 中 cid 在 z 分量
+    if (mask_enabled) {
+      const int word_idx = cid / 32;
+      const int bit_idx = cid % 32;
+      if (word_idx < 0 || word_idx >= constraint_bitmap_words) continue;
+      const u32 mask_word = allowed_masks[focal_var * constraint_bitmap_words + word_idx];
+      if ((mask_word & (1u << bit_idx)) == 0u) continue;
+    }
+    const int w = cid / 32;
+    const int b = cid % 32;
+    atomicOr(&next_bitmap[w], 1u << b);
+  }
+}
+
 // 从 bitmap 取任务（word 级调度）
 __device__ __forceinline__
 int FetchNextCidFromBitmap(
@@ -2106,7 +2140,10 @@ void RunGACToFixpoint_BlockSync(
     float min_productivity = 0.001f,    // P0-1a: 最低产出率
     bool enable_stagnation_check = true,// P0-1a: 是否启用停滞检测
     int quantum_cid = 0,                // P0-1b: 工作量子（0=无限制）
-    bool enable_quantum_check = false   // P0-1b: 是否启用工作量子检查
+    bool enable_quantum_check = false,  // P0-1b: 是否启用工作量子检查
+    const u32* allowed_masks = nullptr, // P0-2: NSAC mask（nullptr=禁用）
+    int constraint_bitmap_words = 0,    // P0-2: = (num_constraints + 31) / 32
+    int focal_var = -1                 // P0-2: singleton test 的 focal variable
     ) {
 
   __shared__ u32* frontier_cur;
@@ -2196,10 +2233,12 @@ void RunGACToFixpoint_BlockSync(
           ws->deletions += static_cast<unsigned long long>(r.deletions);
           const int2 scope = model.constraint_scopes[cid];
           if (r.x_changed) {
-            PropagateVarToNextBitmap(scope.x, model, frontier_next);
+            PropagateVarToNextBitmap(scope.x, model, frontier_next,
+                                     allowed_masks, constraint_bitmap_words, focal_var);
           }
           if (r.y_changed) {
-            PropagateVarToNextBitmap(scope.y, model, frontier_next);
+            PropagateVarToNextBitmap(scope.y, model, frontier_next,
+                                     allowed_masks, constraint_bitmap_words, focal_var);
           }
         }
         if (r.inconsistent) {
@@ -2379,7 +2418,15 @@ void Batch2ProbeKernel_MicroBatch(
   // [5] RunGACToFixpoint（Block-sync）
   extern __shared__ u32 shmem[];
   RunGACToFixpoint_BlockSync(
-      model, ws, bitmap_size_words, max_iterations_per_probe, shmem);
+      model, ws, bitmap_size_words, max_iterations_per_probe, shmem,
+      /*stagnation_threshold=*/3,
+      /*min_productivity=*/0.001f,
+      /*enable_stagnation_check=*/true,
+      /*quantum_cid=*/0,
+      /*enable_quantum_check=*/false,
+      /*allowed_masks=*/model.allowed_masks,
+      /*constraint_bitmap_words=*/model.constraint_bitmap_words,
+      /*focal_var=*/task.var_id);
 
   // [6] 记录结果
   if (threadIdx.x == 0) {
@@ -2703,7 +2750,10 @@ void Batch2ProbeKernel_PersistentBlocks(
         control->min_productivity,          // P0-1a
         control->enable_stagnation_check,   // P0-1a
         control->quantum_cid,               // P0-1b
-        control->enable_quantum_check);     // P0-1b
+        control->enable_quantum_check,      // P0-1b
+        control->allowed_masks,             // P0-2
+        control->constraint_bitmap_words,   // P0-2
+        task.var_id);                       // P0-2: focal_var
 
     // [7] 写回结果和统计
     if (threadIdx.x == 0) {
@@ -2953,8 +3003,14 @@ GModelData GModel::GetGModelDataView() const {
   md.d_subscription_offset = d_subscription_offset;
 
   // P0-2: NSAC allowed-constraints mask
-  md.allowed_masks = d_allowed_masks;
-  md.constraint_bitmap_words = constraint_bitmap_words;
+  if (nsac_mask_enabled) {
+    md.allowed_masks = d_allowed_masks;
+    md.constraint_bitmap_words = constraint_bitmap_words;
+  } else {
+    md.allowed_masks = nullptr;
+    // 仍返回实际 bitmap_words，便于日志/调试；mask 是否生效由 allowed_masks 是否为空决定。
+    md.constraint_bitmap_words = constraint_bitmap_words;
+  }
 
   return md;
 }

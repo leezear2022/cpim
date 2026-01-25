@@ -39,6 +39,8 @@ ABSL_FLAG(int, sac_failure_priority_min_hist_probes, 16,
           "SAC3 failure-priority: min probes for hist term");
 ABSL_FLAG(bool, sac_nsac_mask, true,
           "Enable NSAC allowed-constraints mask (restrict propagation to neighborhood)");
+ABSL_FLAG(bool, sac_use_batch3a, false,
+          "P1-1: Enable Batch-3A (constraint aggregation) in SAC3; disabled when NSAC mask is enabled");
 
 using namespace cpim;
 
@@ -158,6 +160,11 @@ GpuSearchStatistics RunGPUSolver(const model::IntermediateModel& im_model,
       GModelSolver::NSACMaskConfig nsac_mask;
       nsac_mask.enabled = absl::GetFlag(FLAGS_sac_nsac_mask);
       solver.SetNSACMaskConfig(nsac_mask);
+
+      // P1-1: Batch-3A optional accelerator (gating: auto fallback when NSAC enabled)
+      GModelSolver::Batch3AConfig batch3a;
+      batch3a.enabled = absl::GetFlag(FLAGS_sac_use_batch3a);
+      solver.SetBatch3AConfig(batch3a);
     }
   }
 
@@ -210,6 +217,7 @@ int main(int argc, char** argv) {
     std::cerr << "  --sac_mode=X      SAC 模式: sac1|sac3" << std::endl;
     std::cerr << "  --sac_failure_priority   SAC3: 失败概率优先调度（分桶队列）" << std::endl;
     std::cerr << "  --sac_nsac_mask          P0-2: NSAC allowed-constraints mask（默认启用）" << std::endl;
+    std::cerr << "  --sac_use_batch3a        P1-1: Batch-3A 约束聚合（SAC3，可选；NSAC 开启时自动回退）" << std::endl;
     return 1;
   }
 

@@ -58,6 +58,12 @@ host 侧的“外层队列预算”来避免 requeue/queue 爆炸；同时 AutoS
   - `SAC_PREPROCESS_REGRESSION` 移除 `large-80-unsat_ext.xml`（仍保留在 `perf`）
   - 增加 `composed-25-1-2-0_ext.xml` 作为“快速 UNSAT/DWO”回归样例
 
+## 2026-01-27
+
+- 新增规划文档 `docs/planning/DGPU_MEMORY_PLAN.md`：给出从 Jetson UMA 迁移到 PCIe dGPU（RTX 4060/4090/2080 等）
+  的内存后端设计（GPU-resident、pinned+async 双缓冲、delta 删除 GPU 应用、可消融/可回退/可观测），用于后续减少/隐藏 memcpy。
+- 更新文档导航 `docs/README.md`：注册 dGPU 内存规划文档入口。
+
 ## 2026-01-21
 
 ### Preprocess：补齐“回归/性能哨兵”评测集（suite）+ 澄清 SAC vs NSAC 口径

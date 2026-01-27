@@ -202,14 +202,41 @@ updated: 2026-01-25
 
 ### P2：bitGEMM/算子形态（以数据驱动决定是否推进重构）
 
-- [ ] **P2-1：bitGEMM Route-A（低风险，先拿收益曲线）**
-  - 目标：不改全局数据布局，先在 kernel 内对多 world 做复用/向量化，测“上限”。
-  - 载体：优先放在 Batch-3A（同 cid 多 world）或 Stage2（block 内处理多个 task）。
-  - 验收：给出 microbench + e2e 两条曲线，证明是否值得做 Route-B/C。
+- [ ] **P2-1：bitGEMM Route-A（低风险“算子试上限”，不改全局布局）**
+  - 目标：在 **不改 AoS 域布局**（`[world][var][word]`）的前提下，把 Batch‑3A 的“低 lane 利用率”问题转成
+    “同一 warp 同时处理多个 world”的向量化形态，先测算子上限并给出收益曲线。
+  - 关键约束（避免走歪路）：
+    - **必须保留现有 Warp‑per‑World 路径**（默认仍用旧实现），新实现必须可用 flag 切换，便于消融。
+    - Batch‑3A 当前 `world_mask` 为 `u32`（最多 32 worlds）；Route‑A 不应假设 `num_worlds=128/256` 这种规模。
+    - **避免“纯 Thread‑per‑World”**：在 AoS 下会导致 warp 内对 `bitDom` 的访问高度 stride（不同 world 距离极远），
+      Jetson UMA 上大概率更慢，且测不到 bitGEMM 的复用收益。
+  - 推荐实现形态：**Subwarp‑per‑World（可参数化）**
+    - 将一个 warp 切成 `subwarp_size ∈ {4,8,16}` 的小组；
+    - 每个 subwarp 处理 1 个 world（保留 `lane→word` 的连续访问），一个 warp 同时处理 `32/subwarp_size` 个 worlds；
+    - 好处：在 `bit_dom_int_size` 较小（例如 6/8/12）时，lane 利用率从 `6/32` 提升到 `6/8` 或 `6/16`，
+      同时不把访存从“同 world 连续 word”退化成“跨 world stride”。
+  - 参数化与消融（建议）：
+    - `--sac_batch3a_check_mapping=warp|subwarp`（默认 `warp`）
+    - `--sac_batch3a_subwarp=4|8|16`（默认 `8`，或按 `bit_dom_int_size` 自动选）
+    - 输出统计/CSV 增加：`batch3a_check_mapping/subwarp_size`（否则无法做 A/B 曲线）
+  - 载体与评测（先把“噪声”隔离开）：
+    - **microbench 优先**：只测 `ExecuteConstraintCheck_Aggregated*()` 的吞吐（`cid×world` 检查数 / 秒），避免
+      Batch‑3A 的任务构建、frontier 扫描、shared memory 装载等框架噪声掩盖算子收益。
+    - e2e（可选）：仅在筛到“深传播/删值多”的 hard‑cases 上复测；否则结论容易被“浅传播”样例误导。
+  - 验收（数据驱动）：
+    - microbench：在 `bit_dom_int_size<=8` 且 `world_mask_popcount>=8` 的区间出现稳定收益；否则 Route‑A 可止损。
+    - 正确性：与旧路径 `warp` 对比 **删值集合一致**（或更少删但不能多删；budget hit 一律 `UNKNOWN` 不删）。
 
 - [ ] **P2-2：bitGEMM Route-B（lane→world / warp 形态重排）**
-  - 目标：把 `lane` 从 `word/value` 改为 `world`，提升 warp 利用率与 dom 复用。
-  - 说明：这一步通常需要引入 SoA/packing（实现成本显著上升，需评估收益）。
+  - 目标：把 “world” 维度变成天然连续维（SoA/packing），让 `lane→world` 真正变成合并访存，并把 `dom_y`
+    以矩阵形态复用（从“像 bitGEMV”走向“像 bitGEMM”）。
+  - 说明：这是显著重构（会引入额外域存储/转换成本），**应以前置数据为门槛**：
+    - 只有当 P2‑1 的算子 microbench 显示“潜在收益足够大”，并且 hard‑cases 里存在“传播够深/删值够多”的任务，
+      Route‑B 才值得推进。
+  - 消融与回退要求（必须）：
+    - `--sac_dom_layout=aos|soa`（默认 `aos`）
+    - `--sac_support_backend=simt|bitgemm`（默认 `simt`；`soa+bitgemm` 才走新路径）
+    - 任意不满足对齐/阈值/设备能力时自动回退到 `aos+simt`。
 
 ### P3：BMMA（1-bit Tensor Core）实验后端（创新点）
 

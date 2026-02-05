@@ -4419,18 +4419,71 @@ void Batch3AKernel_MultiBlock(
   uint2* shmem_bitsup = reinterpret_cast<uint2*>(shmem_raw);
   u32* shared_del = reinterpret_cast<u32*>(shmem_raw + bitsup_size_bytes);
 
-  // Phase 0: 初始化本 block 的 world 子集
+  // --------------------------------------------------------------------------
+  // Phase 0: device 侧初始化（替代 host 端 InitializeWorlds 的逐 world memcpy/memset）
+  //
+  // 目标：
+  // - 并行恢复 snapshot（bitDom + dom_size）到每个 world 的私有域；
+  // - 并行重置 world 控制字段与结果数组；
+  // - 再执行 singleton assign + 初始 enqueue（probe var 的邻接约束）。
+  //
+  // 注：队列版 Batch-3A 不再依赖 ws->frontier_A/B，因此不在这里清零 frontier bitmap（否则成本与 num_cons 成正比）。
+  // --------------------------------------------------------------------------
+  const int num_vars = model.num_vars;
+  const int dom_words_per_world = num_vars * bit_dom_int_size;
+
+  // 0) 恢复 bitDom snapshot（block 内所有 worlds）
+  for (int idx = threadIdx.x;
+       idx < block_world_count * dom_words_per_world;
+       idx += blockDim.x) {
+    const int local_w = idx / dom_words_per_world;
+    const int word = idx - local_w * dom_words_per_world;
+    const int global_w = block_world_start + local_w;
+    WorldWorkspace* ws = &control->workspaces[global_w];
+    ws->bitDom[word] = control->domain_snapshot[word];
+  }
+
+  // 1) 恢复 dom_size snapshot（block 内所有 worlds）
+  for (int idx = threadIdx.x;
+       idx < block_world_count * num_vars;
+       idx += blockDim.x) {
+    const int local_w = idx / num_vars;
+    const int var = idx - local_w * num_vars;
+    const int global_w = block_world_start + local_w;
+    WorldWorkspace* ws = &control->workspaces[global_w];
+    ws->d_cur_dom_size[var] = control->dom_size_snapshot[var];
+  }
+  __syncthreads();
+
+  // 2) 重置 per-world 控制字段 + 默认结果为 true（consistent）
+  for (int local_w = threadIdx.x; local_w < block_world_count; local_w += blockDim.x) {
+    const int global_w = block_world_start + local_w;
+    WorldWorkspace* ws = &control->workspaces[global_w];
+    ws->inconsistent_flag = 0;
+    ws->scanner_index = 0;
+    ws->deletions = 0;
+    ws->iterations = 0;
+    ws->frontier_nonempty = 0;
+    ws->stagnation_count = 0;
+    ws->last_deletions = 0;
+    ws->last_frontier_popcount = 0;
+    ws->work_cnt = 0;
+    ws->total_constraints_checked = 0;
+    ws->quantum_exceeded = 0;
+    control->results[global_w] = true;
+  }
+  __syncthreads();
+
+  // 3) singleton assign + 初始 enqueue
   for (int local_w = threadIdx.x; local_w < block_world_count; local_w += blockDim.x) {
     const int global_w = block_world_start + local_w;
     WorldWorkspace* ws = &control->workspaces[global_w];
     const ProbeTask& task = control->world_probes[global_w];
 
-    // 单例赋值
     const int var_id = task.var_id;
     const int value = task.value;
 
-    if (var_id >= 0 && var_id < model.num_vars &&
-        value >= 0 && value < model.max_dom_size) {
+    if (var_id >= 0 && var_id < num_vars && value >= 0 && value < max_dom_size) {
       const int dom_base = var_id * bit_dom_int_size;
       const int word_idx = value / 32;
       const int bit_idx = value % 32;
@@ -4443,10 +4496,9 @@ void Batch3AKernel_MultiBlock(
       }
       ws->d_cur_dom_size[var_id] = 1;
 
-      // Dynamic Submission：初始时把 probe var 的邻接约束加入当前轮队列（A）
-      Batch3AEnqueueVarToNextQueue(var_id, local_w, model, frontier_mask_A,
-                                  cid_queue_A, queue_tail_A, queue_capacity,
-                                  overflow_flag);
+      Batch3AEnqueueVarToNextQueue(
+          var_id, local_w, model, frontier_mask_A, cid_queue_A, queue_tail_A,
+          queue_capacity, overflow_flag);
     } else {
       ws->inconsistent_flag = 1;
       control->results[global_w] = false;

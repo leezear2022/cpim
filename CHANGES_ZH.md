@@ -28,6 +28,29 @@
 - microbench（mapping=2 / perf suite，对照 Stage2）：`out/batch3a_queue_vs_stage2_perf_10min.csv` 中 `speedup_vs_stage2≈0.03–0.12`
   （8×–30× 慢于 Stage2），说明去掉“开头扫全约束”后瓶颈主要转向 host 侧框架成本（`InitializeWorlds` 等）。
 
+### Batch-3A：Phase0 device 初始化（跳过 host InitializeWorlds）
+
+**动机**：Dynamic Submission 去掉了 kernel 内的“开头扫全约束”，但 microbench 仍显示 8×–30× 回退；
+进一步定位表明 host 侧 `InitializeWorlds()` 的逐 world `cudaMemcpy/cudaMemset + synchronize` 是主要框架瓶颈之一。
+
+**交付内容**：
+- `src/solver/gpu/GModel.cu`：扩展 `Batch3AKernel_MultiBlock` 的 Phase0：
+  - device 并行恢复 snapshot：`domain_snapshot → ws->bitDom`，`dom_size_snapshot → ws->d_cur_dom_size`
+  - 初始化 `WorldWorkspace` 控制字段与 `results[w]=true`
+  - singleton assign + 初始 enqueue（probe var 的 subscription）
+  - 队列版不再依赖 `ws->frontier_A/B`，Phase0 不清零 frontier bitmap（避免 O(num_cons) 纯开销）
+- `src/solver/gpu/batch_probe_manager.cu`：
+  - `Batch3AManager::Execute()` 跳过 `InitializeWorlds()`
+  - `Batch3AManager::LaunchBatch3AKernel()` 补齐全局控制初始化（`active_world_mask/global_iteration/stats`）
+
+**测试结果**：
+- `make -j$(nproc)`：通过
+- `python3 tests/python/batch_test_v2.py --tier=0`：8/12 (66%)，与历史基线一致
+- `./build/test_batch3a`：通过
+- microbench smoke（perf suite 取 3 个实例，mapping=2，对照 Stage2）：
+  - `out/batch3a_queue_phase0init_smoke.csv`：`speedup_vs_stage2≈0.17–0.26`
+  - 含义：回退显著收敛，但仍慢于 Stage2，后续仍需继续拆解剩余瓶颈
+
 ## 2026-01-29
 
 ### P2-2c：Batch-3A microbench 升级为 Stage2 对照（同口径 speedup）

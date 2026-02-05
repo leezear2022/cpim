@@ -26,20 +26,23 @@ updated: 2026-02-05
   - `include/solver/gpu/batch_probe_manager.h`：`Batch3AControl` 新增 per-block 队列与 mask 字段
   - `src/solver/gpu/batch_probe_manager.cu`：
     - `Batch3AManager::AllocateMemory()`：分配队列/掩码缓冲区（`queue_capacity_=num_cons`）
-    - `Batch3AManager::LaunchBatch3AKernel()`：launch 前 `cudaMemset` 清零 mask/queue_tail/overflow
+    - `Batch3AManager::LaunchBatch3AKernel()`：launch 前 `cudaMemset` 清零 mask/queue_tail/overflow，并初始化全局控制
+      （替代 `InitializeWorlds()` 的 host 侧逐 world 初始化）
+    - `Batch3AManager::Execute()`：已跳过 `InitializeWorlds()`（避免 host 循环的 `cudaMemcpy/cudaMemset` 纯开销）
 - Device 侧队列原语 + kernel：
   - `src/solver/gpu/GModel.cu`：
     - `Batch3AEnqueueConstraintToNextQueue()` / `Batch3AEnqueueVarToNextQueue()`
     - `Batch3AKernel_MultiBlock`：双队列 A/B worklist 驱动（round-based）
-
-> 注：当前版本仍保留 host 侧 `InitializeWorlds()` 的 snapshot 恢复（每批次）；后续可按 5.3 的建议，
-> 把恢复/清零搬到 Phase0（device 内并行），进一步降低框架开销。
+      - Phase0 已扩展为 device 侧并行恢复 snapshot（`bitDom + dom_size`）+ 初始化 `WorldWorkspace` 状态 + singleton assign
+      - 队列版不再依赖 `ws->frontier_A/B`，Phase0 不清零 frontier bitmap（否则成本与 `num_cons` 成正比）
 
 **初步对照结果（perf suite / mapping=2）**：
 - 命令：`python3 tests/python/batch_batch3a_microbench.py --suite=perf --include-stage2=1 --mappings=2 ... --csv=out/batch3a_queue_vs_stage2_perf_10min.csv`
-- 结论：`speedup_vs_stage2` 仍为 `0.03–0.12`（约 8×–30× 慢于 Stage2），未达到“可接受回退（<5×）/接近 1×”门槛。
-- 含义：Dynamic Submission 解决了“开头扫全约束”的结构性问题，但 **仍不足以让 Batch‑3A 在现有样例上接近 Stage2**；
-  下一步需要把 host 侧 `InitializeWorlds()` 的框架成本下沉到 device Phase0（见 5.3）。
+- 队列版（Phase0 下沉前）结论：`speedup_vs_stage2≈0.03–0.12`（约 8×–30× 慢于 Stage2），未达到“可接受回退（<5×）/接近 1×”门槛。
+- **更新（device Phase0 下沉后，smoke / 3 个 perf 样例）**：
+  - `out/batch3a_queue_phase0init_smoke.csv`：`speedup_vs_stage2≈0.17–0.26`（仍慢于 Stage2，但框架回退显著收敛）
+- 含义：Dynamic Submission 解决了“开头扫全约束”的结构性问题；Phase0 下沉验证了 “host 侧逐 world 初始化”确实是主要框架瓶颈之一。
+  但要达到接近 Stage2 的吞吐，还需要进一步处理（见 7 节风险项）。
 
 ## 1. 关键约束（必须守住）
 
@@ -146,10 +149,13 @@ Finalize:
 
 ### 5.3 初始化：Phase0 不再依赖 host 侧“逐 world memcpy/memset”
 
-建议（可选但强烈推荐）：
+已落地（强烈推荐项已完成）：
 
-- 把 `InitializeWorlds()` 的 snapshot restore + frontier 清零搬到 Phase0（device 内并行完成），
-  这样能显著降低 host 侧 `cudaMemcpy/cudaMemset/cudaDeviceSynchronize` 的框架成本。
+- `Batch3AKernel_MultiBlock` Phase0 现在会在 device 内并行完成：
+  - snapshot restore：`domain_snapshot → ws->bitDom`，`dom_size_snapshot → ws->d_cur_dom_size`
+  - world 状态初始化：`inconsistent/scanner/deletions/iterations/...` 与 `results[w]=true`
+  - singleton assign + 初始 enqueue（probe var 的 subscription）
+- `Batch3AManager::Execute()` 已跳过 `InitializeWorlds()`，避免 host 侧 O(worlds) 的 `cudaMemcpy/cudaMemset` 纯开销。
 
 ## 6. 观测与验收（最小闭环）
 

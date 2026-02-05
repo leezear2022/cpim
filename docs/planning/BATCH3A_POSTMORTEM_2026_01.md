@@ -1,6 +1,6 @@
 ---
 status: active
-updated: 2026-01-30
+updated: 2026-02-05
 ---
 
 # Batch-3A（Constraint Aggregation）性能回退复盘（2026-01）
@@ -23,6 +23,13 @@ updated: 2026-01-30
 > 初步对照（`out/batch3a_queue_vs_stage2_perf_10min.csv`）显示 mapping=2 仍为 `speedup_vs_stage2≈0.03–0.12`
 >（8×–30× 慢于 Stage2），说明“开头扫”并非唯一决定性瓶颈；**host 侧分批初始化/同步**仍然是需要优先处理的框架成本。
 > 本复盘仍保留用于解释 **为什么扫描版会结构性回退**，并作为后续优化（把初始化下沉到 device Phase0 等）的对照基线。
+>
+> **更新（2026-02-05）**：已将 `InitializeWorlds()` 的 snapshot restore + world 状态初始化下沉到
+> `Batch3AKernel_MultiBlock` 的 Phase0（device 并行执行），并在 `Batch3AManager::Execute()` 中跳过
+> host 侧逐 world 的 `cudaMemcpy/cudaMemset` 循环。smoke 对照（3 个 perf 样例，见
+> `out/batch3a_queue_phase0init_smoke.csv`）显示 `speedup_vs_stage2≈0.17–0.26`（仍慢于 Stage2，但框架回退明显收敛）。
+> 这验证了 3.2 的判断：host 初始化是主要瓶颈之一；后续若继续“救 Batch‑3A”，应优先把剩余 host 框架成本继续下沉到 device
+>（例如把 task batching/拷贝进一步合并，或把更多统计/清零移到 kernel 内）。
 
 ## 1. 如何复现（同口径对照）
 

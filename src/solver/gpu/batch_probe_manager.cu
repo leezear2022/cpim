@@ -2273,6 +2273,17 @@ void Batch3AManager::LaunchBatch3AKernel(int num_worlds) {
              num_worlds * sizeof(ProbeTask),
              cudaMemcpyHostToDevice);
 
+  // 初始化全局控制（从 InitializeWorlds 下沉过来；避免 host 侧逐 world memcpy/memset）
+  *d_global_iteration_ = 0;
+  *d_all_converged_flag_ = 0;
+  *d_any_world_active_ = 1;
+  *d_active_world_mask_ =
+      (num_worlds >= 32) ? 0xFFFFFFFFu : ((1u << num_worlds) - 1u);
+  if (stats_enabled_) {
+    *d_total_constraint_checks_ = 0;
+    *d_total_deletions_ = 0;
+  }
+
   // 清空 Dynamic Submission 队列与 mask（每次 kernel 启动前重置）
   const int num_cons = model_->GetNumCons();
   const size_t mask_bytes =
@@ -2406,9 +2417,6 @@ int Batch3AManager::Execute(std::vector<int>& failed_vars,
     if (offset == 0) {
       SaveSnapshot();
     }
-
-    // 初始化 worlds
-    InitializeWorlds(batch_size);
 
     // 构建约束任务
     BuildConstraintTasks(batch_size);

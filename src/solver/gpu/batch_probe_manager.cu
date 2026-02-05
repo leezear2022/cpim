@@ -15,6 +15,21 @@
 
 namespace cpim {
 
+namespace {
+
+int SanitizeSubwarpSize(int subwarp_size) {
+  switch (subwarp_size) {
+    case 4:
+    case 8:
+    case 16:
+      return subwarp_size;
+    default:
+      return 8;
+  }
+}
+
+}  // namespace
+
 // ============================================================================
 // 构造函数
 // ============================================================================
@@ -2222,6 +2237,10 @@ void Batch3AManager::LaunchBatch3AKernel(int num_worlds) {
   d_control_->num_blocks = num_blocks_;
   d_control_->max_iterations = max_iterations_;
   d_control_->activation_strategy = activation_strategy_;
+  d_control_->check_mapping = static_cast<int>(check_mapping_);
+  d_control_->subwarp_size = SanitizeSubwarpSize(subwarp_size_);
+  d_control_->requested_worlds_per_block = requested_worlds_per_block_;
+  d_control_->shmem_padding = shmem_padding_ ? 1 : 0;
   d_control_->total_constraint_checks = stats_enabled_ ? d_total_constraint_checks_ : nullptr;
   d_control_->total_deletions = stats_enabled_ ? d_total_deletions_ : nullptr;
 

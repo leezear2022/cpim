@@ -1,5 +1,42 @@
 # 修改清单（中文）
 
+## 2026-01-29
+
+### P2-2c：Batch-3A microbench 升级为 Stage2 对照（同口径 speedup）
+
+**动机**：此前 P2-2c 只跑 `--mode=batch3a`，只能比较不同 `G/padding` 的相对曲线，无法回答
+“Batch-3A（mapping=0/1/2）相对 Stage2 的真实 speedup 在哪些实例上成立”。这会直接影响
+“要不要继续推进更重的 SoA/flatten”决策。
+
+**交付内容**：
+- `tests/python/batch_batch3a_microbench.py`：
+  - 新增 `--include-stage2`：先跑 `--mode=stage2` baseline，再跑 `--mode=batch3a`；
+  - 新增 `--mappings/--subwarp-sizes/--padding-values`：支持一次跑全消融组合；
+  - CSV 增加 `stage2_avg_time_ms` 与 `speedup_vs_stage2` 字段，便于直接做 go/no-go。
+  - 跑通 `suite=perf` 的 10 分钟对照样例（输出 `out/batch3a_vs_stage2_perf_10min.csv`），用于判断是否值得继续推进 SoA/flatten。
+  - 跑通 `suite=stress` 的大实例门槛验证（输出 `out/batch3a_vs_stage2_stress_20min.csv`）：
+    - `large-80/84`：Batch‑3A（mapping=2）相对 Stage2 的 `speedup_vs_stage2` 约 0.028–0.042（24×–36× 慢）
+    - `large-92`：模型构建阶段触发 CUDA OOM（Stage2 baseline 无法获得）
+
+### Suite：perf 哨兵剥离大实例到 stress（避免被解析/建模 wall-time 污染）
+
+**调整**：
+- `tests/python/sac_preprocess_tier_definitions.py`：
+  - `SAC_PREPROCESS_PERF_SENTINELS` 移除 `benchmarks/marc/large-80-unsat_ext.xml` / `large-84-unsat_ext.xml`
+  - 二者移动到 `SAC_PREPROCESS_STRESS`（在 60s perf 预算下容易 timeout，更适合单独拉高 timeout 跑）
+
+### Docs：P2 任务状态与门槛更新
+
+- `docs/planning/TODO_SACGPU_NEXT.md`：
+  - 标记 P2-2b/P2-2c 已落地；
+  - 补充 “何时进入 SoA/flatten” 的 go/no-go 门槛（基于 `speedup_vs_stage2` 的硬数据）。
+
+### Docs：新增 Batch-3A 性能回退复盘文档（便于外部复核）
+
+- 新增 `docs/planning/BATCH3A_POSTMORTEM_2026_01.md`：汇总 Batch‑3A 在 perf/stress 上结构性慢于 Stage2 的主要瓶颈
+  （kernel 内单线程全量扫描构建任务 + host 分批初始化/同步 + mapping=2 pack/unpack 开销），并附关键代码片段与复现实验命令。
+- 更新 `docs/README.md`：注册上述复盘文档入口。
+
 ## 2026-01-25
 
 ### P0-3：统一观测入口落地（full_sac vs SAC1/SAC3 preprocess 同口径）
@@ -59,6 +96,55 @@ host 侧的“外层队列预算”来避免 requeue/queue 爆炸；同时 AutoS
   - 增加 `composed-25-1-2-0_ext.xml` 作为“快速 UNSAT/DWO”回归样例
 
 ## 2026-01-27
+
+### P2-1：Batch-3A Route-A（Subwarp-per-World）算子形态试上限
+
+**动机**：Batch-3A 的现有 Warp-per-World 在 `bit_dom_int_size` 较小（例如 6/8/12）时容易出现 lane 利用率低，
+但直接做 AoS 下的 “Thread-per-World” 会把 `bitDom` 访问退化成跨 world 的 stride 访存（UMA 上大概率更慢）。
+因此先落地 **Subwarp-per-World**（在不改 AoS 布局前提下的低风险向量化），用于评估是否值得推进后续 SoA/packing（P2-2）。
+
+**交付内容**：
+- `include/solver/gpu/batch_probe_manager.h` / `src/solver/gpu/batch_probe_manager.cu`：
+  - Batch-3A 新增 `check_mapping/subwarp_size`（`kWarpPerWorld` vs `kSubwarpPerWorld`，`subwarp_size=4/8/16`）
+  - `Batch3AManager` 增加对应 setter，保持默认不变（便于消融）
+- `src/solver/gpu/GModel.cu`：
+  - 新增 `ExecuteConstraintCheck_Aggregated_SubwarpPerWorld()` 并在 Batch-3A kernel 中按 `check_mapping` 分发
+  - 修复 Batch-3A wrapper 的 dynamic shared memory 计算：仅计入 `bitSup + del_buffer`，避免把静态 shared 数组重复计入
+- `apps/sac_benchmark.cpp` / `tests/cpp/test_batch3a.cpp`：
+  - 新增 flags：`--batch3a_check_mapping` / `--batch3a_subwarp_size`，用于 A/B 消融对照
+
+**测试结果**：
+- `python3 tests/python/batch_test_v2.py --tier=0`：8/12 (66%)，与历史基线一致，无退化（不匹配项仍为 CPIM 超时）。
+- `./build/test_batch3a`：`mapping=0` 与 `mapping=1` 均通过，且与 Stage2 结果一致。
+
+### P2-2：Batch-3A Route-B 原型（warp-per-word + lane-per-world + shared dom packing）
+
+**动机**：P2-1 的 Subwarp-per-World 依然受 AoS（`[world][var][word]`）带来的跨 world stride 访存影响，
+理论性能上限偏低。P2-2 先落地一个 **不改全局 layout** 的原型：在 shared memory 中把 dom 打包成 `[word][world]` 矩阵，
+让热点访问在 block 内变成“像 SoA”。
+
+**交付内容**：
+- `include/solver/gpu/batch_probe_manager.h`：`Batch3ACheckMapping` 新增 `kWarpPerWordLaneWorld=2`
+- `src/solver/gpu/GModel.cu`：
+  - 新增 `ExecuteConstraintCheck_Aggregated_WarpPerWordLaneWorld()`：计算阶段 lane→world，应用阶段保留 warp-per-world
+  - Batch-3A dispatch 支持 `mapping=2`
+  - wrapper 对 `mapping=2` 调整 `worlds_per_block` 默认值与 dynamic shared memory 预算
+- `apps/sac_benchmark.cpp` / `tests/cpp/test_batch3a.cpp`：`--batch3a_check_mapping` 扩展支持 `2`
+
+**测试结果**：
+- `python3 tests/python/batch_test_v2.py --tier=0`：8/12 (66%)，与历史基线一致，无退化（不匹配项仍为 CPIM 超时）。
+- `./build/test_batch3a --batch3a_check_mapping=2`：与 Stage2 结果一致。
+
+- P2-2 调参入口（G 参数化）：
+  - `include/solver/gpu/batch_probe_manager.h` / `src/solver/gpu/batch_probe_manager.cu` / `src/solver/gpu/GModel.cu`：
+    - `Batch3AControl` 新增 `requested_worlds_per_block`（0=auto）
+    - wrapper 在 `mapping=2` 时支持覆盖 `G`
+  - `apps/sac_benchmark.cpp` / `tests/cpp/test_batch3a.cpp`：
+    - 新增 `--batch3a_worlds_per_block=0|1..32`（默认 0，不改变现有行为）
+  - P2-2c microbench 工具：
+    - 新增脚本 `tests/python/batch_batch3a_microbench.py`：批量跑 `./build/sac_benchmark --mode=batch3a` 扫 `G` 并导出 CSV（支持 `--resume`/原子 flush）。
+  - P2-2b shared padding：
+    - `--batch3a_shmem_padding=0|1`（默认 0；仅对 `mapping=2` 的 shared packing 生效），通过 pitch padding（`G+1`）降低 bank conflict 风险。
 
 - 新增规划文档 `docs/planning/DGPU_MEMORY_PLAN.md`：给出从 Jetson UMA 迁移到 PCIe dGPU（RTX 4060/4090/2080 等）
   的内存后端设计（GPU-resident、pinned+async 双缓冲、delta 删除 GPU 应用、可消融/可回退/可观测），用于后续减少/隐藏 memcpy。

@@ -3694,15 +3694,15 @@ int GModel::GetNextValue(int var, int value) const {
 // Batch-3A: 约束聚合 Kernel 实现
 // ============================================================================
 
-// ExecuteConstraintCheck_Aggregated - 对多个 world 检查同一约束
+// ExecuteConstraintCheck_Aggregated_WarpPerWorld - 对多个 world 检查同一约束
 // bitSup 已加载到 shared memory，对 world_mask 中的每个活跃 world 执行检查
 // ============================================================================
-// Warp-per-World 版本：G 个 warp 并行处理 G 个 world（支持多 Block）
-// shared_del 布局：[num_warps * 2 * MAX_BIT_DOM_INT_SIZE]
+// Warp-per-World 版本：每个 warp 处理 1 个 world（支持多 Block）
+// shared_del 布局：[num_warps * 2 * bit_dom_int_size]
 // 每个 warp 有独立的删除缓冲区
 // ============================================================================
 __device__
-void ExecuteConstraintCheck_Aggregated(
+void ExecuteConstraintCheck_Aggregated_WarpPerWorld(
     int cid,
     u32 local_world_mask,       // 局部 world 掩码（0 ~ G-1 位）
     int block_world_start,      // 本 block 的 world 起始索引
@@ -3869,12 +3869,436 @@ void ExecuteConstraintCheck_Aggregated(
       }
 
       ws->deletions += x_deletions + y_deletions;
+
+      // 可选统计：约束检查次数与删值数
+      if (control->total_constraint_checks) {
+        atomicAdd(control->total_constraint_checks, 1ull);
+      }
+      if (control->total_deletions) {
+        atomicAdd(control->total_deletions,
+                  static_cast<unsigned long long>(x_deletions + y_deletions));
+      }
     }
     __syncwarp();
   }
 
   // 最后同步所有 warp
   __syncthreads();
+}
+
+// ============================================================================
+// ExecuteConstraintCheck_Aggregated_SubwarpPerWorld - Route-A（P2-1）
+// 目标：在不改 AoS（[world][var][word]）布局前提下，提高小域场景的 lane 利用率。
+//
+// 思路：把一个 warp 切成多个 subwarp（4/8/16），每个 subwarp 处理 1 个 world。
+// shared_del 布局按 world 分片：[worlds_per_block * 2 * bit_dom_int_size]。
+// ============================================================================
+__device__
+void ExecuteConstraintCheck_Aggregated_SubwarpPerWorld(
+    int cid,
+    u32 local_world_mask,       // 局部 world 掩码（0 ~ G-1 位）
+    int block_world_start,      // 本 block 的 world 起始索引
+    int block_world_count,      // 本 block 的 world 数量
+    const GModelData& model,
+    Batch3AControl* control,
+    const uint2* shmem_bitsup,  // bitSup 在 shared memory
+    u32* shared_del) {          // 布局: [worlds_per_block * 2 * bit_dom_int_size]
+
+  const int warp_id = threadIdx.x / 32;
+  const int lane_id = threadIdx.x % 32;
+
+  int subwarp_size = control->subwarp_size;
+  if (subwarp_size != 4 && subwarp_size != 8 && subwarp_size != 16) {
+    subwarp_size = 8;
+  }
+  const int subwarp_id = lane_id / subwarp_size;
+  const int lane_in_subwarp = lane_id % subwarp_size;
+  const int worlds_per_warp = 32 / subwarp_size;
+
+  // 该 subwarp 对应的局部 world 索引
+  const int local_w = warp_id * worlds_per_warp + subwarp_id;
+  if (local_w >= block_world_count) {
+    return;
+  }
+  if ((local_world_mask & (1u << local_w)) == 0) {
+    return;
+  }
+
+  const int2 scope = model.constraint_scopes[cid];
+  const int x = scope.x;
+  const int y = scope.y;
+  const int bit_dom_int_size = model.bit_dom_int_size;
+  const int max_dom_size = model.max_dom_size;
+
+  const int global_w = block_world_start + local_w;
+  WorldWorkspace* ws = &control->workspaces[global_w];
+  if (ws->inconsistent_flag == 1) {
+    return;
+  }
+
+  u32* bitDom = ws->bitDom;
+  int* dom_size = ws->d_cur_dom_size;
+  const int x_base = x * bit_dom_int_size;
+  const int y_base = y * bit_dom_int_size;
+
+  // 每个 world 一份删除缓冲区
+  u32* world_del = shared_del + local_w * 2 * bit_dom_int_size;
+
+  // 子 warp mask（用于局部同步）
+  const unsigned int subwarp_mask =
+      ((1u << subwarp_size) - 1u) << (subwarp_id * subwarp_size);
+
+  // 计算删除掩码：每个 lane 处理若干 word
+  for (int word = lane_in_subwarp; word < bit_dom_int_size; word += subwarp_size) {
+    const u32 x_word = bitDom[x_base + word];
+    const u32 y_word = bitDom[y_base + word];
+
+    u32 del_x = 0u;
+    u32 del_y = 0u;
+
+    // X→Y 支持检查
+    u32 x_bits = x_word;
+    while (x_bits != 0u) {
+      const int bit = __ffs(x_bits) - 1;
+      x_bits &= ~(1u << bit);
+      const int a = word * 32 + bit;
+
+      bool has_support = false;
+      for (int w2 = 0; w2 < bit_dom_int_size && !has_support; ++w2) {
+        const u32 y_dom = bitDom[y_base + w2];
+        if (y_dom == 0u) continue;
+
+        const int bitsup_idx = a * bit_dom_int_size + w2;
+        const uint2 sup = shmem_bitsup[bitsup_idx];
+        if ((sup.x & y_dom) != 0u) {
+          has_support = true;
+        }
+      }
+
+      if (!has_support) {
+        del_x |= (1u << bit);
+      }
+    }
+
+    // Y→X 支持检查
+    u32 y_bits = y_word;
+    while (y_bits != 0u) {
+      const int bit = __ffs(y_bits) - 1;
+      y_bits &= ~(1u << bit);
+      const int b = word * 32 + bit;
+
+      bool has_support = false;
+      for (int w2 = 0; w2 < bit_dom_int_size && !has_support; ++w2) {
+        const u32 x_dom = bitDom[x_base + w2];
+        if (x_dom == 0u) continue;
+
+        const int bitsup_idx = (max_dom_size + b) * bit_dom_int_size + w2;
+        const uint2 sup = shmem_bitsup[bitsup_idx];
+        if ((sup.y & x_dom) != 0u) {
+          has_support = true;
+        }
+      }
+
+      if (!has_support) {
+        del_y |= (1u << bit);
+      }
+    }
+
+    world_del[word] = del_x;
+    world_del[bit_dom_int_size + word] = del_y;
+  }
+
+  __syncwarp(subwarp_mask);
+
+  // 每个 subwarp 的 lane0 负责应用删除与更新 frontier/统计
+  if (lane_in_subwarp == 0) {
+    int x_deletions = 0;
+    int y_deletions = 0;
+
+    for (int w = 0; w < bit_dom_int_size; ++w) {
+      const u32 del_x_word = world_del[w];
+      const u32 del_y_word = world_del[bit_dom_int_size + w];
+
+      if (del_x_word != 0u) {
+        const u32 old_x = bitDom[x_base + w];
+        const u32 new_x = old_x & ~del_x_word;
+        if (new_x != old_x) {
+          bitDom[x_base + w] = new_x;
+          x_deletions += __popc(old_x) - __popc(new_x);
+        }
+      }
+
+      if (del_y_word != 0u) {
+        const u32 old_y = bitDom[y_base + w];
+        const u32 new_y = old_y & ~del_y_word;
+        if (new_y != old_y) {
+          bitDom[y_base + w] = new_y;
+          y_deletions += __popc(old_y) - __popc(new_y);
+        }
+      }
+    }
+
+    const int x_size = dom_size[x] - x_deletions;
+    const int y_size = dom_size[y] - y_deletions;
+    dom_size[x] = x_size;
+    dom_size[y] = y_size;
+
+    if (x_size == 0 || y_size == 0) {
+      ws->inconsistent_flag = 1;
+      control->results[global_w] = false;
+    } else {
+      if (x_deletions > 0) {
+        PropagateVarToNextBitmap(x, model, ws->frontier_B);
+      }
+      if (y_deletions > 0) {
+        PropagateVarToNextBitmap(y, model, ws->frontier_B);
+      }
+    }
+
+    ws->deletions += x_deletions + y_deletions;
+
+    if (control->total_constraint_checks) {
+      atomicAdd(control->total_constraint_checks, 1ull);
+    }
+    if (control->total_deletions) {
+      atomicAdd(control->total_deletions,
+                static_cast<unsigned long long>(x_deletions + y_deletions));
+    }
+  }
+
+  __syncwarp(subwarp_mask);
+}
+
+// ============================================================================
+// ExecuteConstraintCheck_Aggregated_WarpPerWordLaneWorld - Route-B（P2-2 原型）
+//
+// 目标：将“world 维度”映射到 warp 的 lane（lane→world），并在 shared memory 中
+// packing dom 矩阵（[word][world]），以减少重复的全局 dom 读。
+//
+// 注意：
+// - 仍保留 AoS 的 workspace bitDom（[var][word] per world），避免全局大重构；
+// - 通过 shared packing 把热点访问形态变成“像 SoA”；
+// - 该实现用于评估算子上限，后续若收益足够，再考虑真正的 SoA/packing（P2-2 继续推进）。
+// ============================================================================
+__device__
+void ExecuteConstraintCheck_Aggregated_WarpPerWordLaneWorld(
+    int cid,
+    u32 local_world_mask,       // 局部 world 掩码（0 ~ G-1 位）
+    int block_world_start,      // 本 block 的 world 起始索引
+    int block_world_count,      // 本 block 的 world 数量
+    const GModelData& model,
+    Batch3AControl* control,
+    const uint2* shmem_bitsup,  // bitSup 在 shared memory
+    u32* shared_buf) {          // dynamic shared buffer（bitsup 之后）
+
+  const int warp_id = threadIdx.x / 32;
+  const int lane_id = threadIdx.x % 32;
+  const int num_warps = blockDim.x / 32;
+
+  const int2 scope = model.constraint_scopes[cid];
+  const int x = scope.x;
+  const int y = scope.y;
+  const int bit_dom_int_size = model.bit_dom_int_size;
+  const int max_dom_size = model.max_dom_size;
+
+  // shared layout（按 block_world_count 变长）：
+  //   sh_dom_x[word][world]  : W*G
+  //   sh_dom_y[word][world]  : W*G
+  //   sh_del_x[word][world]  : W*G
+  //   sh_del_y[word][world]  : W*G
+  const int G = block_world_count;
+  // P2-2b：shared packing stride padding（通过扩大 world 维的 pitch 来打散 bank 访问模式）。
+  // 说明：
+  // - pitch 用 block 的最大 world-group（control->worlds_per_block）定义，保证同一 block 内布局一致；
+  // - local_w 仍是 [0, G) 的有效 world 索引；pitch 的额外列仅用于 padding。
+  const int base_pitch = control->worlds_per_block;
+  const int pitch =
+      (control->shmem_padding != 0) ? (base_pitch + 1) : base_pitch;
+  u32* sh_dom_x = shared_buf;
+  u32* sh_dom_y = sh_dom_x + bit_dom_int_size * pitch;
+  u32* sh_del_x = sh_dom_y + bit_dom_int_size * pitch;
+  u32* sh_del_y = sh_del_x + bit_dom_int_size * pitch;
+
+  // --------------------------------------------------------------------------
+  // Phase A: warp-per-world 方式把 x/y 的 dom packing 到 shared（并清零 del）
+  // --------------------------------------------------------------------------
+  for (int local_w = warp_id; local_w < G; local_w += num_warps) {
+    const int global_w = block_world_start + local_w;
+    WorldWorkspace* ws = &control->workspaces[global_w];
+
+    const bool active =
+        ((local_world_mask & (1u << local_w)) != 0) && ws->inconsistent_flag == 0;
+
+    if (!active) {
+      for (int word = lane_id; word < bit_dom_int_size; word += 32) {
+        const int idx = word * pitch + local_w;
+        sh_dom_x[idx] = 0u;
+        sh_dom_y[idx] = 0u;
+        sh_del_x[idx] = 0u;
+        sh_del_y[idx] = 0u;
+      }
+      continue;
+    }
+
+    const u32* bitDom = ws->bitDom;
+    const int x_base = x * bit_dom_int_size;
+    const int y_base = y * bit_dom_int_size;
+
+    for (int word = lane_id; word < bit_dom_int_size; word += 32) {
+      const int idx = word * pitch + local_w;
+      sh_dom_x[idx] = bitDom[x_base + word];
+      sh_dom_y[idx] = bitDom[y_base + word];
+      sh_del_x[idx] = 0u;
+      sh_del_y[idx] = 0u;
+    }
+  }
+  __syncthreads();
+
+  // --------------------------------------------------------------------------
+  // Phase B: warp-per-word + lane-per-world 计算 del（仅写 shared_del）
+  // --------------------------------------------------------------------------
+  const int local_w = lane_id;
+  if (local_w < G && ((local_world_mask & (1u << local_w)) != 0)) {
+    const int global_w = block_world_start + local_w;
+    WorldWorkspace* ws = &control->workspaces[global_w];
+
+    if (ws->inconsistent_flag == 0) {
+      for (int word = warp_id; word < bit_dom_int_size; word += num_warps) {
+        const int idx = word * pitch + local_w;
+        const u32 x_word = sh_dom_x[idx];
+        const u32 y_word = sh_dom_y[idx];
+
+        u32 del_x = 0u;
+        u32 del_y = 0u;
+
+        // X→Y 支持检查（按 bit 遍历当前 word）
+        u32 x_bits = x_word;
+        while (x_bits != 0u) {
+          const int bit = __ffs(x_bits) - 1;
+          x_bits &= ~(1u << bit);
+          const int a = word * 32 + bit;
+          if (a >= max_dom_size) continue;
+
+          bool has_support = false;
+          for (int w2 = 0; w2 < bit_dom_int_size && !has_support; ++w2) {
+            const u32 y_dom = sh_dom_y[w2 * pitch + local_w];
+            if (y_dom == 0u) continue;
+            const int bitsup_idx = a * bit_dom_int_size + w2;
+            const uint2 sup = shmem_bitsup[bitsup_idx];
+            if ((sup.x & y_dom) != 0u) {
+              has_support = true;
+            }
+          }
+          if (!has_support) {
+            del_x |= (1u << bit);
+          }
+        }
+
+        // Y→X 支持检查（按 bit 遍历当前 word）
+        u32 y_bits = y_word;
+        while (y_bits != 0u) {
+          const int bit = __ffs(y_bits) - 1;
+          y_bits &= ~(1u << bit);
+          const int b = word * 32 + bit;
+          if (b >= max_dom_size) continue;
+
+          bool has_support = false;
+          for (int w2 = 0; w2 < bit_dom_int_size && !has_support; ++w2) {
+            const u32 x_dom = sh_dom_x[w2 * pitch + local_w];
+            if (x_dom == 0u) continue;
+            const int bitsup_idx = (max_dom_size + b) * bit_dom_int_size + w2;
+            const uint2 sup = shmem_bitsup[bitsup_idx];
+            if ((sup.y & x_dom) != 0u) {
+              has_support = true;
+            }
+          }
+          if (!has_support) {
+            del_y |= (1u << bit);
+          }
+        }
+
+        sh_del_x[word * pitch + local_w] = del_x;
+        sh_del_y[word * pitch + local_w] = del_y;
+      }
+    }
+  }
+  __syncthreads();
+
+  // --------------------------------------------------------------------------
+  // Phase C: warp-per-world 应用删除（lane→word），并更新 dom_size/frontier
+  // --------------------------------------------------------------------------
+  for (int local_w2 = warp_id; local_w2 < G; local_w2 += num_warps) {
+    if ((local_world_mask & (1u << local_w2)) == 0) continue;
+
+    const int global_w = block_world_start + local_w2;
+    WorldWorkspace* ws = &control->workspaces[global_w];
+    if (ws->inconsistent_flag == 1) continue;
+
+    u32* bitDom = ws->bitDom;
+    int* dom_size = ws->d_cur_dom_size;
+    const int x_base = x * bit_dom_int_size;
+    const int y_base = y * bit_dom_int_size;
+
+    int x_deletions = 0;
+    int y_deletions = 0;
+
+    for (int word = lane_id; word < bit_dom_int_size; word += 32) {
+      const u32 del_x_word = sh_del_x[word * pitch + local_w2];
+      const u32 del_y_word = sh_del_y[word * pitch + local_w2];
+
+      if (del_x_word != 0u) {
+        const u32 old_x = bitDom[x_base + word];
+        const u32 new_x = old_x & ~del_x_word;
+        if (new_x != old_x) {
+          bitDom[x_base + word] = new_x;
+          x_deletions += __popc(old_x) - __popc(new_x);
+        }
+      }
+      if (del_y_word != 0u) {
+        const u32 old_y = bitDom[y_base + word];
+        const u32 new_y = old_y & ~del_y_word;
+        if (new_y != old_y) {
+          bitDom[y_base + word] = new_y;
+          y_deletions += __popc(old_y) - __popc(new_y);
+        }
+      }
+    }
+
+    // warp reduce
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      x_deletions += __shfl_down_sync(0xFFFFFFFFu, x_deletions, offset);
+      y_deletions += __shfl_down_sync(0xFFFFFFFFu, y_deletions, offset);
+    }
+
+    if (lane_id == 0) {
+      const int x_size = dom_size[x] - x_deletions;
+      const int y_size = dom_size[y] - y_deletions;
+      dom_size[x] = x_size;
+      dom_size[y] = y_size;
+
+      if (x_size == 0 || y_size == 0) {
+        ws->inconsistent_flag = 1;
+        control->results[global_w] = false;
+      } else {
+        if (x_deletions > 0) {
+          PropagateVarToNextBitmap(x, model, ws->frontier_B);
+        }
+        if (y_deletions > 0) {
+          PropagateVarToNextBitmap(y, model, ws->frontier_B);
+        }
+      }
+
+      ws->deletions += static_cast<unsigned long long>(x_deletions + y_deletions);
+
+      if (control->total_constraint_checks) {
+        atomicAdd(control->total_constraint_checks, 1ull);
+      }
+      if (control->total_deletions) {
+        atomicAdd(control->total_deletions,
+                  static_cast<unsigned long long>(x_deletions + y_deletions));
+      }
+    }
+  }
 }
 
 // Batch3AKernel - 约束聚合单 block kernel（MVP 版本，避免跨 block 同步问题）
@@ -3998,8 +4422,16 @@ void Batch3AKernel(
       __syncthreads();
 
       // 对所有相关 world 执行约束检查（单 block 版本：block_world_start=0）
-      ExecuteConstraintCheck_Aggregated(
-          cid, world_mask, 0, num_worlds, model, control, shmem_bitsup, shared_del);
+      if (control->check_mapping == static_cast<int>(kWarpPerWordLaneWorld)) {
+        ExecuteConstraintCheck_Aggregated_WarpPerWordLaneWorld(
+            cid, world_mask, 0, num_worlds, model, control, shmem_bitsup, shared_del);
+      } else if (control->check_mapping == static_cast<int>(kSubwarpPerWorld)) {
+        ExecuteConstraintCheck_Aggregated_SubwarpPerWorld(
+            cid, world_mask, 0, num_worlds, model, control, shmem_bitsup, shared_del);
+      } else {
+        ExecuteConstraintCheck_Aggregated_WarpPerWorld(
+            cid, world_mask, 0, num_worlds, model, control, shmem_bitsup, shared_del);
+      }
 
       __syncthreads();
     }
@@ -4173,9 +4605,19 @@ void Batch3AKernel_MultiBlock(
       __syncthreads();
 
       // 对本 block 的相关 world 执行约束检查
-      ExecuteConstraintCheck_Aggregated(
-          cid, local_world_mask, block_world_start, block_world_count,
-          model, control, shmem_bitsup, shared_del);
+      if (control->check_mapping == static_cast<int>(kWarpPerWordLaneWorld)) {
+        ExecuteConstraintCheck_Aggregated_WarpPerWordLaneWorld(
+            cid, local_world_mask, block_world_start, block_world_count, model,
+            control, shmem_bitsup, shared_del);
+      } else if (control->check_mapping == static_cast<int>(kSubwarpPerWorld)) {
+        ExecuteConstraintCheck_Aggregated_SubwarpPerWorld(
+            cid, local_world_mask, block_world_start, block_world_count, model,
+            control, shmem_bitsup, shared_del);
+      } else {
+        ExecuteConstraintCheck_Aggregated_WarpPerWorld(
+            cid, local_world_mask, block_world_start, block_world_count, model,
+            control, shmem_bitsup, shared_del);
+      }
 
       __syncthreads();
     }
@@ -4236,11 +4678,31 @@ void LaunchBatch3AKernelWrapper(
 
   const int num_worlds = control->num_worlds;
 
-  // 选择分片策略：G=4（每 block 4 个 world）
-  // 当 num_worlds <= 4 时使用单 block
-  const int G = 4;  // worlds per block
-  const int block_size = G * 32;  // 128 threads = 4 warps
-  const int num_blocks = (num_worlds + G - 1) / G;  // 最多 8 blocks（32/4）
+  // block_size 固定为 128（4 warps），便于复用现有实现与 shared memory 预算
+  const int block_size = 128;
+  int subwarp_size = control->subwarp_size;
+  if (subwarp_size != 4 && subwarp_size != 8 && subwarp_size != 16) {
+    subwarp_size = 8;
+  }
+
+  // 分片策略：
+  // - warp-per-world：沿用原实现，G=4（每 block 4 个 world）
+  // - subwarp-per-world：G=block_size/subwarp_size（一个 block 同时处理更多 world）
+  int G = 4;
+  if (control->check_mapping == static_cast<int>(kWarpPerWordLaneWorld)) {
+    // P2-2：lane→world 需要更大的 world-group 才能“吃满”warp，但 world 总数≤32。
+    // 这里先用保守默认值（8），后续通过跑曲线再调参。
+    const int requested = control->requested_worlds_per_block;
+    if (requested > 0) {
+      G = std::min(requested, num_worlds);
+    } else {
+      G = std::min(8, num_worlds);
+    }
+  } else if (control->check_mapping == static_cast<int>(kSubwarpPerWorld)) {
+    G = block_size / subwarp_size;  // 32/16/8 worlds per block（对应 subwarp=4/8/16）
+    G = std::clamp(G, 1, 32);
+  }
+  const int num_blocks = (num_worlds + G - 1) / G;
 
   // 初始化 block 分片信息
   control->worlds_per_block = G;
@@ -4256,23 +4718,31 @@ void LaunchBatch3AKernelWrapper(
     control->block_world_count[b] = 0;
   }
 
-  // 计算 shared memory 需求
-  // bitSup: 2 * max_dom_size * bit_dom_int_size * sizeof(uint2)
-  // del_buffer: G * 2 * bit_dom_int_size * sizeof(u32) (每个 warp 独立)
-  // local_tasks: 512 * (sizeof(int) + sizeof(u32)) = 4KB（约束任务列表）
-  const int bitsup_bytes = 2 * model_data.max_dom_size *
-                           model_data.bit_dom_int_size * sizeof(uint2);
-  const int del_buffer_bytes = G * 2 * model_data.bit_dom_int_size * sizeof(u32);
-  const int local_tasks_bytes = 512 * (sizeof(int) + sizeof(u32));
-  const int shared_mem_bytes = bitsup_bytes + del_buffer_bytes + local_tasks_bytes;
+  // 计算 dynamic shared memory 需求：
+  // - bitSup：2 * max_dom_size * bit_dom_int_size * sizeof(uint2)
+  // - del_buffer：
+  //   - warp/subwarp: G * 2 * bit_dom_int_size * sizeof(u32)
+  //   - P2-2 (warp-per-word + lane-per-world): 4 * G * bit_dom_int_size * sizeof(u32)
+  // 注意：local_task_cids/masks 使用静态 shared 数组，不应计入 dynamic shared。
+  const int bitsup_bytes =
+      2 * model_data.max_dom_size * model_data.bit_dom_int_size * sizeof(uint2);
+  const int shmem_pitch =
+      (control->check_mapping == static_cast<int>(kWarpPerWordLaneWorld) &&
+       control->shmem_padding != 0)
+          ? (G + 1)
+          : G;
+  const int del_buffer_bytes =
+      (control->check_mapping == static_cast<int>(kWarpPerWordLaneWorld))
+          ? (4 * shmem_pitch * model_data.bit_dom_int_size * sizeof(u32))
+          : (G * 2 * model_data.bit_dom_int_size * sizeof(u32));
+  const int shared_mem_bytes = bitsup_bytes + del_buffer_bytes;
 
   LOG(INFO) << "Batch3A kernel launch (multi-block, G=" << G << "):";
   LOG(INFO) << "  num_blocks: " << num_blocks << ", block_size: " << block_size;
   LOG(INFO) << "  num_worlds: " << num_worlds << ", worlds_per_block: " << G;
   LOG(INFO) << "  shared_mem_bytes: " << shared_mem_bytes
             << " (bitsup=" << bitsup_bytes
-            << ", del=" << del_buffer_bytes
-            << ", tasks=" << local_tasks_bytes << ")";
+            << ", del=" << del_buffer_bytes << ")";
 
   Batch3AKernel_MultiBlock<<<dim3(num_blocks), dim3(block_size), shared_mem_bytes>>>(
       model_data,

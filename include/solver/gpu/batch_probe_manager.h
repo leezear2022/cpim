@@ -750,6 +750,19 @@ struct Batch3ATask {
 };
 
 // ============================================================================
+// Batch-3A: P2-1 约束检查线程映射（用于消融/实验）
+// ============================================================================
+// 注意：Batch-3A 当前 world_mask 为 u32（最多 32 个 world）。
+// - kWarpPerWorld: 现有实现（每个 warp 处理 1 个 world）
+// - kSubwarpPerWorld: Route-A（一个 warp 内多个 subwarp 并行处理多个 world）
+enum Batch3ACheckMapping : int {
+  kWarpPerWorld = 0,
+  kSubwarpPerWorld = 1,
+  // P2-2: warp-per-word + lane-per-world，配合 shared dom packing（Route-B 原型）
+  kWarpPerWordLaneWorld = 2,
+};
+
+// ============================================================================
 // Batch-3A: 约束聚合控制结构
 // ============================================================================
 struct Batch3AControl {
@@ -780,6 +793,10 @@ struct Batch3AControl {
   int num_blocks;                       // 持久 blocks 数量
   int max_iterations;                   // 最大迭代次数
   int activation_strategy;              // 0 = FULL, 1 = NEIGHBOR
+  int check_mapping;                    // P2-1: Batch3ACheckMapping（默认 kWarpPerWorld）
+  int subwarp_size;                     // P2-1: 4/8/16（仅 mapping=subwarp 生效）
+  int requested_worlds_per_block;       // P2-2: 覆盖 G（0=auto，范围 1..32）
+  int shmem_padding;                   // P2-2b: shared packing stride padding（0=off, 1=on）
 
   // ========== Block 分片信息（Phase 4）==========
   int worlds_per_block;                 // G: 每个 block 处理多少 world
@@ -807,6 +824,10 @@ struct Batch3AControl {
         num_blocks(0),
         max_iterations(1000),
         activation_strategy(1),
+        check_mapping(static_cast<int>(kWarpPerWorld)),
+        subwarp_size(8),
+        requested_worlds_per_block(0),
+        shmem_padding(0),
         worlds_per_block(4),
         total_constraint_checks(nullptr),
         total_deletions(nullptr) {
@@ -859,6 +880,14 @@ class Batch3AManager {
   void SetActivationStrategy(int strategy) { activation_strategy_ = strategy; }
   void SetMaxIterations(int max_iter) { max_iterations_ = max_iter; }
   void EnableStats(bool enabled) { stats_enabled_ = enabled; }
+  void SetCheckMapping(Batch3ACheckMapping mapping) { check_mapping_ = mapping; }
+  void SetSubwarpSize(int subwarp_size) { subwarp_size_ = subwarp_size; }
+  // 覆盖每个 block 处理的 world 数（G），0=auto（由 wrapper 决定）。
+  void SetWorldsPerBlock(int worlds_per_block) {
+    requested_worlds_per_block_ = std::clamp(worlds_per_block, 0, 32);
+  }
+  // P2-2b: shared packing stride padding（默认关闭，便于消融）。
+  void SetShmemPadding(bool enabled) { shmem_padding_ = enabled; }
 
   // ========== 统计 ==========
   unsigned long long GetTotalConstraintChecks() const {
@@ -937,6 +966,10 @@ class Batch3AManager {
   int activation_strategy_ = 1;                 // 默认 NEIGHBOR_ACTIVATION
   int max_iterations_ = 1000;
   bool stats_enabled_ = false;
+  Batch3ACheckMapping check_mapping_ = kWarpPerWorld;
+  int subwarp_size_ = 8;
+  int requested_worlds_per_block_ = 0;
+  bool shmem_padding_ = false;
 
   // ========== 运行时统计 ==========
   unsigned long long total_constraint_checks_ = 0;

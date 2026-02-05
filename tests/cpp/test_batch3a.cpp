@@ -25,6 +25,14 @@ DEFINE_string(input, CPIM_PROJECT_ROOT "/tests/data/bench/queens-4_ext.xml",
               "Input XCSP3 file path");
 DEFINE_int32(num_probes, 10, "Number of probe tasks to run");
 DEFINE_bool(compare_stage2, true, "Compare with Stage 2 results");
+DEFINE_int32(batch3a_check_mapping, 0,
+             "Batch-3A check mapping: 0=warp-per-world, 1=subwarp-per-world (P2-1), 2=warp-per-word+lane-per-world (P2-2)");
+DEFINE_int32(batch3a_subwarp_size, 8,
+             "Batch-3A subwarp size: 4/8/16 (only for mapping=1)");
+DEFINE_int32(batch3a_worlds_per_block, 0,
+             "Batch-3A worlds per block (G): 0=auto, 1..32=override (P2-2 tuning)");
+DEFINE_int32(batch3a_shmem_padding, 0,
+             "Batch-3A shared packing stride padding (P2-2b): 0=off (default), 1=on");
 
 namespace cpim {
 
@@ -128,6 +136,21 @@ std::vector<std::pair<int, int>> RunBatch3A(
     GModel* gmodel,
     const std::vector<ProbeTask>& tasks) {
   Batch3AManager mgr(gmodel, -1, 32);
+  if (FLAGS_batch3a_check_mapping == 1) {
+    mgr.SetCheckMapping(kSubwarpPerWorld);
+  } else if (FLAGS_batch3a_check_mapping == 2) {
+    mgr.SetCheckMapping(kWarpPerWordLaneWorld);
+  } else {
+    if (FLAGS_batch3a_check_mapping != 0) {
+      LOG(WARNING) << "Invalid --batch3a_check_mapping="
+                   << FLAGS_batch3a_check_mapping
+                   << ", fallback to 0 (warp-per-world)";
+    }
+    mgr.SetCheckMapping(kWarpPerWorld);
+  }
+  mgr.SetSubwarpSize(FLAGS_batch3a_subwarp_size);
+  mgr.SetWorldsPerBlock(FLAGS_batch3a_worlds_per_block);
+  mgr.SetShmemPadding(FLAGS_batch3a_shmem_padding != 0);
 
   for (const auto& t : tasks) {
     mgr.AddTask(t.var_id, t.value);

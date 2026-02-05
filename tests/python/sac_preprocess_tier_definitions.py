@@ -198,13 +198,13 @@ SAC_PREPROCESS_PERF_SENTINELS: List[str] = [
     # 结构化实例（常见实际类）
     _resolve_path('benchmarks/langford/langford-3-11-ext.xml'),
     _resolve_path('benchmarks/QCP-15/qcp-15-120-14_ext.xml'),
-    # 大规模 UNSAT（内存压力 + DWO）
-    _resolve_path('benchmarks/marc/large-80-unsat_ext.xml'),
-    _resolve_path('benchmarks/marc/large-84-unsat_ext.xml'),
 ]
 
 # 可选：压力/已知问题样例（不建议纳入日常回归）。
 SAC_PREPROCESS_STRESS: List[str] = [
+    # 大规模 UNSAT（内存压力 + DWO；在 60s perf 预算下可能 timeout，建议放到 stress）
+    _resolve_path('benchmarks/marc/large-80-unsat_ext.xml'),
+    _resolve_path('benchmarks/marc/large-84-unsat_ext.xml'),
     # Jetson Orin 8G 上可能 OOM（已在 scan_10min 里出现过）。
     _resolve_path('benchmarks/marc/large-92-unsat_ext.xml'),
 ]

@@ -202,22 +202,23 @@ updated: 2026-01-25
 
 ### P2：bitGEMM/算子形态（以数据驱动决定是否推进重构）
 
-- [ ] **P2-1：bitGEMM Route-A（低风险“算子试上限”，不改全局布局）**
+- [ ] **P2-1：bitGEMM Route-A（低风险“算子试上限”，不改全局布局）**（Subwarp-per-World 已落地，待跑曲线/沉淀数据）
   - 目标：在 **不改 AoS 域布局**（`[world][var][word]`）的前提下，把 Batch‑3A 的“低 lane 利用率”问题转成
     “同一 warp 同时处理多个 world”的向量化形态，先测算子上限并给出收益曲线。
   - 关键约束（避免走歪路）：
     - **必须保留现有 Warp‑per‑World 路径**（默认仍用旧实现），新实现必须可用 flag 切换，便于消融。
     - Batch‑3A 当前 `world_mask` 为 `u32`（最多 32 worlds）；Route‑A 不应假设 `num_worlds=128/256` 这种规模。
-    - **避免“纯 Thread‑per‑World”**：在 AoS 下会导致 warp 内对 `bitDom` 的访问高度 stride（不同 world 距离极远），
-      Jetson UMA 上大概率更慢，且测不到 bitGEMM 的复用收益。
+    - **避免“纯 Thread‑per‑World（AoS 下）”**：在 AoS 下会导致 warp 内对 `bitDom` 的访问高度 stride（不同 world 距离极远），
+      Jetson UMA 上大概率更慢，且测不到 bitGEMM 的复用收益；该路线仅在 **Route‑B（SoA/packing）** 后才值得重提。
   - 推荐实现形态：**Subwarp‑per‑World（可参数化）**
     - 将一个 warp 切成 `subwarp_size ∈ {4,8,16}` 的小组；
     - 每个 subwarp 处理 1 个 world（保留 `lane→word` 的连续访问），一个 warp 同时处理 `32/subwarp_size` 个 worlds；
     - 好处：在 `bit_dom_int_size` 较小（例如 6/8/12）时，lane 利用率从 `6/32` 提升到 `6/8` 或 `6/16`，
       同时不把访存从“同 world 连续 word”退化成“跨 world stride”。
   - 参数化与消融（建议）：
-    - `--sac_batch3a_check_mapping=warp|subwarp`（默认 `warp`）
-    - `--sac_batch3a_subwarp=4|8|16`（默认 `8`，或按 `bit_dom_int_size` 自动选）
+    - `apps/sac_benchmark` / `tests/cpp/test_batch3a`：
+      - `--batch3a_check_mapping=0|1`（默认 `0=warp-per-world`；`1=subwarp-per-world`）
+      - `--batch3a_subwarp_size=4|8|16`（默认 `8`；仅 `mapping=1` 生效）
     - 输出统计/CSV 增加：`batch3a_check_mapping/subwarp_size`（否则无法做 A/B 曲线）
   - 载体与评测（先把“噪声”隔离开）：
     - **microbench 优先**：只测 `ExecuteConstraintCheck_Aggregated*()` 的吞吐（`cid×world` 检查数 / 秒），避免
@@ -230,6 +231,16 @@ updated: 2026-01-25
 - [ ] **P2-2：bitGEMM Route-B（lane→world / warp 形态重排）**
   - 目标：把 “world” 维度变成天然连续维（SoA/packing），让 `lane→world` 真正变成合并访存，并把 `dom_y`
     以矩阵形态复用（从“像 bitGEMV”走向“像 bitGEMM”）。
+  - 现状（2026-01）：已落地 **Route-B 原型（shared dom packing）**，用于快速验证收益曲线：
+    - Batch-3A 新增 `kWarpPerWordLaneWorld`：
+      - 计算：warp-per-word + lane-per-world（lane→world），在 shared memory 中构造 `[word][world]` 的 dom 矩阵；
+      - 应用：warp-per-world + lane→word（保持 AoS workspace 不变，避免全局大重构）。
+    - 消融开关（A/B/C）：
+      - `--batch3a_check_mapping=0`：warp-per-world（baseline）
+      - `--batch3a_check_mapping=1`：subwarp-per-world（P2-1）
+      - `--batch3a_check_mapping=2`：warp-per-word + lane-per-world + shared dom packing（P2-2 原型）
+  - 说明：真正的 **全局 SoA/packing（跨 kernel/跨阶段复用）** 仍属于显著重构，
+    需要以该原型的 microbench/hard-cases 数据为门槛，再决定是否推进。
   - 说明：这是显著重构（会引入额外域存储/转换成本），**应以前置数据为门槛**：
     - 只有当 P2‑1 的算子 microbench 显示“潜在收益足够大”，并且 hard‑cases 里存在“传播够深/删值够多”的任务，
       Route‑B 才值得推进。
@@ -237,6 +248,53 @@ updated: 2026-01-25
     - `--sac_dom_layout=aos|soa`（默认 `aos`）
     - `--sac_support_backend=simt|bitgemm`（默认 `simt`；`soa+bitgemm` 才走新路径）
     - 任意不满足对齐/阈值/设备能力时自动回退到 `aos+simt`。
+
+- [x] **P2-2a：Route-B 优化：Group Size 参数化（优先做）** <!-- id: 7 -->
+  - 目标：将 `worlds_per_block (G)` 从硬编码 8 改为运行时参数 `{8, 16, 32}`。
+  - 理由：G 增大能提升 Phase B (Lane-per-World) 的利用率，但会增加 dynamic shared memory（`del_buffer`）；
+    需要在不同 shared memory 预算下找甜点。
+  - 交付：`--batch3a_worlds_per_block=0|8|16|32`（0=auto；默认 0=沿用现状 `G=min(8,num_worlds)`）。
+
+- [x] **P2-2b：Route-B 优化：Shared Memory Padding**（已落地；需用 microbench 实测是否真是瓶颈）
+  - 目标：解决 Packing 阶段（Phase A）的 Shared Memory Bank Conflict。
+  - 现状：`G=8` 且 `stride=32` bytes 时，Warp 内多个线程写入同一 bank。
+  - 方案：引入 stride padding（`G_PAD = G + 1` 或按 32 对齐的 padding）。
+  - 交付：`--batch3a_shmem_padding=0|1`（默认 0，仅 `mapping=2` 生效）。
+  - 现状快照：在当前浅传播样例集上，padding 的几何均值收益接近噪声（见 P2-2c 的 CSV 对照结果）。
+
+- [x] **P2-2c：Microbenchmark 扫参（数据闭环）**（已落地：Stage2 对照 + mapping/G/padding 扫参）
+  - 目标：只测 `./build/sac_benchmark --mode=stage2|batch3a` 的吞吐，输出 CSV（支持 `--resume`）。
+  - 维度：`instance` × `mode(stage2/batch3a)` × `mapping` × `G` × `padding`（其中 Stage2 为 baseline，可用 `--include-stage2=0` 关闭）。
+  - 实例选择：深传播（Deep）、浅传播（Shallow）、延后复查（Deferred）。
+  - 工具脚本：
+    - `python3 tests/python/batch_batch3a_microbench.py --suite=perf --timeout=60 --csv=out/batch3a_vs_stage2_perf.csv --resume`
+    - 常用扫参（建议）：`--include-stage2=1 --mappings=2 --g-values=0,8,16,32 --padding-values=0,1 --num-probes=256 --warmup=1 --iterations=3`
+    - 兼容跑全消融：`--mappings=0,1,2 --subwarp-sizes=4,8,16`
+  - CSV 关键列（用于做 go/no-go 决策）：
+    - `avg_time_ms` / `probes_per_sec`：本模式绝对吞吐
+    - `stage2_avg_time_ms` / `speedup_vs_stage2`：对 Stage2 baseline 的同口径 speedup
+  - 最新结果快照（Orin，timeout=60s，num_probes=256，warmup=1，iters=3）：
+    - 输出：
+      - `out/batch3a_m2_pad0.csv`（`--shmem-padding=0`）
+      - `out/batch3a_m2_pad1.csv`（`--shmem-padding=1`）
+    - 结论（以“每个 instance 取最佳 G”的 probes/s 对照）：
+      - padding=1 相对 padding=0 的几何均值提升约 **+0.37%**（接近噪声量级）
+      - 个别实例有明显回退：`benchmarks/QCP-15/qcp-15-120-14_ext.xml` 约 **-5%**
+      - `benchmarks/marc/large-80-unsat_ext.xml` / `large-84-unsat_ext.xml` 在 60s 下全部 timeout（后续若要纳入，需要单独拉高 timeout 或从 perf suite 移到 stress）
+    - 补充：若固定 `G=8` 做对照，padding=1 的几何均值提升约 **+1.35%**（n=9）。
+  - 最新对照结果（Orin，`suite=perf`，timeout=600s，num_probes=256，warmup=1，iters=3）：
+    - 输出：`out/batch3a_vs_stage2_perf_10min.csv`
+    - 结论：`mapping=2` 在该套样例上 **显著慢于 Stage2**（`speedup_vs_stage2` 约 0.02–0.12，整体无任何 >1.0 的样例）
+    - 解释：该 perf suite 多为“浅传播/低聚合度”，Batch‑3A 的框架开销（task 聚合/packing/同步）无法被摊平。
+    - 推论：在未找到 “深传播 + 高 world_mask 聚合度” hard‑cases 前，不应进入更重的 SoA/flatten 重构。
+  - Stress 最终门槛验证（Orin，`suite=stress`，timeout=1200s，num_probes=256，warmup=1，iters=3）：
+    - 输出：`out/batch3a_vs_stage2_stress_20min.csv`
+    - `large-80/84`：`mapping=2` 仍显著慢于 Stage2（`speedup_vs_stage2` 约 **0.028–0.042**，即 24×–36× 慢）
+    - `large-92`：在 `--mode=stage2` 构建模型阶段触发 CUDA OOM（无法提供 baseline；Batch‑3A 同理大概率不可跑）
+    - 结论：该 stress 验证满足 “仍然 speedup < 1.0 → No‑Go” 条件，**Batch‑3A/flatten 路线当前应止损**（保留代码用于论文/消融，但不再投入工程量）。
+  - Go/No-Go 门槛（决定是否推进更重的 SoA/flatten）：
+    - 只有当 `mapping=2` 在“深传播 + 高聚合度”的 hard‑cases 上，相对 Stage2 出现稳定 **≥1.2×** 的 `speedup_vs_stage2`
+      （建议至少 ≥3 个实例，同时保持结果一致/不多删），才进入下一阶段（全局 SoA/packing 或更激进的 flatten）。
 
 ### P3：BMMA（1-bit Tensor Core）实验后端（创新点）
 

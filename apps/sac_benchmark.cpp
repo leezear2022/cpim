@@ -70,12 +70,38 @@ DEFINE_int32(sac_max_total_probes, 0, "Max total probes for SAC3 (0=unlimited)")
 DEFINE_int32(sac_max_queue_size, 0, "Max probe queue size for SAC3 (0=unlimited)");
 DEFINE_int32(sac_max_total_requeues, 0, "Max total requeues for SAC3 (0=unlimited)");
 DEFINE_int32(sac_max_requeues_per_var, 0, "Max requeues per var for SAC3 (0=unlimited)");
+DEFINE_int32(batch3a_check_mapping, 0,
+             "Batch-3A check mapping: 0=warp-per-world, 1=subwarp-per-world (P2-1), 2=warp-per-word+lane-per-world (P2-2)");
+DEFINE_int32(batch3a_subwarp_size, 8,
+             "Batch-3A subwarp size: 4/8/16 (only for mapping=1)");
+DEFINE_int32(batch3a_worlds_per_block, 0,
+             "Batch-3A worlds per block (G): 0=auto, 1..32=override (P2-2 tuning)");
+DEFINE_int32(batch3a_shmem_padding, 0,
+             "Batch-3A shared packing stride padding (P2-2b): 0=off (default), 1=on");
 
 namespace cpim {
 
 using cpim::model::ModelNormalizer;
 using cpim::model::ParserType;
 using cpim::model::XcspParser;
+
+void ConfigureBatch3AManager(Batch3AManager& manager) {
+    const int mapping = FLAGS_batch3a_check_mapping;
+    if (mapping == 1) {
+        manager.SetCheckMapping(kSubwarpPerWorld);
+    } else if (mapping == 2) {
+        manager.SetCheckMapping(kWarpPerWordLaneWorld);
+    } else {
+        if (mapping != 0) {
+            LOG(WARNING) << "Invalid --batch3a_check_mapping=" << mapping
+                         << ", fallback to 0 (warp-per-world)";
+        }
+        manager.SetCheckMapping(kWarpPerWorld);
+    }
+    manager.SetSubwarpSize(FLAGS_batch3a_subwarp_size);
+    manager.SetWorldsPerBlock(FLAGS_batch3a_worlds_per_block);
+    manager.SetShmemPadding(FLAGS_batch3a_shmem_padding != 0);
+}
 
 // ============================================================================
 // Probe task generation
@@ -488,6 +514,7 @@ BenchmarkResult RunBatch3ABenchmark(GModel* gmodel,
     result.valid = false;
 
     Batch3AManager manager(gmodel, -1, 32);
+    ConfigureBatch3AManager(manager);
 
     // Check if suitable for Batch-3A
     if (!manager.IsSuitableForBatch3A()) {
@@ -764,6 +791,7 @@ FullSACResult RunFullSAC_Batch3A(GModel* gmodel, int max_rounds, bool verbose) {
 
     // Create Batch-3A manager
     Batch3AManager manager(gmodel, -1, 32);
+    ConfigureBatch3AManager(manager);
 
     if (!manager.IsSuitableForBatch3A()) {
         LOG(WARNING) << "Instance not suitable for Batch-3A (bitSup too large)";

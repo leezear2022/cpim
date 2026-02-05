@@ -24,7 +24,9 @@ updated: 2026-02-05
 
 - Control/Manager：
   - `include/solver/gpu/batch_probe_manager.h`：`Batch3AControl` 新增 per-block 队列与 mask 字段
-  - `src/solver/gpu/batch_probe_manager.cu`：`Batch3AManager` 分配并初始化队列/掩码缓冲区，launch 前清零
+  - `src/solver/gpu/batch_probe_manager.cu`：
+    - `Batch3AManager::AllocateMemory()`：分配队列/掩码缓冲区（`queue_capacity_=num_cons`）
+    - `Batch3AManager::LaunchBatch3AKernel()`：launch 前 `cudaMemset` 清零 mask/queue_tail/overflow
 - Device 侧队列原语 + kernel：
   - `src/solver/gpu/GModel.cu`：
     - `Batch3AEnqueueConstraintToNextQueue()` / `Batch3AEnqueueVarToNextQueue()`
@@ -32,6 +34,12 @@ updated: 2026-02-05
 
 > 注：当前版本仍保留 host 侧 `InitializeWorlds()` 的 snapshot 恢复（每批次）；后续可按 5.3 的建议，
 > 把恢复/清零搬到 Phase0（device 内并行），进一步降低框架开销。
+
+**初步对照结果（perf suite / mapping=2）**：
+- 命令：`python3 tests/python/batch_batch3a_microbench.py --suite=perf --include-stage2=1 --mappings=2 ... --csv=out/batch3a_queue_vs_stage2_perf_10min.csv`
+- 结论：`speedup_vs_stage2` 仍为 `0.03–0.12`（约 8×–30× 慢于 Stage2），未达到“可接受回退（<5×）/接近 1×”门槛。
+- 含义：Dynamic Submission 解决了“开头扫全约束”的结构性问题，但 **仍不足以让 Batch‑3A 在现有样例上接近 Stage2**；
+  下一步需要把 host 侧 `InitializeWorlds()` 的框架成本下沉到 device Phase0（见 5.3）。
 
 ## 1. 关键约束（必须守住）
 

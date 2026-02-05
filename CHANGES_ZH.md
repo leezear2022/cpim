@@ -25,6 +25,8 @@
 - `make -j$(nproc)`：通过
 - `python3 tests/python/batch_test_v2.py --tier=0`：8/12 (66%)，与历史基线一致（不匹配项仍为 CPIM 超时）
 - `./build/test_batch3a`：通过
+- microbench（mapping=2 / perf suite，对照 Stage2）：`out/batch3a_queue_vs_stage2_perf_10min.csv` 中 `speedup_vs_stage2≈0.03–0.12`
+  （8×–30× 慢于 Stage2），说明去掉“开头扫全约束”后瓶颈主要转向 host 侧框架成本（`InitializeWorlds` 等）。
 
 ## 2026-01-29
 

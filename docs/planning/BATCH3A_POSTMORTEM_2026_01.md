@@ -20,7 +20,9 @@ updated: 2026-01-30
 > **更新（2026-02）**：为消除 3.1 的“开头扫全约束”杀手级开销，已实现 Batch‑3A 的
 > **Dynamic Submission（结尾提交）队列版**（见 `docs/planning/BATCH3A_DYNAMIC_SUBMISSION_QUEUE_DESIGN.md`），
 > 将任务构建从“每轮扫描 `cid=0..num_cons-1`”替换为 “device 侧 `<cid, world_mask>` worklist + 双队列”。
-> 本复盘仍保留用于解释 **为什么扫描版会结构性回退**，以及帮助评估“队列化是否足以把瓶颈转移/消除”。
+> 初步对照（`out/batch3a_queue_vs_stage2_perf_10min.csv`）显示 mapping=2 仍为 `speedup_vs_stage2≈0.03–0.12`
+>（8×–30× 慢于 Stage2），说明“开头扫”并非唯一决定性瓶颈；**host 侧分批初始化/同步**仍然是需要优先处理的框架成本。
+> 本复盘仍保留用于解释 **为什么扫描版会结构性回退**，并作为后续优化（把初始化下沉到 device Phase0 等）的对照基线。
 
 ## 1. 如何复现（同口径对照）
 

@@ -76,7 +76,7 @@ CSV 关键列：
 
 这段逻辑本质是串行 `O(num_cons * block_world_count)`，并且 multi‑block 会被 **每个 block 重复一遍扫描**。
 
-代码（节选）位于 `src/solver/gpu/GModel.cu`：
+代码（节选）来自 **扫描版 Batch‑3A**（已被 2026-02 的 Dynamic Submission 队列版替换，保留于本文用于解释瓶颈根因）：
 
 ```cpp
 // Step 1: thread 0 构建稀疏约束任务列表（只包含活跃约束）
@@ -170,7 +170,8 @@ mapping=2（`kWarpPerWordLaneWorld`）通过 shared 把 AoS dom 变成类似 SoA
 
 ## 5. 相关代码锚点（便于快速定位）
 
-- 内核任务构建（串行扫描）：`src/solver/gpu/GModel.cu`（`Batch3AKernel*` 内 `threadIdx.x==0` 的 Step 1）
+- 内核任务构建（串行扫描，历史实现）：见本文 3.1 的节选（扫描版已在 2026-02 被队列版替换）
+- Dynamic Submission 队列版：`src/solver/gpu/GModel.cu`（`Batch3AEnqueue*` + `Batch3AKernel_MultiBlock`）
 - 内核入口与 G 参数：`src/solver/gpu/GModel.cu`（`LaunchBatch3AKernelWrapper`）
 - Batch‑3A 批处理框架：`src/solver/gpu/batch_probe_manager.cu`（`Batch3AManager::Execute()`）
 - Batch‑3A world 初始化：`src/solver/gpu/batch_probe_manager.cu`（`Batch3AManager::InitializeWorlds()`）

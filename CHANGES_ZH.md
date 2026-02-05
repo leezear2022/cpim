@@ -1,5 +1,31 @@
 # 修改清单（中文）
 
+## 2026-02-05
+
+### Batch-3A：Dynamic Submission 队列版（去掉 kernel 内全量扫描）
+
+**动机**：Batch‑3A 扫描版的决定性瓶颈是 kernel 内 `threadIdx.x==0` 每轮全量扫描 `cid=0..num_cons-1`
+构建 `local_task_cids/local_task_masks`，成本与 `num_cons`（甚至 `num_cons*worlds`）成正比，完全无法利用稀疏性，
+并且会把 mapping=2 的 shared packing/bitGEMM 原型收益淹没（详见复盘：`docs/planning/BATCH3A_POSTMORTEM_2026_01.md`）。
+
+**交付内容**：
+- `src/solver/gpu/GModel.cu`：
+  - 新增 device 侧队列原语：`Batch3AEnqueueConstraintToNextQueue()` / `Batch3AEnqueueVarToNextQueue()`
+  - 重写 `Batch3AKernel_MultiBlock`：用双队列 A/B + per-cid `world_mask` 聚合实现 “结尾提交（Dynamic Submission）”，
+    不再进行“开头扫全约束”。
+- `include/solver/gpu/batch_probe_manager.h` / `src/solver/gpu/batch_probe_manager.cu`：
+  - `Batch3AControl` / `Batch3AManager` 增加 per-block 队列与 mask 缓冲区（`queue_capacity=num_cons` 作为保守起点）
+  - kernel launch 前清零队列与 mask；若溢出则保持 `active_world_mask` bit（按 UNKNOWN 语义不删值）。
+- 文档同步：
+  - 新增 `docs/planning/BATCH3A_DYNAMIC_SUBMISSION_QUEUE_DESIGN.md`
+  - `docs/planning/BATCH3A_POSTMORTEM_2026_01.md` 增加“2026-02 更新”说明
+  - `docs/README.md` 注册新文档入口
+
+**测试结果**：
+- `make -j$(nproc)`：通过
+- `python3 tests/python/batch_test_v2.py --tier=0`：8/12 (66%)，与历史基线一致（不匹配项仍为 CPIM 超时）
+- `./build/test_batch3a`：通过
+
 ## 2026-01-29
 
 ### P2-2c：Batch-3A microbench 升级为 Stage2 对照（同口径 speedup）

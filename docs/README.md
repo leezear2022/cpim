@@ -50,6 +50,7 @@
 - [现代化计划 V2](planning/MODERNIZATION_PLAN_V2.md) - 总体开发规划
 - [**SAC-GPU 设计**](planning/SACGPU_DESIGN.md) - bitGEMM 化、SACq/NSACq、长尾控制
 - [Batch-3A 性能回退复盘（2026-01）](planning/BATCH3A_POSTMORTEM_2026_01.md) - 为什么 Batch-3A 在 Orin 上结构性慢于 Stage2，以及是否值得继续投入/如何止损
+- [Batch-3A Dynamic Submission 队列版（2026-02）](planning/BATCH3A_DYNAMIC_SUBMISSION_QUEUE_DESIGN.md) - “结尾提交”worklist 替代“开头扫全约束”，显式利用稀疏性（PSTRds/PCTds 风格）
 - [dGPU 内存规划（RTX 4060/4090）](planning/DGPU_MEMORY_PLAN.md) - 从 Jetson UMA 迁移到 PCIe dGPU 的 GPU-resident 数据流与 memcpy 规避/隐藏策略（可消融/可回退）
 - [SACGPU 下一步执行清单（10 分钟超时版）](planning/SACGPU_NEXT_ACTIONS_10MIN_TIMEOUT.md) - 可执行命令清单
 - [Phase 1.5 启发式](planning/PHASE_1.5_HEURISTICS_DESIGN.md) - 变量选择启发式

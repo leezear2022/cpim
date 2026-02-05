@@ -1996,6 +1996,45 @@ void Batch3AManager::AllocateMemory() {
   CHECK(err == cudaSuccess) << "Failed to allocate d_ws_frontier_B_: "
                             << cudaGetErrorString(err);
 
+  // ========== Dynamic Submission 队列（每个 block 一套）==========
+  // 说明：
+  // - 该内存用于替代 Batch-3A kernel 内单线程全量扫描构建任务；
+  // - 以 `<cid, world_mask>` 的形式在 device 侧动态提交下一轮要检查的约束；
+  // - mask/queue 维度与约束数成正比，避免每轮扫 `num_cons`。
+  queue_capacity_ = num_cons;
+  const size_t mask_bytes =
+      static_cast<size_t>(kMaxBatch3ABlocks) * num_cons * sizeof(u32);
+  const size_t queue_bytes =
+      static_cast<size_t>(kMaxBatch3ABlocks) * queue_capacity_ * sizeof(int);
+
+  err = cudaMallocManaged(&d_block_frontier_mask_A_, mask_bytes);
+  CHECK(err == cudaSuccess) << "Failed to allocate d_block_frontier_mask_A_: "
+                            << cudaGetErrorString(err);
+
+  err = cudaMallocManaged(&d_block_frontier_mask_B_, mask_bytes);
+  CHECK(err == cudaSuccess) << "Failed to allocate d_block_frontier_mask_B_: "
+                            << cudaGetErrorString(err);
+
+  err = cudaMallocManaged(&d_block_cid_queue_A_, queue_bytes);
+  CHECK(err == cudaSuccess) << "Failed to allocate d_block_cid_queue_A_: "
+                            << cudaGetErrorString(err);
+
+  err = cudaMallocManaged(&d_block_cid_queue_B_, queue_bytes);
+  CHECK(err == cudaSuccess) << "Failed to allocate d_block_cid_queue_B_: "
+                            << cudaGetErrorString(err);
+
+  err = cudaMallocManaged(&d_block_queue_tail_A_, kMaxBatch3ABlocks * sizeof(int));
+  CHECK(err == cudaSuccess) << "Failed to allocate d_block_queue_tail_A_: "
+                            << cudaGetErrorString(err);
+
+  err = cudaMallocManaged(&d_block_queue_tail_B_, kMaxBatch3ABlocks * sizeof(int));
+  CHECK(err == cudaSuccess) << "Failed to allocate d_block_queue_tail_B_: "
+                            << cudaGetErrorString(err);
+
+  err = cudaMallocManaged(&d_block_overflow_, kMaxBatch3ABlocks * sizeof(int));
+  CHECK(err == cudaSuccess) << "Failed to allocate d_block_overflow_: "
+                            << cudaGetErrorString(err);
+
   // 初始化每个 workspace 的切片指针
   for (int i = 0; i < max_worlds_; ++i) {
     WorldWorkspace& ws = d_workspaces_[i];
@@ -2063,6 +2102,13 @@ void Batch3AManager::FreeMemory() {
   if (d_ws_dom_size_) cudaFree(d_ws_dom_size_);
   if (d_ws_frontier_A_) cudaFree(d_ws_frontier_A_);
   if (d_ws_frontier_B_) cudaFree(d_ws_frontier_B_);
+  if (d_block_frontier_mask_A_) cudaFree(d_block_frontier_mask_A_);
+  if (d_block_frontier_mask_B_) cudaFree(d_block_frontier_mask_B_);
+  if (d_block_cid_queue_A_) cudaFree(d_block_cid_queue_A_);
+  if (d_block_cid_queue_B_) cudaFree(d_block_cid_queue_B_);
+  if (d_block_queue_tail_A_) cudaFree(d_block_queue_tail_A_);
+  if (d_block_queue_tail_B_) cudaFree(d_block_queue_tail_B_);
+  if (d_block_overflow_) cudaFree(d_block_overflow_);
   if (d_control_) cudaFree(d_control_);
   if (d_global_iteration_) cudaFree(d_global_iteration_);
   if (d_all_converged_flag_) cudaFree(d_all_converged_flag_);
@@ -2082,6 +2128,13 @@ void Batch3AManager::FreeMemory() {
   d_ws_dom_size_ = nullptr;
   d_ws_frontier_A_ = nullptr;
   d_ws_frontier_B_ = nullptr;
+  d_block_frontier_mask_A_ = nullptr;
+  d_block_frontier_mask_B_ = nullptr;
+  d_block_cid_queue_A_ = nullptr;
+  d_block_cid_queue_B_ = nullptr;
+  d_block_queue_tail_A_ = nullptr;
+  d_block_queue_tail_B_ = nullptr;
+  d_block_overflow_ = nullptr;
   d_control_ = nullptr;
   d_global_iteration_ = nullptr;
   d_all_converged_flag_ = nullptr;
@@ -2220,10 +2273,30 @@ void Batch3AManager::LaunchBatch3AKernel(int num_worlds) {
              num_worlds * sizeof(ProbeTask),
              cudaMemcpyHostToDevice);
 
+  // 清空 Dynamic Submission 队列与 mask（每次 kernel 启动前重置）
+  const int num_cons = model_->GetNumCons();
+  const size_t mask_bytes =
+      static_cast<size_t>(kMaxBatch3ABlocks) * num_cons * sizeof(u32);
+  cudaMemset(d_block_frontier_mask_A_, 0, mask_bytes);
+  cudaMemset(d_block_frontier_mask_B_, 0, mask_bytes);
+  cudaMemset(d_block_queue_tail_A_, 0, kMaxBatch3ABlocks * sizeof(int));
+  cudaMemset(d_block_queue_tail_B_, 0, kMaxBatch3ABlocks * sizeof(int));
+  cudaMemset(d_block_overflow_, 0, kMaxBatch3ABlocks * sizeof(int));
+
   // 初始化控制结构
   d_control_->num_constraint_tasks = model_->GetNumCons();
   d_control_->constraint_task_cursor = d_constraint_task_cursor_;
   d_control_->constraint_tasks = d_constraint_tasks_;
+
+  d_control_->queue_capacity = queue_capacity_;
+  d_control_->block_frontier_mask_A = d_block_frontier_mask_A_;
+  d_control_->block_frontier_mask_B = d_block_frontier_mask_B_;
+  d_control_->block_cid_queue_A = d_block_cid_queue_A_;
+  d_control_->block_cid_queue_B = d_block_cid_queue_B_;
+  d_control_->block_queue_tail_A = d_block_queue_tail_A_;
+  d_control_->block_queue_tail_B = d_block_queue_tail_B_;
+  d_control_->block_overflow = d_block_overflow_;
+
   d_control_->num_worlds = num_worlds;
   d_control_->world_probes = d_tasks_;
   d_control_->workspaces = d_workspaces_;

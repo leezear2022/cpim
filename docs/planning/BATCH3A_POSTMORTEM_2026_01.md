@@ -17,6 +17,11 @@ updated: 2026-01-30
 这不是“再调 G/padding 就能救”的量级；瓶颈主要来自 **kernel 内单线程全量扫描构建任务** + **host 分批初始化/同步开销**，
 算子层面的优化（G 参数化、padding）被框架成本完全淹没。
 
+> **更新（2026-02）**：为消除 3.1 的“开头扫全约束”杀手级开销，已实现 Batch‑3A 的
+> **Dynamic Submission（结尾提交）队列版**（见 `docs/planning/BATCH3A_DYNAMIC_SUBMISSION_QUEUE_DESIGN.md`），
+> 将任务构建从“每轮扫描 `cid=0..num_cons-1`”替换为 “device 侧 `<cid, world_mask>` worklist + 双队列”。
+> 本复盘仍保留用于解释 **为什么扫描版会结构性回退**，以及帮助评估“队列化是否足以把瓶颈转移/消除”。
+
 ## 1. 如何复现（同口径对照）
 
 使用 microbench 工具（Stage2 baseline + Batch‑3A 对照）：
@@ -171,4 +176,3 @@ mapping=2（`kWarpPerWordLaneWorld`）通过 shared 把 AoS dom 变成类似 SoA
 - Batch‑3A world 初始化：`src/solver/gpu/batch_probe_manager.cu`（`Batch3AManager::InitializeWorlds()`）
 - Stage2 对照实现：`src/solver/gpu/batch_probe_manager.cu`（`Batch2PersistentManager::ExecutePersistentBlocks()`）
 - OOM 触发点：`src/model/gmodel_adapter.cu:79`
-

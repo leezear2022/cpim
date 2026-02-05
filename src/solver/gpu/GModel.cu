@@ -3694,6 +3694,54 @@ int GModel::GetNextValue(int var, int value) const {
 // Batch-3A: 约束聚合 Kernel 实现
 // ============================================================================
 
+// ============================================================================
+// Dynamic Submission（PSTRds/PCTds 风格）：
+// - 旧版：每轮由 thread0 扫描全体 cid 构建 local_task_cids（成本与 num_cons 成正比）
+// - 新版：约束检查结束时 enqueue 邻接约束到“下一轮队列”，显式利用稀疏性
+//
+// 约束：
+// - 仍保持每个 block 独占一段 worlds（避免不同 block 并发写同一 world 的域导致数据竞争）
+// ============================================================================
+__device__ inline void Batch3AEnqueueConstraintToNextQueue(
+    int cid,
+    int local_w,                // [0, G)
+    u32* next_frontier_mask,    // [num_cons]
+    int* next_cid_queue,        // [queue_capacity]
+    int* next_queue_tail,       // [1]
+    int queue_capacity,
+    int* overflow_flag) {       // [1]
+  if (overflow_flag && *overflow_flag != 0) return;
+  const u32 bit = (1u << local_w);
+  const u32 old = atomicOr(&next_frontier_mask[cid], bit);
+  if (old == 0) {
+    const int pos = atomicAdd(next_queue_tail, 1);
+    if (pos < queue_capacity) {
+      next_cid_queue[pos] = cid;
+    } else {
+      if (overflow_flag) atomicExch(overflow_flag, 1);
+    }
+  }
+}
+
+__device__ inline void Batch3AEnqueueVarToNextQueue(
+    int var_id,
+    int local_w,                // [0, G)
+    const GModelData& model,
+    u32* next_frontier_mask,    // [num_cons]
+    int* next_cid_queue,        // [queue_capacity]
+    int* next_queue_tail,       // [1]
+    int queue_capacity,
+    int* overflow_flag) {       // [1]
+  const int start = model.d_subscription_offset[var_id];
+  const int end = model.d_subscription_offset[var_id + 1];
+  for (int i = start; i < end; ++i) {
+    const int cid = model.d_subscription[i].z;
+    Batch3AEnqueueConstraintToNextQueue(
+        cid, local_w, next_frontier_mask, next_cid_queue, next_queue_tail,
+        queue_capacity, overflow_flag);
+  }
+}
+
 // ExecuteConstraintCheck_Aggregated_WarpPerWorld - 对多个 world 检查同一约束
 // bitSup 已加载到 shared memory，对 world_mask 中的每个活跃 world 执行检查
 // ============================================================================
@@ -3710,7 +3758,12 @@ void ExecuteConstraintCheck_Aggregated_WarpPerWorld(
     const GModelData& model,
     Batch3AControl* control,
     const uint2* shmem_bitsup,  // bitSup 在 shared memory
-    u32* shared_del) {          // 布局: [num_warps * 2 * bit_dom_int_size]
+    u32* shared_del,            // 布局: [num_warps * 2 * bit_dom_int_size]
+    u32* next_frontier_mask,    // [num_cons]，本 block 的下一轮 `<cid,world_mask>`
+    int* next_cid_queue,        // [queue_capacity]
+    int* next_queue_tail,       // [1]（本 block 的 tail）
+    int queue_capacity,
+    int* overflow_flag) {       // [1]（本 block 溢出标记）
 
   const int warp_id = threadIdx.x / 32;
   const int lane_id = threadIdx.x % 32;
@@ -3859,12 +3912,16 @@ void ExecuteConstraintCheck_Aggregated_WarpPerWorld(
         ws->inconsistent_flag = 1;
         control->results[global_w] = false;
       } else {
-        // 更新 frontier（邻域激活）
+        // Dynamic Submission：删值后把邻接约束提交到“下一轮队列”（而不是写 frontier bitmap）
         if (x_deletions > 0) {
-          PropagateVarToNextBitmap(x, model, ws->frontier_B);
+          Batch3AEnqueueVarToNextQueue(x, local_w, model, next_frontier_mask,
+                                      next_cid_queue, next_queue_tail,
+                                      queue_capacity, overflow_flag);
         }
         if (y_deletions > 0) {
-          PropagateVarToNextBitmap(y, model, ws->frontier_B);
+          Batch3AEnqueueVarToNextQueue(y, local_w, model, next_frontier_mask,
+                                      next_cid_queue, next_queue_tail,
+                                      queue_capacity, overflow_flag);
         }
       }
 
@@ -3902,7 +3959,12 @@ void ExecuteConstraintCheck_Aggregated_SubwarpPerWorld(
     const GModelData& model,
     Batch3AControl* control,
     const uint2* shmem_bitsup,  // bitSup 在 shared memory
-    u32* shared_del) {          // 布局: [worlds_per_block * 2 * bit_dom_int_size]
+    u32* shared_del,            // 布局: [worlds_per_block * 2 * bit_dom_int_size]
+    u32* next_frontier_mask,    // [num_cons]
+    int* next_cid_queue,        // [queue_capacity]
+    int* next_queue_tail,       // [1]
+    int queue_capacity,
+    int* overflow_flag) {       // [1]
 
   const int warp_id = threadIdx.x / 32;
   const int lane_id = threadIdx.x % 32;
@@ -4048,10 +4110,14 @@ void ExecuteConstraintCheck_Aggregated_SubwarpPerWorld(
       control->results[global_w] = false;
     } else {
       if (x_deletions > 0) {
-        PropagateVarToNextBitmap(x, model, ws->frontier_B);
+        Batch3AEnqueueVarToNextQueue(x, local_w, model, next_frontier_mask,
+                                    next_cid_queue, next_queue_tail,
+                                    queue_capacity, overflow_flag);
       }
       if (y_deletions > 0) {
-        PropagateVarToNextBitmap(y, model, ws->frontier_B);
+        Batch3AEnqueueVarToNextQueue(y, local_w, model, next_frontier_mask,
+                                    next_cid_queue, next_queue_tail,
+                                    queue_capacity, overflow_flag);
       }
     }
 
@@ -4089,7 +4155,12 @@ void ExecuteConstraintCheck_Aggregated_WarpPerWordLaneWorld(
     const GModelData& model,
     Batch3AControl* control,
     const uint2* shmem_bitsup,  // bitSup 在 shared memory
-    u32* shared_buf) {          // dynamic shared buffer（bitsup 之后）
+    u32* shared_buf,            // dynamic shared buffer（bitsup 之后）
+    u32* next_frontier_mask,    // [num_cons]
+    int* next_cid_queue,        // [queue_capacity]
+    int* next_queue_tail,       // [1]
+    int queue_capacity,
+    int* overflow_flag) {       // [1]
 
   const int warp_id = threadIdx.x / 32;
   const int lane_id = threadIdx.x % 32;
@@ -4281,10 +4352,14 @@ void ExecuteConstraintCheck_Aggregated_WarpPerWordLaneWorld(
         control->results[global_w] = false;
       } else {
         if (x_deletions > 0) {
-          PropagateVarToNextBitmap(x, model, ws->frontier_B);
+          Batch3AEnqueueVarToNextQueue(x, local_w2, model, next_frontier_mask,
+                                      next_cid_queue, next_queue_tail,
+                                      queue_capacity, overflow_flag);
         }
         if (y_deletions > 0) {
-          PropagateVarToNextBitmap(y, model, ws->frontier_B);
+          Batch3AEnqueueVarToNextQueue(y, local_w2, model, next_frontier_mask,
+                                      next_cid_queue, next_queue_tail,
+                                      queue_capacity, overflow_flag);
         }
       }
 
@@ -4301,177 +4376,8 @@ void ExecuteConstraintCheck_Aggregated_WarpPerWordLaneWorld(
   }
 }
 
-// Batch3AKernel - 约束聚合单 block kernel（MVP 版本，避免跨 block 同步问题）
-__global__
-void Batch3AKernel(
-    const GModelData model,
-    Batch3AControl* control) {
-
-  // MVP: 只使用单个 block，避免跨 block 同步问题
-  // 后续可以扩展为多 block 版本（需要 cooperative groups）
-
-  // Shared memory 布局:
-  // - shmem_bitsup: bitSup 数据 [2 * max_dom_size * bit_dom_int_size * sizeof(uint2)]
-  // - shared_del: 删除缓冲区 [2 * bit_dom_int_size * sizeof(u32)]
-  extern __shared__ char shmem_raw[];
-
-  const int num_worlds = control->num_worlds;
-  const int num_cons = model.num_constraints;
-  const int bitmap_size_words = (num_cons + 31) / 32;
-  const int bit_dom_int_size = model.bit_dom_int_size;
-  const int max_dom_size = model.max_dom_size;
-
-  // 计算 shared memory 布局
-  const int bitsup_size_bytes = 2 * max_dom_size * bit_dom_int_size * sizeof(uint2);
-  uint2* shmem_bitsup = reinterpret_cast<uint2*>(shmem_raw);
-  u32* shared_del = reinterpret_cast<u32*>(shmem_raw + bitsup_size_bytes);
-
-  // Phase 0: 初始化所有 world
-  for (int world_id = threadIdx.x; world_id < num_worlds; world_id += blockDim.x) {
-    WorldWorkspace* ws = &control->workspaces[world_id];
-    const ProbeTask& task = control->world_probes[world_id];
-
-    // 单例赋值
-    const int var_id = task.var_id;
-    const int value = task.value;
-
-    if (var_id >= 0 && var_id < model.num_vars &&
-        value >= 0 && value < model.max_dom_size) {
-      const int dom_base = var_id * bit_dom_int_size;
-      const int word_idx = value / 32;
-      const int bit_idx = value % 32;
-
-      for (int w = 0; w < bit_dom_int_size; ++w) {
-        ws->bitDom[dom_base + w] = 0u;
-      }
-      if (word_idx < bit_dom_int_size) {
-        ws->bitDom[dom_base + word_idx] = (1u << bit_idx);
-      }
-      ws->d_cur_dom_size[var_id] = 1;
-
-      // 初始化 frontier（邻域激活）
-      const int start = model.d_subscription_offset[var_id];
-      const int end = model.d_subscription_offset[var_id + 1];
-      for (int i = start; i < end; ++i) {
-        const int cid = model.d_subscription[i].z;
-        atomicOr(&ws->frontier_A[cid / 32], 1u << (cid % 32));
-      }
-      ws->frontier_nonempty = 1;
-    } else {
-      ws->inconsistent_flag = 1;
-      control->results[world_id] = false;
-    }
-  }
-  __syncthreads();
-
-  // 主传播循环
-  for (int iter = 0; iter < control->max_iterations; ++iter) {
-    // thread 0 读取 active_mask
-    __shared__ u32 active_mask_shared;
-    if (threadIdx.x == 0) {
-      active_mask_shared = *control->active_world_mask;
-    }
-    __syncthreads();
-
-    u32 active_mask = active_mask_shared;
-    if (active_mask == 0) {
-      break;
-    }
-
-    // Step 1: thread 0 构建稀疏约束任务列表（只包含活跃约束）
-    __shared__ int num_tasks_shared;
-    if (threadIdx.x == 0) {
-      int task_count = 0;
-      for (int cid = 0; cid < num_cons; ++cid) {
-        u32 mask = 0;
-        for (int w = 0; w < num_worlds; ++w) {
-          if ((active_mask & (1u << w)) == 0) continue;
-          WorldWorkspace* ws = &control->workspaces[w];
-          if (ws->inconsistent_flag == 1) continue;
-
-          const u32 frontier_word = ws->frontier_A[cid / 32];
-          if (frontier_word & (1u << (cid % 32))) {
-            mask |= (1u << w);
-          }
-        }
-        if (mask != 0) {
-          control->constraint_tasks[task_count].cid = cid;
-          control->constraint_tasks[task_count].world_mask = mask;
-          task_count++;
-        }
-      }
-      control->num_constraint_tasks = task_count;
-      num_tasks_shared = task_count;
-    }
-    __syncthreads();
-
-    const int num_tasks = num_tasks_shared;
-
-    // Step 2: 只遍历活跃约束（O(K) 而非 O(C)）
-    for (int task_idx = 0; task_idx < num_tasks; ++task_idx) {
-      const int cid = control->constraint_tasks[task_idx].cid;
-      const u32 world_mask = control->constraint_tasks[task_idx].world_mask;
-
-      // 加载 bitSup 到 shared memory（一次加载，多 world 共享）
-      const int bitsup_words = model.bitsup_per_constraint;  // uint2 数量
-      const uint2* src = model.bitSupData + cid * bitsup_words;
-
-      for (int i = threadIdx.x; i < bitsup_words; i += blockDim.x) {
-        shmem_bitsup[i] = src[i];
-      }
-      __syncthreads();
-
-      // 对所有相关 world 执行约束检查（单 block 版本：block_world_start=0）
-      if (control->check_mapping == static_cast<int>(kWarpPerWordLaneWorld)) {
-        ExecuteConstraintCheck_Aggregated_WarpPerWordLaneWorld(
-            cid, world_mask, 0, num_worlds, model, control, shmem_bitsup, shared_del);
-      } else if (control->check_mapping == static_cast<int>(kSubwarpPerWorld)) {
-        ExecuteConstraintCheck_Aggregated_SubwarpPerWorld(
-            cid, world_mask, 0, num_worlds, model, control, shmem_bitsup, shared_del);
-      } else {
-        ExecuteConstraintCheck_Aggregated_WarpPerWorld(
-            cid, world_mask, 0, num_worlds, model, control, shmem_bitsup, shared_del);
-      }
-
-      __syncthreads();
-    }
-
-    // 迭代结束，更新全局状态（thread 0）
-    if (threadIdx.x == 0) {
-      // 检查每个 world 的收敛状态
-      u32 new_active_mask = 0;
-      for (int w = 0; w < num_worlds; ++w) {
-        WorldWorkspace* ws = &control->workspaces[w];
-        if (ws->inconsistent_flag == 1) continue;
-
-        // 检查 frontier_B 是否非空
-        bool has_work = false;
-        for (int word = 0; word < bitmap_size_words; ++word) {
-          if (ws->frontier_B[word] != 0u) {
-            has_work = true;
-            break;
-          }
-        }
-
-        if (has_work) {
-          new_active_mask |= (1u << w);
-          // Swap frontiers
-          u32* tmp = ws->frontier_A;
-          ws->frontier_A = ws->frontier_B;
-          ws->frontier_B = tmp;
-          // 清空新的 frontier_B
-          for (int word = 0; word < bitmap_size_words; ++word) {
-            ws->frontier_B[word] = 0u;
-          }
-          ws->iterations++;
-        }
-      }
-      *control->active_world_mask = new_active_mask;
-      (*control->global_iteration)++;
-    }
-    __syncthreads();
-  }
-}
+// 说明：历史上存在一个单 block 的 Batch3A MVP kernel（会在每轮扫描全体约束构建任务）。
+// 该实现已被 multi-block + Dynamic Submission 队列版替代，为避免误用与重复维护，这里移除。
 
 // ============================================================================
 // Batch3AKernel_MultiBlock - 多 Block World 分片版本
@@ -4494,7 +4400,20 @@ void Batch3AKernel_MultiBlock(
   const int bit_dom_int_size = model.bit_dom_int_size;
   const int max_dom_size = model.max_dom_size;
   const int num_cons = model.num_constraints;
-  const int bitmap_size_words = (num_cons + 31) / 32;
+
+  // Dynamic Submission：本 block 的队列与 mask
+  const int queue_capacity = control->queue_capacity;
+  u32* frontier_mask_A =
+      control->block_frontier_mask_A + blockIdx.x * num_cons;
+  u32* frontier_mask_B =
+      control->block_frontier_mask_B + blockIdx.x * num_cons;
+  int* cid_queue_A =
+      control->block_cid_queue_A + blockIdx.x * queue_capacity;
+  int* cid_queue_B =
+      control->block_cid_queue_B + blockIdx.x * queue_capacity;
+  int* queue_tail_A = control->block_queue_tail_A + blockIdx.x;
+  int* queue_tail_B = control->block_queue_tail_B + blockIdx.x;
+  int* overflow_flag = control->block_overflow + blockIdx.x;
 
   const int bitsup_size_bytes = 2 * max_dom_size * bit_dom_int_size * sizeof(uint2);
   uint2* shmem_bitsup = reinterpret_cast<uint2*>(shmem_raw);
@@ -4524,14 +4443,10 @@ void Batch3AKernel_MultiBlock(
       }
       ws->d_cur_dom_size[var_id] = 1;
 
-      // 初始化 frontier（邻域激活）
-      const int start = model.d_subscription_offset[var_id];
-      const int end = model.d_subscription_offset[var_id + 1];
-      for (int i = start; i < end; ++i) {
-        const int cid = model.d_subscription[i].z;
-        atomicOr(&ws->frontier_A[cid / 32], 1u << (cid % 32));
-      }
-      ws->frontier_nonempty = 1;
+      // Dynamic Submission：初始时把 probe var 的邻接约束加入当前轮队列（A）
+      Batch3AEnqueueVarToNextQueue(var_id, local_w, model, frontier_mask_A,
+                                  cid_queue_A, queue_tail_A, queue_capacity,
+                                  overflow_flag);
     } else {
       ws->inconsistent_flag = 1;
       control->results[global_w] = false;
@@ -4539,136 +4454,109 @@ void Batch3AKernel_MultiBlock(
   }
   __syncthreads();
 
-  // 主传播循环
-  for (int iter = 0; iter < control->max_iterations; ++iter) {
-    // 读取全局 active_mask，提取本 block 的局部掩码
-    __shared__ u32 local_active_mask;
+  // --------------------------------------------------------------------------
+  // Dynamic Submission：双队列（A/B）worklist 驱动（结尾提交，避免开头扫全约束）
+  // --------------------------------------------------------------------------
+  __shared__ int converged_flag;
+  __shared__ int parity;
+  if (threadIdx.x == 0) {
+    converged_flag = 0;
+    parity = 0;  // A 为当前队列，B 为下一轮队列
+  }
+  __syncthreads();
+
+  for (int round = 0; round < control->max_iterations; ++round) {
+    if (*overflow_flag != 0) break;
+
+    u32* mask_cur = (parity == 0) ? frontier_mask_A : frontier_mask_B;
+    u32* mask_next = (parity == 0) ? frontier_mask_B : frontier_mask_A;
+    int* queue_cur = (parity == 0) ? cid_queue_A : cid_queue_B;
+    int* queue_next = (parity == 0) ? cid_queue_B : cid_queue_A;
+    int* tail_cur = (parity == 0) ? queue_tail_A : queue_tail_B;
+    int* tail_next = (parity == 0) ? queue_tail_B : queue_tail_A;
+
+    __shared__ int tail_snapshot;
     if (threadIdx.x == 0) {
-      const u32 global_mask = *control->active_world_mask;
-      u32 mask = 0;
-      for (int i = 0; i < block_world_count; ++i) {
-        const int global_w = block_world_start + i;
-        if (global_mask & (1u << global_w)) {
-          mask |= (1u << i);  // 局部索引
-        }
-      }
-      local_active_mask = mask;
+      tail_snapshot = *tail_cur;
     }
     __syncthreads();
 
-    if (local_active_mask == 0) break;
+    for (int head = 0; head < tail_snapshot; ++head) {
+      if (*overflow_flag != 0) break;
 
-    // Step 1: thread 0 构建本 block 的稀疏约束任务列表
-    // 注意：使用 control->constraint_tasks 的分片（每个 block 用不同区域）
-    // 为简化实现，这里使用 shared memory 存储局部任务
-    __shared__ int num_local_tasks;
-    __shared__ int local_task_cids[512];     // 最多 512 个约束
-    __shared__ u32 local_task_masks[512];
-
-    if (threadIdx.x == 0) {
-      int task_count = 0;
-      for (int cid = 0; cid < num_cons && task_count < 512; ++cid) {
-        u32 mask = 0;
-        for (int i = 0; i < block_world_count; ++i) {
-          if ((local_active_mask & (1u << i)) == 0) continue;
-          const int global_w = block_world_start + i;
-          WorldWorkspace* ws = &control->workspaces[global_w];
-          if (ws->inconsistent_flag == 1) continue;
-
-          const u32 frontier_word = ws->frontier_A[cid / 32];
-          if (frontier_word & (1u << (cid % 32))) {
-            mask |= (1u << i);  // 局部索引
-          }
-        }
-        if (mask != 0) {
-          local_task_cids[task_count] = cid;
-          local_task_masks[task_count] = mask;
-          task_count++;
-        }
+      __shared__ int cur_cid;
+      __shared__ u32 cur_mask;
+      if (threadIdx.x == 0) {
+        cur_cid = queue_cur[head];
+        cur_mask = atomicExch(&mask_cur[cur_cid], 0u);
       }
-      num_local_tasks = task_count;
-    }
-    __syncthreads();
+      __syncthreads();
 
-    // Step 2: 只遍历活跃约束
-    for (int task_idx = 0; task_idx < num_local_tasks; ++task_idx) {
-      const int cid = local_task_cids[task_idx];
-      const u32 local_world_mask = local_task_masks[task_idx];
+      if (cur_mask == 0u) continue;
 
-      // 加载 bitSup 到 shared memory
+      // 加载 bitSup 到 shared memory（一次加载，多 world 共享）
       const int bitsup_words = model.bitsup_per_constraint;
-      const uint2* src = model.bitSupData + cid * bitsup_words;
+      const uint2* src = model.bitSupData + cur_cid * bitsup_words;
 
       for (int i = threadIdx.x; i < bitsup_words; i += blockDim.x) {
         shmem_bitsup[i] = src[i];
       }
       __syncthreads();
 
-      // 对本 block 的相关 world 执行约束检查
+      // 执行约束检查，并在删值时向 next 队列提交邻接约束
       if (control->check_mapping == static_cast<int>(kWarpPerWordLaneWorld)) {
         ExecuteConstraintCheck_Aggregated_WarpPerWordLaneWorld(
-            cid, local_world_mask, block_world_start, block_world_count, model,
-            control, shmem_bitsup, shared_del);
+            cur_cid, cur_mask, block_world_start, block_world_count, model,
+            control, shmem_bitsup, shared_del, mask_next, queue_next, tail_next,
+            queue_capacity, overflow_flag);
       } else if (control->check_mapping == static_cast<int>(kSubwarpPerWorld)) {
         ExecuteConstraintCheck_Aggregated_SubwarpPerWorld(
-            cid, local_world_mask, block_world_start, block_world_count, model,
-            control, shmem_bitsup, shared_del);
+            cur_cid, cur_mask, block_world_start, block_world_count, model,
+            control, shmem_bitsup, shared_del, mask_next, queue_next, tail_next,
+            queue_capacity, overflow_flag);
       } else {
         ExecuteConstraintCheck_Aggregated_WarpPerWorld(
-            cid, local_world_mask, block_world_start, block_world_count, model,
-            control, shmem_bitsup, shared_del);
+            cur_cid, cur_mask, block_world_start, block_world_count, model,
+            control, shmem_bitsup, shared_del, mask_next, queue_next, tail_next,
+            queue_capacity, overflow_flag);
       }
-
       __syncthreads();
     }
 
-    // 迭代结束，更新本 block 管理的 world 状态
+    __syncthreads();
     if (threadIdx.x == 0) {
-      u32 done_mask = 0;  // 已完成的 world（全局索引）
-      u32 still_active_mask = 0;  // 仍需继续的 world（全局索引）
-
-      for (int i = 0; i < block_world_count; ++i) {
-        const int global_w = block_world_start + i;
-        WorldWorkspace* ws = &control->workspaces[global_w];
-
-        if (ws->inconsistent_flag == 1) {
-          done_mask |= (1u << global_w);
-          continue;
-        }
-
-        // 检查 frontier_B 是否非空
-        bool has_work = false;
-        for (int word = 0; word < bitmap_size_words; ++word) {
-          if (ws->frontier_B[word] != 0u) {
-            has_work = true;
-            break;
-          }
-        }
-
-        if (has_work) {
-          still_active_mask |= (1u << global_w);
-          // Swap frontiers
-          u32* tmp = ws->frontier_A;
-          ws->frontier_A = ws->frontier_B;
-          ws->frontier_B = tmp;
-          // 清空新的 frontier_B
-          for (int word = 0; word < bitmap_size_words; ++word) {
-            ws->frontier_B[word] = 0u;
-          }
-          ws->iterations++;
-        } else {
-          done_mask |= (1u << global_w);
-        }
-      }
-
-      // 原子更新全局 active_mask
-      // 清除已完成的 world，保持仍活跃的
-      if (done_mask != 0) {
-        atomicAnd(control->active_world_mask, ~done_mask);
+      if (*overflow_flag != 0) {
+        converged_flag = 0;
+      } else if (*tail_next == 0) {
+        converged_flag = 1;
+      } else {
+        // 进入下一轮：清空当前 tail，并切换 A/B
+        *tail_cur = 0;
+        parity ^= 1;
       }
     }
     __syncthreads();
+
+    if (converged_flag != 0) break;
   }
+
+  // Finalize：清理 active_world_mask（UNKNOWN 保持 bit 不清）
+  if (threadIdx.x == 0) {
+    u32 done_mask = 0;
+    for (int i = 0; i < block_world_count; ++i) {
+      const int global_w = block_world_start + i;
+      WorldWorkspace* ws = &control->workspaces[global_w];
+      if (ws->inconsistent_flag == 1) {
+        done_mask |= (1u << global_w);
+      } else if (converged_flag != 0) {
+        done_mask |= (1u << global_w);
+      }
+    }
+    if (done_mask != 0) {
+      atomicAnd(control->active_world_mask, ~done_mask);
+    }
+  }
+  __syncthreads();
 }
 
 // LaunchBatch3AKernelWrapper - Host 端调用入口

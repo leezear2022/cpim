@@ -771,6 +771,25 @@ struct Batch3AControl {
   int* constraint_task_cursor;          // 原子游标（动态获取任务）
   Batch3ATask* constraint_tasks;        // 紧凑任务数组 [num_constraint_tasks]
 
+  // ========== Dynamic Submission：队列驱动（每个 block 一套）==========
+  // 说明：
+  // - 旧版 Batch-3A 每轮由 thread0 扫描全体 cid 构建 local_task_cids（成本与 num_cons 成正比）。
+  // - 新版改为 worklist：约束检查结束时把“受影响的邻接约束” enqueue 到下一轮队列，
+  //   从而显式利用稀疏性（成本与活跃 cid 数量成正比）。
+  //
+  // 数据布局：
+  // - mask_A/B: [max_blocks * num_cons]，每个元素是该 block 的局部 world_mask（0..G-1 位）
+  // - queue_A/B: [max_blocks * queue_capacity]，存放 cid
+  // - tail_A/B/overflow: [max_blocks]
+  int queue_capacity;                  // 每个 block 的队列容量（建议 >= num_cons；溢出则 UNKNOWN）
+  u32* block_frontier_mask_A;          // [max_blocks * num_cons]
+  u32* block_frontier_mask_B;          // [max_blocks * num_cons]
+  int* block_cid_queue_A;              // [max_blocks * queue_capacity]
+  int* block_cid_queue_B;              // [max_blocks * queue_capacity]
+  int* block_queue_tail_A;             // [max_blocks]
+  int* block_queue_tail_B;             // [max_blocks]
+  int* block_overflow;                 // [max_blocks]（1=队列溢出）
+
   // ========== World 管理 ==========
   int num_worlds;                       // 当前 world 数量（≤ 32）
   ProbeTask* world_probes;              // 每个 world 的 probe 信息 [num_worlds]
@@ -811,6 +830,14 @@ struct Batch3AControl {
       : num_constraint_tasks(0),
         constraint_task_cursor(nullptr),
         constraint_tasks(nullptr),
+        queue_capacity(0),
+        block_frontier_mask_A(nullptr),
+        block_frontier_mask_B(nullptr),
+        block_cid_queue_A(nullptr),
+        block_cid_queue_B(nullptr),
+        block_queue_tail_A(nullptr),
+        block_queue_tail_B(nullptr),
+        block_overflow(nullptr),
         num_worlds(0),
         world_probes(nullptr),
         workspaces(nullptr),
@@ -904,6 +931,7 @@ class Batch3AManager {
   int GetBitSupSizePerConstraint() const;
 
  private:
+  static constexpr int kMaxBatch3ABlocks = 16;
   void AllocateMemory();
   void FreeMemory();
   void SaveSnapshot();
@@ -948,6 +976,16 @@ class Batch3AManager {
   int* d_ws_dom_size_ = nullptr;                // [max_worlds * num_vars]
   u32* d_ws_frontier_A_ = nullptr;              // [max_worlds * bitmap_size_words]
   u32* d_ws_frontier_B_ = nullptr;              // [max_worlds * bitmap_size_words]
+
+  // Dynamic Submission（每个 block 一套 A/B 队列与 mask）
+  int queue_capacity_ = 0;                      // 每个 block 队列容量（通常取 num_cons）
+  u32* d_block_frontier_mask_A_ = nullptr;      // [kMaxBatch3ABlocks * num_cons]
+  u32* d_block_frontier_mask_B_ = nullptr;      // [kMaxBatch3ABlocks * num_cons]
+  int* d_block_cid_queue_A_ = nullptr;          // [kMaxBatch3ABlocks * queue_capacity_]
+  int* d_block_cid_queue_B_ = nullptr;          // [kMaxBatch3ABlocks * queue_capacity_]
+  int* d_block_queue_tail_A_ = nullptr;         // [kMaxBatch3ABlocks]
+  int* d_block_queue_tail_B_ = nullptr;         // [kMaxBatch3ABlocks]
+  int* d_block_overflow_ = nullptr;             // [kMaxBatch3ABlocks]
 
   // 控制结构
   Batch3AControl* d_control_ = nullptr;

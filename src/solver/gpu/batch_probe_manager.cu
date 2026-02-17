@@ -2486,4 +2486,609 @@ int Batch3AManager::GetBitSupSizePerConstraint() const {
   return 2 * max_dom_size * bit_dom_int_size * sizeof(uint2);
 }
 
+// ============================================================================
+// FQ-PT Baseline 管理器实现
+// ============================================================================
+
+int FQPTBaselineManager::RoundUpPow2(int v) {
+  if (v <= 1) return 1;
+  int x = v - 1;
+  x |= x >> 1;
+  x |= x >> 2;
+  x |= x >> 4;
+  x |= x >> 8;
+  x |= x >> 16;
+  return x + 1;
+}
+
+int FQPTBaselineManager::ComputeRecommendedNumBlocks(int device_id) {
+  cudaDeviceProp prop;
+  cudaError_t err = cudaGetDeviceProperties(&prop, device_id);
+  if (err != cudaSuccess) {
+    return 8;
+  }
+  return std::max(1, std::min(64, prop.multiProcessorCount * 2));
+}
+
+FQPTBaselineManager::FQPTBaselineManager(GModel* model, int num_blocks)
+    : model_(model) {
+  CHECK(model_ != nullptr) << "GModel pointer cannot be null";
+  if (num_blocks == -1) {
+    num_blocks_ = ComputeRecommendedNumBlocks(0);
+  } else {
+    CHECK(num_blocks > 0) << "num_blocks must be > 0 or -1";
+    num_blocks_ = num_blocks;
+  }
+
+  max_tasks_ = std::max(64, num_blocks_ * 8);
+  queue_capacity_ = RoundUpPow2(std::max(4096, model_->GetNumCons() * 8));
+  AllocateMemory();
+}
+
+FQPTBaselineManager::~FQPTBaselineManager() {
+  FreeMemory();
+}
+
+void FQPTBaselineManager::SetQueueCapacity(int capacity_pow2) {
+  const int new_capacity = RoundUpPow2(std::max(32, capacity_pow2));
+  if (new_capacity == queue_capacity_) return;
+  queue_capacity_ = new_capacity;
+  if (memory_allocated_) {
+    FreeMemory();
+    AllocateMemory();
+  }
+}
+
+void FQPTBaselineManager::AllocateMemory() {
+  if (memory_allocated_) return;
+
+  const int num_vars = model_->GetNumVars();
+  const int bit_dom_int_size = model_->GetBitDomIntSize();
+  const int num_cons = model_->GetNumCons();
+  const int dom_words_per_world = num_vars * bit_dom_int_size;
+  const int bitmap_size_words = (num_cons + 31) / 32;
+
+  cudaError_t err;
+
+  err = cudaMallocManaged(&d_tasks_, max_tasks_ * sizeof(ProbeTask));
+  CHECK(err == cudaSuccess) << "Failed to allocate d_tasks_: "
+                            << cudaGetErrorString(err);
+
+  err = cudaMallocManaged(&d_world_results_, max_tasks_ * sizeof(bool));
+  CHECK(err == cudaSuccess) << "Failed to allocate d_world_results_: "
+                            << cudaGetErrorString(err);
+
+  err = cudaMallocManaged(&d_world_status_, max_tasks_ * sizeof(int));
+  CHECK(err == cudaSuccess) << "Failed to allocate d_world_status_: "
+                            << cudaGetErrorString(err);
+
+  err = cudaMallocManaged(
+      &d_snapshot_,
+      static_cast<size_t>(dom_words_per_world) * sizeof(u32));
+  CHECK(err == cudaSuccess) << "Failed to allocate d_snapshot_: "
+                            << cudaGetErrorString(err);
+
+  err = cudaMallocManaged(&d_dom_size_snapshot_, num_vars * sizeof(int));
+  CHECK(err == cudaSuccess) << "Failed to allocate d_dom_size_snapshot_: "
+                            << cudaGetErrorString(err);
+
+  err = cudaMallocManaged(&d_workspaces_, max_tasks_ * sizeof(WorldWorkspace));
+  CHECK(err == cudaSuccess) << "Failed to allocate d_workspaces_: "
+                            << cudaGetErrorString(err);
+
+  err = cudaMallocManaged(
+      &d_ws_bitdom_,
+      static_cast<size_t>(max_tasks_) * dom_words_per_world * sizeof(u32));
+  CHECK(err == cudaSuccess) << "Failed to allocate d_ws_bitdom_: "
+                            << cudaGetErrorString(err);
+
+  err = cudaMallocManaged(
+      &d_ws_dom_size_,
+      static_cast<size_t>(max_tasks_) * num_vars * sizeof(int));
+  CHECK(err == cudaSuccess) << "Failed to allocate d_ws_dom_size_: "
+                            << cudaGetErrorString(err);
+
+  err = cudaMallocManaged(
+      &d_ws_frontier_A_,
+      static_cast<size_t>(max_tasks_) * bitmap_size_words * sizeof(u32));
+  CHECK(err == cudaSuccess) << "Failed to allocate d_ws_frontier_A_: "
+                            << cudaGetErrorString(err);
+
+  err = cudaMallocManaged(
+      &d_ws_frontier_B_,
+      static_cast<size_t>(max_tasks_) * bitmap_size_words * sizeof(u32));
+  CHECK(err == cudaSuccess) << "Failed to allocate d_ws_frontier_B_: "
+                            << cudaGetErrorString(err);
+
+  err = cudaMallocManaged(&d_world_locks_, max_tasks_ * sizeof(int));
+  CHECK(err == cudaSuccess) << "Failed to allocate d_world_locks_: "
+                            << cudaGetErrorString(err);
+
+  err = cudaMallocManaged(&d_queue_slots_, queue_capacity_ * sizeof(FQPTRingSlot));
+  CHECK(err == cudaSuccess) << "Failed to allocate d_queue_slots_: "
+                            << cudaGetErrorString(err);
+
+  err = cudaMallocManaged(&d_enqueue_pos_, sizeof(unsigned long long));
+  CHECK(err == cudaSuccess) << "Failed to allocate d_enqueue_pos_: "
+                            << cudaGetErrorString(err);
+  err = cudaMallocManaged(&d_dequeue_pos_, sizeof(unsigned long long));
+  CHECK(err == cudaSuccess) << "Failed to allocate d_dequeue_pos_: "
+                            << cudaGetErrorString(err);
+  err = cudaMallocManaged(&d_pending_tasks_, sizeof(unsigned long long));
+  CHECK(err == cudaSuccess) << "Failed to allocate d_pending_tasks_: "
+                            << cudaGetErrorString(err);
+  err = cudaMallocManaged(&d_processed_tasks_, sizeof(unsigned long long));
+  CHECK(err == cudaSuccess) << "Failed to allocate d_processed_tasks_: "
+                            << cudaGetErrorString(err);
+  err = cudaMallocManaged(&d_overflow_count_, sizeof(unsigned long long));
+  CHECK(err == cudaSuccess) << "Failed to allocate d_overflow_count_: "
+                            << cudaGetErrorString(err);
+  err = cudaMallocManaged(&d_unknown_count_, sizeof(unsigned long long));
+  CHECK(err == cudaSuccess) << "Failed to allocate d_unknown_count_: "
+                            << cudaGetErrorString(err);
+
+  err = cudaMallocManaged(&d_total_constraint_checks_, sizeof(unsigned long long));
+  CHECK(err == cudaSuccess) << "Failed to allocate d_total_constraint_checks_: "
+                            << cudaGetErrorString(err);
+  err = cudaMallocManaged(&d_total_deletions_, sizeof(unsigned long long));
+  CHECK(err == cudaSuccess) << "Failed to allocate d_total_deletions_: "
+                            << cudaGetErrorString(err);
+  err = cudaMallocManaged(&d_stale_drop_count_, sizeof(unsigned long long));
+  CHECK(err == cudaSuccess) << "Failed to allocate d_stale_drop_count_: "
+                            << cudaGetErrorString(err);
+  err = cudaMallocManaged(&d_lock_fail_count_, sizeof(unsigned long long));
+  CHECK(err == cudaSuccess) << "Failed to allocate d_lock_fail_count_: "
+                            << cudaGetErrorString(err);
+  err = cudaMallocManaged(&d_lock_retry_count_, sizeof(unsigned long long));
+  CHECK(err == cudaSuccess) << "Failed to allocate d_lock_retry_count_: "
+                            << cudaGetErrorString(err);
+  err = cudaMallocManaged(&d_bucket_count_, sizeof(unsigned long long));
+  CHECK(err == cudaSuccess) << "Failed to allocate d_bucket_count_: "
+                            << cudaGetErrorString(err);
+  err = cudaMallocManaged(&d_bucket_task_sum_, sizeof(unsigned long long));
+  CHECK(err == cudaSuccess) << "Failed to allocate d_bucket_task_sum_: "
+                            << cudaGetErrorString(err);
+  err = cudaMallocManaged(&d_bucket_active_warp_sum_, sizeof(unsigned long long));
+  CHECK(err == cudaSuccess) << "Failed to allocate d_bucket_active_warp_sum_: "
+                            << cudaGetErrorString(err);
+
+  err = cudaMallocManaged(&d_control_, sizeof(FQPTControl));
+  CHECK(err == cudaSuccess) << "Failed to allocate d_control_: "
+                            << cudaGetErrorString(err);
+
+  for (int i = 0; i < max_tasks_; ++i) {
+    WorldWorkspace& ws = d_workspaces_[i];
+    ws.bitDom = d_ws_bitdom_ + static_cast<size_t>(i) * dom_words_per_world;
+    ws.d_cur_dom_size = d_ws_dom_size_ + static_cast<size_t>(i) * num_vars;
+    ws.frontier_A =
+        d_ws_frontier_A_ + static_cast<size_t>(i) * bitmap_size_words;
+    ws.frontier_B =
+        d_ws_frontier_B_ + static_cast<size_t>(i) * bitmap_size_words;
+    ws.inconsistent_flag = 0;
+    ws.scanner_index = 0;
+    ws.deletions = 0;
+    ws.iterations = 0;
+    ws.frontier_nonempty = 0;
+  }
+
+  memory_allocated_ = true;
+}
+
+void FQPTBaselineManager::FreeMemory() {
+  if (!memory_allocated_) return;
+
+  if (d_tasks_) cudaFree(d_tasks_);
+  if (d_world_results_) cudaFree(d_world_results_);
+  if (d_world_status_) cudaFree(d_world_status_);
+  if (d_snapshot_) cudaFree(d_snapshot_);
+  if (d_dom_size_snapshot_) cudaFree(d_dom_size_snapshot_);
+  if (d_workspaces_) cudaFree(d_workspaces_);
+  if (d_ws_bitdom_) cudaFree(d_ws_bitdom_);
+  if (d_ws_dom_size_) cudaFree(d_ws_dom_size_);
+  if (d_ws_frontier_A_) cudaFree(d_ws_frontier_A_);
+  if (d_ws_frontier_B_) cudaFree(d_ws_frontier_B_);
+  if (d_world_locks_) cudaFree(d_world_locks_);
+  if (d_queue_slots_) cudaFree(d_queue_slots_);
+  if (d_enqueue_pos_) cudaFree(d_enqueue_pos_);
+  if (d_dequeue_pos_) cudaFree(d_dequeue_pos_);
+  if (d_pending_tasks_) cudaFree(d_pending_tasks_);
+  if (d_processed_tasks_) cudaFree(d_processed_tasks_);
+  if (d_overflow_count_) cudaFree(d_overflow_count_);
+  if (d_unknown_count_) cudaFree(d_unknown_count_);
+  if (d_total_constraint_checks_) cudaFree(d_total_constraint_checks_);
+  if (d_total_deletions_) cudaFree(d_total_deletions_);
+  if (d_stale_drop_count_) cudaFree(d_stale_drop_count_);
+  if (d_lock_fail_count_) cudaFree(d_lock_fail_count_);
+  if (d_lock_retry_count_) cudaFree(d_lock_retry_count_);
+  if (d_bucket_count_) cudaFree(d_bucket_count_);
+  if (d_bucket_task_sum_) cudaFree(d_bucket_task_sum_);
+  if (d_bucket_active_warp_sum_) cudaFree(d_bucket_active_warp_sum_);
+  if (d_control_) cudaFree(d_control_);
+
+  d_tasks_ = nullptr;
+  d_world_results_ = nullptr;
+  d_world_status_ = nullptr;
+  d_snapshot_ = nullptr;
+  d_dom_size_snapshot_ = nullptr;
+  d_workspaces_ = nullptr;
+  d_ws_bitdom_ = nullptr;
+  d_ws_dom_size_ = nullptr;
+  d_ws_frontier_A_ = nullptr;
+  d_ws_frontier_B_ = nullptr;
+  d_world_locks_ = nullptr;
+  d_queue_slots_ = nullptr;
+  d_enqueue_pos_ = nullptr;
+  d_dequeue_pos_ = nullptr;
+  d_pending_tasks_ = nullptr;
+  d_processed_tasks_ = nullptr;
+  d_overflow_count_ = nullptr;
+  d_unknown_count_ = nullptr;
+  d_total_constraint_checks_ = nullptr;
+  d_total_deletions_ = nullptr;
+  d_stale_drop_count_ = nullptr;
+  d_lock_fail_count_ = nullptr;
+  d_lock_retry_count_ = nullptr;
+  d_bucket_count_ = nullptr;
+  d_bucket_task_sum_ = nullptr;
+  d_bucket_active_warp_sum_ = nullptr;
+  d_control_ = nullptr;
+  memory_allocated_ = false;
+}
+
+void FQPTBaselineManager::EnsureTaskCapacity(int required_tasks) {
+  if (required_tasks <= max_tasks_) return;
+  max_tasks_ = std::max(required_tasks, max_tasks_ * 2);
+  FreeMemory();
+  AllocateMemory();
+}
+
+void FQPTBaselineManager::AddTask(int var_id, int value) {
+  const int num_vars = model_->GetNumVars();
+  if (var_id < 0 || var_id >= num_vars) return;
+  task_queue_.emplace_back(var_id, value, static_cast<int>(task_queue_.size()));
+}
+
+void FQPTBaselineManager::Clear() {
+  task_queue_.clear();
+}
+
+void FQPTBaselineManager::SaveSnapshot() {
+  const int num_vars = model_->GetNumVars();
+  const int bit_dom_int_size = model_->GetBitDomIntSize();
+  const int snapshot_size_words = num_vars * bit_dom_int_size;
+
+  cudaError_t err = cudaMemcpy(
+      d_snapshot_,
+      model_->GetBitDom(),
+      snapshot_size_words * sizeof(u32),
+      cudaMemcpyDeviceToDevice);
+  CHECK(err == cudaSuccess) << "Failed to save domain snapshot: "
+                            << cudaGetErrorString(err);
+
+  err = cudaMemcpy(
+      d_dom_size_snapshot_,
+      model_->GetDomainSizesPtr(),
+      num_vars * sizeof(int),
+      cudaMemcpyDeviceToDevice);
+  CHECK(err == cudaSuccess) << "Failed to save dom_size snapshot: "
+                            << cudaGetErrorString(err);
+
+  err = cudaDeviceSynchronize();
+  CHECK(err == cudaSuccess) << "cudaDeviceSynchronize failed after snapshot: "
+                            << cudaGetErrorString(err);
+}
+
+void FQPTBaselineManager::InitializeWorldsFromSnapshot(int num_worlds) {
+  const int num_vars = model_->GetNumVars();
+  const int bit_dom_int_size = model_->GetBitDomIntSize();
+  const int num_cons = model_->GetNumCons();
+  const int dom_words_per_world = num_vars * bit_dom_int_size;
+  const int bitmap_size_words = (num_cons + 31) / 32;
+
+  cudaError_t err = cudaMemcpy(
+      d_tasks_,
+      task_queue_.data(),
+      num_worlds * sizeof(ProbeTask),
+      cudaMemcpyHostToDevice);
+  CHECK(err == cudaSuccess) << "Failed to copy probe tasks: "
+                            << cudaGetErrorString(err);
+
+  for (int w = 0; w < num_worlds; ++w) {
+    WorldWorkspace& ws = d_workspaces_[w];
+    err = cudaMemcpy(
+        ws.bitDom,
+        d_snapshot_,
+        dom_words_per_world * sizeof(u32),
+        cudaMemcpyDeviceToDevice);
+    CHECK(err == cudaSuccess) << "Failed to init world bitDom: "
+                              << cudaGetErrorString(err);
+
+    err = cudaMemcpy(
+        ws.d_cur_dom_size,
+        d_dom_size_snapshot_,
+        num_vars * sizeof(int),
+        cudaMemcpyDeviceToDevice);
+    CHECK(err == cudaSuccess) << "Failed to init world dom_size: "
+                              << cudaGetErrorString(err);
+  }
+
+  err = cudaDeviceSynchronize();
+  CHECK(err == cudaSuccess) << "cudaDeviceSynchronize failed after world init: "
+                            << cudaGetErrorString(err);
+
+  for (int w = 0; w < num_worlds; ++w) {
+    d_world_locks_[w] = 0;
+    d_world_results_[w] = true;
+    d_world_status_[w] = static_cast<int>(ProbeStatus::kOK);
+
+    WorldWorkspace& ws = d_workspaces_[w];
+    ws.inconsistent_flag = 0;
+    ws.scanner_index = 0;
+    ws.deletions = 0;
+    ws.iterations = 0;
+    ws.frontier_nonempty = 0;
+    for (int bw = 0; bw < bitmap_size_words; ++bw) {
+      ws.frontier_A[bw] = 0u;
+      ws.frontier_B[bw] = 0u;
+    }
+
+    const ProbeTask& task = task_queue_[w];
+    const int var = task.var_id;
+    const int val = task.value;
+    if (var < 0 || var >= num_vars || val < 0 || val >= model_->max_dom_size) {
+      d_world_results_[w] = false;
+      d_world_status_[w] = static_cast<int>(ProbeStatus::kDWO);
+      ws.inconsistent_flag = 1;
+      continue;
+    }
+
+    const int word = val / 32;
+    const int bit = val % 32;
+    if (word < 0 || word >= bit_dom_int_size) {
+      d_world_results_[w] = false;
+      d_world_status_[w] = static_cast<int>(ProbeStatus::kDWO);
+      ws.inconsistent_flag = 1;
+      continue;
+    }
+
+    const int base = var * bit_dom_int_size;
+    const u32 old_word = ws.bitDom[base + word];
+    if ((old_word & (1u << bit)) == 0u) {
+      d_world_results_[w] = false;
+      d_world_status_[w] = static_cast<int>(ProbeStatus::kDWO);
+      ws.inconsistent_flag = 1;
+      continue;
+    }
+
+    for (int k = 0; k < bit_dom_int_size; ++k) {
+      ws.bitDom[base + k] = 0u;
+    }
+    ws.bitDom[base + word] = (1u << bit);
+    ws.d_cur_dom_size[var] = 1;
+  }
+
+  for (int w = num_worlds; w < max_tasks_; ++w) {
+    d_world_locks_[w] = 0;
+    d_world_results_[w] = true;
+    d_world_status_[w] = static_cast<int>(ProbeStatus::kOK);
+    WorldWorkspace& ws = d_workspaces_[w];
+    for (int bw = 0; bw < bitmap_size_words; ++bw) {
+      ws.frontier_A[bw] = 0u;
+      ws.frontier_B[bw] = 0u;
+    }
+  }
+
+  *d_processed_tasks_ = 0;
+  *d_total_constraint_checks_ = 0;
+  *d_total_deletions_ = 0;
+  *d_overflow_count_ = 0;
+  *d_stale_drop_count_ = 0;
+  *d_lock_fail_count_ = 0;
+  *d_lock_retry_count_ = 0;
+  *d_bucket_count_ = 0;
+  *d_bucket_task_sum_ = 0;
+  *d_bucket_active_warp_sum_ = 0;
+}
+
+void FQPTBaselineManager::InitializeGlobalQueueWithSeedTasks(int num_worlds) {
+  std::vector<FQPTTask> seeds;
+  seeds.reserve(std::min(queue_capacity_, num_worlds * 16));
+
+  unsigned long long init_unknown = 0;
+  unsigned long long init_overflow = 0;
+
+  GModelData md = model_->GetModelData();
+  for (int w = 0; w < num_worlds; ++w) {
+    if (d_world_status_[w] != static_cast<int>(ProbeStatus::kOK)) continue;
+    WorldWorkspace& ws = d_workspaces_[w];
+
+    const int probe_var = task_queue_[w].var_id;
+    const int start = md.d_subscription_offset[probe_var];
+    const int end = md.d_subscription_offset[probe_var + 1];
+
+    bool world_overflow = false;
+    for (int i = start; i < end; ++i) {
+      const int cid = md.d_subscription[i].z;
+      const int word = cid >> 5;
+      const u32 bit = (1u << (cid & 31));
+      if ((ws.frontier_A[word] & bit) != 0u) {
+        continue;
+      }
+      if (static_cast<int>(seeds.size()) >= queue_capacity_) {
+        world_overflow = true;
+        break;
+      }
+      ws.frontier_A[word] |= bit;
+      seeds.emplace_back(w, cid);
+    }
+    if (world_overflow) {
+      d_world_status_[w] = static_cast<int>(ProbeStatus::kUNKNOWN);
+      d_world_results_[w] = true;
+      ++init_unknown;
+      ++init_overflow;
+    }
+  }
+
+  for (int i = 0; i < queue_capacity_; ++i) {
+    d_queue_slots_[i].seq = static_cast<unsigned long long>(i);
+    d_queue_slots_[i].task = FQPTTask();
+  }
+
+  for (size_t i = 0; i < seeds.size(); ++i) {
+    d_queue_slots_[i].task = seeds[i];
+    d_queue_slots_[i].seq = static_cast<unsigned long long>(i + 1);
+  }
+
+  *d_enqueue_pos_ = static_cast<unsigned long long>(seeds.size());
+  *d_dequeue_pos_ = 0ULL;
+  *d_pending_tasks_ = static_cast<unsigned long long>(seeds.size());
+  *d_processed_tasks_ = 0ULL;
+  *d_overflow_count_ = init_overflow;
+  *d_unknown_count_ = init_unknown;
+}
+
+void FQPTBaselineManager::LaunchKernel(int num_worlds) {
+  d_control_->num_worlds = num_worlds;
+  d_control_->world_probes = d_tasks_;
+  d_control_->workspaces = d_workspaces_;
+  d_control_->domain_snapshot = d_snapshot_;
+  d_control_->dom_size_snapshot = d_dom_size_snapshot_;
+  d_control_->world_results = d_world_results_;
+  d_control_->world_status = d_world_status_;
+  d_control_->world_locks = d_world_locks_;
+
+  d_control_->queue_slots = d_queue_slots_;
+  d_control_->enqueue_pos = d_enqueue_pos_;
+  d_control_->dequeue_pos = d_dequeue_pos_;
+  d_control_->queue_capacity = queue_capacity_;
+  d_control_->queue_mask = queue_capacity_ - 1;
+
+  d_control_->pending_tasks = d_pending_tasks_;
+  d_control_->processed_tasks = d_processed_tasks_;
+  d_control_->overflow_count = d_overflow_count_;
+  d_control_->unknown_count = d_unknown_count_;
+
+  d_control_->cta_pop_batch = cta_pop_batch_;
+  d_control_->local_buffer_capacity = local_buffer_capacity_;
+  d_control_->lock_retry_limit = lock_retry_limit_;
+  d_control_->lock_backoff = lock_backoff_;
+  d_control_->enable_cid_grouping = enable_cid_grouping_ ? 1 : 0;
+  d_control_->enable_parallel_group_check = enable_parallel_group_check_ ? 1 : 0;
+  d_control_->group_warps_per_cta = group_warps_per_cta_;
+  d_control_->group_degrade_threshold = group_degrade_threshold_;
+
+  d_control_->total_constraint_checks =
+      stats_enabled_ ? d_total_constraint_checks_ : nullptr;
+  d_control_->total_deletions =
+      stats_enabled_ ? d_total_deletions_ : nullptr;
+  d_control_->stale_drop_count =
+      stats_enabled_ ? d_stale_drop_count_ : nullptr;
+  d_control_->lock_fail_count =
+      stats_enabled_ ? d_lock_fail_count_ : nullptr;
+  d_control_->lock_retry_count =
+      stats_enabled_ ? d_lock_retry_count_ : nullptr;
+  d_control_->bucket_count =
+      stats_enabled_ ? d_bucket_count_ : nullptr;
+  d_control_->bucket_task_sum =
+      stats_enabled_ ? d_bucket_task_sum_ : nullptr;
+  d_control_->bucket_active_warp_sum =
+      stats_enabled_ ? d_bucket_active_warp_sum_ : nullptr;
+
+  cudaError_t err = cudaDeviceSynchronize();
+  CHECK(err == cudaSuccess) << "cudaDeviceSynchronize failed before FQPT kernel: "
+                            << cudaGetErrorString(err);
+
+  LaunchFQPTBaselineKernelWrapper(model_->GetModelData(), d_control_, num_blocks_);
+
+  err = cudaDeviceSynchronize();
+  CHECK(err == cudaSuccess) << "FQPT kernel failed: " << cudaGetErrorString(err);
+}
+
+int FQPTBaselineManager::CollectResults(
+    int num_worlds,
+    std::vector<int>& failed_vars,
+    std::vector<int>& failed_values,
+    std::vector<int>* unknown_vars,
+    std::vector<int>* unknown_values) {
+  failed_vars.clear();
+  failed_values.clear();
+  if (unknown_vars != nullptr) unknown_vars->clear();
+  if (unknown_values != nullptr) unknown_values->clear();
+
+  last_stats_ = FQPTStatistics{};
+  last_stats_.total_worlds = num_worlds;
+  last_stats_.processed_tasks = d_processed_tasks_ ? *d_processed_tasks_ : 0ULL;
+  last_stats_.overflow_count = d_overflow_count_ ? *d_overflow_count_ : 0ULL;
+  last_stats_.constraint_checks =
+      stats_enabled_ && d_total_constraint_checks_ ? *d_total_constraint_checks_ : 0ULL;
+  last_stats_.deletions =
+      stats_enabled_ && d_total_deletions_ ? *d_total_deletions_ : 0ULL;
+  last_stats_.stale_drop_count =
+      stats_enabled_ && d_stale_drop_count_ ? *d_stale_drop_count_ : 0ULL;
+  last_stats_.lock_fail_count =
+      stats_enabled_ && d_lock_fail_count_ ? *d_lock_fail_count_ : 0ULL;
+  last_stats_.lock_retry_count =
+      stats_enabled_ && d_lock_retry_count_ ? *d_lock_retry_count_ : 0ULL;
+  const unsigned long long bucket_count =
+      stats_enabled_ && d_bucket_count_ ? *d_bucket_count_ : 0ULL;
+  const unsigned long long bucket_task_sum =
+      stats_enabled_ && d_bucket_task_sum_ ? *d_bucket_task_sum_ : 0ULL;
+  const unsigned long long bucket_active_warp_sum =
+      stats_enabled_ && d_bucket_active_warp_sum_ ? *d_bucket_active_warp_sum_ : 0ULL;
+  if (bucket_count > 0ULL) {
+    last_stats_.avg_bucket_size =
+        static_cast<double>(bucket_task_sum) / static_cast<double>(bucket_count);
+    const int denom_warps = std::max(1, group_warps_per_cta_);
+    last_stats_.avg_bucket_utilization =
+        static_cast<double>(bucket_active_warp_sum) /
+        static_cast<double>(bucket_count * static_cast<unsigned long long>(denom_warps));
+  }
+
+  int failed = 0;
+  for (int w = 0; w < num_worlds; ++w) {
+    const int status = d_world_status_[w];
+    if (status == static_cast<int>(ProbeStatus::kDWO)) {
+      failed_vars.push_back(task_queue_[w].var_id);
+      failed_values.push_back(task_queue_[w].value);
+      ++failed;
+      ++last_stats_.dwo_worlds;
+    } else if (status == static_cast<int>(ProbeStatus::kUNKNOWN)) {
+      if (unknown_vars != nullptr && unknown_values != nullptr) {
+        unknown_vars->push_back(task_queue_[w].var_id);
+        unknown_values->push_back(task_queue_[w].value);
+      }
+      ++last_stats_.unknown_worlds;
+    } else {
+      ++last_stats_.ok_worlds;
+    }
+  }
+  return failed;
+}
+
+int FQPTBaselineManager::Execute(
+    std::vector<int>& failed_vars,
+    std::vector<int>& failed_values,
+    std::vector<int>* unknown_vars,
+    std::vector<int>* unknown_values) {
+  const int num_tasks = static_cast<int>(task_queue_.size());
+  if (num_tasks == 0) {
+    failed_vars.clear();
+    failed_values.clear();
+    if (unknown_vars != nullptr) unknown_vars->clear();
+    if (unknown_values != nullptr) unknown_values->clear();
+    last_stats_ = FQPTStatistics{};
+    return 0;
+  }
+
+  EnsureTaskCapacity(num_tasks);
+  SaveSnapshot();
+  InitializeWorldsFromSnapshot(num_tasks);
+  InitializeGlobalQueueWithSeedTasks(num_tasks);
+  LaunchKernel(num_tasks);
+  const int failed = CollectResults(
+      num_tasks, failed_vars, failed_values, unknown_vars, unknown_values);
+  Clear();
+  return failed;
+}
+
 }  // namespace cpim

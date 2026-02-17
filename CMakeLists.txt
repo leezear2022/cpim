@@ -710,6 +710,54 @@ set_tests_properties(test_batch3a PROPERTIES
 )
 
 # ============================================================================
+# test_fqpt_baseline: FQ-PT (Flattened Queue Persistent Threads) 基线测试
+# ============================================================================
+add_executable(test_fqpt_baseline
+  tests/cpp/test_fqpt_baseline.cpp
+  src/solver/gpu/GModel.cu
+  src/solver/gpu/batch_probe_manager.cu
+  src/model/gmodel_adapter.cu
+  src/model/gmodel_validator.cu
+)
+
+set_target_properties(test_fqpt_baseline PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON
+)
+
+target_link_libraries(test_fqpt_baseline PRIVATE
+  cpim_model
+  cpim_solver_cpu
+  glog::glog
+  absl::flags
+  absl::flags_parse
+  cuda
+  cudart
+)
+
+target_compile_definitions(test_fqpt_baseline PRIVATE
+  CPIM_PROJECT_ROOT="${CMAKE_SOURCE_DIR}"
+)
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm")
+  target_compile_options(test_fqpt_baseline PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=-U__ARM_NEON>
+    $<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=-U__ARM_NEON__>
+    $<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=-DABSL_HAVE_NEON=0>
+  )
+endif()
+
+add_test(
+  NAME test_fqpt_baseline
+  COMMAND test_fqpt_baseline --input=${CMAKE_SOURCE_DIR}/tests/data/bench/queens-4_ext.xml --num_probes=16
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+)
+
+set_tests_properties(test_fqpt_baseline PROPERTIES
+  LABELS "gpu;batch_ac;fqpt"
+  TIMEOUT 120
+)
+
+# ============================================================================
 # sac_benchmark: SAC-GPU 统一基准测试工具
 # ============================================================================
 add_executable(sac_benchmark

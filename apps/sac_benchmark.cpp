@@ -3,7 +3,7 @@
 // ============================================================================
 // This is the unified entry point for SAC-GPU performance benchmarking.
 // Supports:
-//   - Throughput test: batch1, stage2, batch3a (measure probes/sec)
+//   - Throughput test: batch1, stage2, batch3a, fqpt (measure probes/sec)
 //   - Full SAC: full_sac (complete SAC convergence until fixed point)
 //   - SAC preprocess: sac1_preprocess / sac3_preprocess (queue-based SAC/NSACQ)
 //
@@ -11,7 +11,7 @@
 //   ./sac_benchmark --input=<file.xml> [options]
 //
 // Options:
-//   --mode=batch1|stage2|batch3a|full_sac|sac1_preprocess|sac3_preprocess|compare
+//   --mode=batch1|stage2|batch3a|fqpt|full_sac|sac1_preprocess|sac3_preprocess|compare
 //                                 Select mode (default: stage2)
 //   --num_probes=N                Number of probe tasks for throughput (default: 32)
 //   --warmup=N                    Warmup iterations (default: 1)
@@ -55,7 +55,7 @@ DEFINE_string(input, "", "Input XCSP3 file path");
 DEFINE_string(
     mode,
     "stage2",
-    "Benchmark mode: batch1, stage2, batch3a, compare, full_sac, sac1_preprocess, sac3_preprocess");
+    "Benchmark mode: batch1, stage2, batch3a, fqpt, compare, full_sac, sac1_preprocess, sac3_preprocess");
 DEFINE_int32(num_probes, 32, "Number of probe tasks (for throughput test)");
 DEFINE_int32(warmup, 1, "Warmup iterations");
 DEFINE_int32(iterations, 3, "Benchmark iterations");
@@ -78,6 +78,26 @@ DEFINE_int32(batch3a_worlds_per_block, 0,
              "Batch-3A worlds per block (G): 0=auto, 1..32=override (P2-2 tuning)");
 DEFINE_int32(batch3a_shmem_padding, 0,
              "Batch-3A shared packing stride padding (P2-2b): 0=off (default), 1=on");
+DEFINE_int32(fqpt_num_blocks, -1,
+             "FQ-PT: persistent blocks count (-1=auto)");
+DEFINE_int32(fqpt_queue_capacity, 0,
+             "FQ-PT: global ring capacity (power of two, 0=auto)");
+DEFINE_int32(fqpt_pop_batch, 4,
+             "FQ-PT: CTA batch pop size K");
+DEFINE_int32(fqpt_local_buffer, 64,
+             "FQ-PT: CTA local buffer capacity L");
+DEFINE_int32(fqpt_lock_retry, 8,
+             "FQ-PT: world lock retry count");
+DEFINE_int32(fqpt_lock_backoff, 32,
+             "FQ-PT: world lock backoff iterations");
+DEFINE_bool(fqpt_enable_cid_grouping, false,
+            "FQ-PT: enable CTA-local cid grouping");
+DEFINE_bool(fqpt_enable_parallel_group_check, false,
+            "FQ-PT: enable parallel group check (warp-per-world)");
+DEFINE_int32(fqpt_group_warps, 4,
+             "FQ-PT: group warps per CTA for grouped check");
+DEFINE_int32(fqpt_group_degrade_threshold, 1,
+             "FQ-PT: degrade to single-task when max bucket <= threshold");
 
 namespace cpim {
 
@@ -101,6 +121,21 @@ void ConfigureBatch3AManager(Batch3AManager& manager) {
     manager.SetSubwarpSize(FLAGS_batch3a_subwarp_size);
     manager.SetWorldsPerBlock(FLAGS_batch3a_worlds_per_block);
     manager.SetShmemPadding(FLAGS_batch3a_shmem_padding != 0);
+}
+
+void ConfigureFQPTManager(FQPTBaselineManager& manager) {
+    manager.EnableStats(true);
+    if (FLAGS_fqpt_queue_capacity > 0) {
+        manager.SetQueueCapacity(FLAGS_fqpt_queue_capacity);
+    }
+    manager.SetCtaPopBatch(FLAGS_fqpt_pop_batch);
+    manager.SetLocalBufferCapacity(FLAGS_fqpt_local_buffer);
+    manager.SetLockRetryLimit(FLAGS_fqpt_lock_retry);
+    manager.SetLockBackoff(FLAGS_fqpt_lock_backoff);
+    manager.SetEnableCidGrouping(FLAGS_fqpt_enable_cid_grouping);
+    manager.SetEnableParallelGroupCheck(FLAGS_fqpt_enable_parallel_group_check);
+    manager.SetGroupWarpsPerCta(FLAGS_fqpt_group_warps);
+    manager.SetGroupDegradeThreshold(FLAGS_fqpt_group_degrade_threshold);
 }
 
 // ============================================================================
@@ -373,6 +408,15 @@ struct BenchmarkResult {
     int num_probes;
     double probes_per_sec;
     bool valid;
+    int num_unknown = 0;
+    unsigned long long overflow_count = 0;
+    unsigned long long processed_tasks = 0;
+    unsigned long long constraint_checks = 0;
+    unsigned long long stale_drop_count = 0;
+    unsigned long long lock_fail_count = 0;
+    unsigned long long lock_retry_count = 0;
+    double avg_bucket_size = 0.0;
+    double avg_bucket_utilization = 0.0;
 };
 
 void PrintResult(const BenchmarkResult& result) {
@@ -381,7 +425,16 @@ void PrintResult(const BenchmarkResult& result) {
     std::cout << "  " << std::setw(10) << result.avg_time_ms << " ms";
     std::cout << "  [" << result.min_time_ms << " - " << result.max_time_ms << "]";
     std::cout << "  " << std::setw(6) << result.num_failures << " failures";
+    std::cout << "  " << std::setw(6) << result.num_unknown << " unknown";
+    std::cout << "  ovf=" << result.overflow_count;
     std::cout << "  " << std::setw(10) << result.probes_per_sec << " probes/s";
+    std::cout << "  checks=" << result.constraint_checks;
+    std::cout << "  stale=" << result.stale_drop_count;
+    std::cout << "  lock_fail=" << result.lock_fail_count;
+    std::cout << "  lock_retry=" << result.lock_retry_count;
+    std::cout << "  bsz=" << std::setprecision(2) << result.avg_bucket_size;
+    std::cout << "  butil=" << std::setprecision(2)
+              << result.avg_bucket_utilization;
     std::cout << std::endl;
 }
 
@@ -564,6 +617,87 @@ BenchmarkResult RunBatch3ABenchmark(GModel* gmodel,
     result.probes_per_sec = result.num_probes * 1000.0 / result.avg_time_ms;
     result.valid = true;
 
+    return result;
+}
+
+// ============================================================================
+// FQ-PT benchmark
+// ============================================================================
+
+BenchmarkResult RunFQPTBenchmark(GModel* gmodel,
+                                 const std::vector<ProbeTask>& tasks,
+                                 int warmup, int iterations) {
+    BenchmarkResult result;
+    result.mode_name = "FQ-PT";
+    result.num_probes = tasks.size();
+    result.valid = false;
+
+    FQPTBaselineManager manager(gmodel, FLAGS_fqpt_num_blocks);
+    ConfigureFQPTManager(manager);
+
+    for (int w = 0; w < warmup; ++w) {
+        for (const auto& t : tasks) {
+            manager.AddTask(t.var_id, t.value);
+        }
+        std::vector<int> failed_vars, failed_values, unknown_vars, unknown_values;
+        manager.Execute(failed_vars, failed_values, &unknown_vars, &unknown_values);
+        manager.Clear();
+    }
+
+    std::vector<double> times;
+    int total_failures = 0;
+    int total_unknown = 0;
+    unsigned long long total_overflow = 0;
+    unsigned long long total_processed = 0;
+    unsigned long long total_checks = 0;
+    unsigned long long total_stale_drop = 0;
+    unsigned long long total_lock_fail = 0;
+    unsigned long long total_lock_retry = 0;
+    double total_bucket_size = 0.0;
+    double total_bucket_util = 0.0;
+
+    for (int iter = 0; iter < iterations; ++iter) {
+        for (const auto& t : tasks) {
+            manager.AddTask(t.var_id, t.value);
+        }
+
+        std::vector<int> failed_vars, failed_values, unknown_vars, unknown_values;
+        auto start = std::chrono::high_resolution_clock::now();
+        manager.Execute(failed_vars, failed_values, &unknown_vars, &unknown_values);
+        auto end = std::chrono::high_resolution_clock::now();
+
+        times.push_back(std::chrono::duration<double, std::milli>(end - start).count());
+        total_failures = static_cast<int>(failed_vars.size());
+        total_unknown = static_cast<int>(unknown_vars.size());
+        const auto& st = manager.GetLastStatistics();
+        total_overflow += st.overflow_count;
+        total_processed += st.processed_tasks;
+        total_checks += st.constraint_checks;
+        total_stale_drop += st.stale_drop_count;
+        total_lock_fail += st.lock_fail_count;
+        total_lock_retry += st.lock_retry_count;
+        total_bucket_size += st.avg_bucket_size;
+        total_bucket_util += st.avg_bucket_utilization;
+        manager.Clear();
+    }
+
+    result.min_time_ms = *std::min_element(times.begin(), times.end());
+    result.max_time_ms = *std::max_element(times.begin(), times.end());
+    result.avg_time_ms = 0;
+    for (double t : times) result.avg_time_ms += t;
+    result.avg_time_ms /= times.size();
+    result.num_failures = total_failures;
+    result.num_unknown = total_unknown;
+    result.overflow_count = total_overflow / std::max(1, iterations);
+    result.processed_tasks = total_processed / std::max(1, iterations);
+    result.constraint_checks = total_checks / std::max(1, iterations);
+    result.stale_drop_count = total_stale_drop / std::max(1, iterations);
+    result.lock_fail_count = total_lock_fail / std::max(1, iterations);
+    result.lock_retry_count = total_lock_retry / std::max(1, iterations);
+    result.avg_bucket_size = total_bucket_size / std::max(1, iterations);
+    result.avg_bucket_utilization = total_bucket_util / std::max(1, iterations);
+    result.probes_per_sec = result.num_probes * 1000.0 / result.avg_time_ms;
+    result.valid = true;
     return result;
 }
 
@@ -1146,6 +1280,13 @@ int main(int argc, char* argv[]) {
     if (FLAGS_mode == "batch3a" || FLAGS_compare) {
         LOG(INFO) << "Running Batch-3A benchmark...";
         auto result = cpim::RunBatch3ABenchmark(gmodel, tasks, FLAGS_warmup, FLAGS_iterations);
+        results.push_back(result);
+        cpim::PrintResult(result);
+    }
+
+    if (FLAGS_mode == "fqpt" || FLAGS_compare) {
+        LOG(INFO) << "Running FQ-PT benchmark...";
+        auto result = cpim::RunFQPTBenchmark(gmodel, tasks, FLAGS_warmup, FLAGS_iterations);
         results.push_back(result);
         cpim::PrintResult(result);
     }

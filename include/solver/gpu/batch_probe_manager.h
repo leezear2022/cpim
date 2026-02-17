@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <climits>
 #include <cstdint>
+#include <string>
 #include <cuda_runtime.h>
 #include "GModel.cuh"
 
@@ -1015,6 +1016,246 @@ class Batch3AManager {
 
   bool memory_allocated_ = false;
 };
+
+// ============================================================================
+// FQ-PT Baseline: Task = (world_id, cid) 的摊平队列持久线程基线
+// ============================================================================
+
+// FQ-PT 任务（8 bytes）
+struct FQPTTask {
+  int world_id;  // 子问题/世界 ID
+  int cid;       // 约束 ID
+
+  __host__ __device__ FQPTTask() : world_id(-1), cid(-1) {}
+  __host__ __device__ FQPTTask(int w, int c) : world_id(w), cid(c) {}
+};
+
+// MPMC ring 的槽位（seq + payload）
+struct FQPTRingSlot {
+  unsigned long long seq;  // 序号（避免 MPMC holes）
+  FQPTTask task;
+
+  __host__ __device__ FQPTRingSlot() : seq(0), task() {}
+};
+
+// FQ-PT 控制结构（Host 填充，Kernel 读写）
+struct FQPTControl {
+  // ========== 世界与工作区 ==========
+  int num_worlds;                       // world 数量（= probe 数）
+  const ProbeTask* world_probes;        // [num_worlds]
+  WorldWorkspace* workspaces;           // [num_worlds]
+  const u32* domain_snapshot;           // 只读快照 [num_vars * bit_dom_int_size]
+  const int* dom_size_snapshot;         // 只读快照 [num_vars]
+  bool* world_results;                  // [num_worlds]（true=OK/UNKNOWN, false=DWO）
+  int* world_status;                    // [num_worlds]（ProbeStatus 枚举值）
+  int* world_locks;                     // [num_worlds]（0=free, 1=held）
+
+  // ========== 全局 MPMC ring ==========
+  FQPTRingSlot* queue_slots;            // [queue_capacity]
+  unsigned long long* enqueue_pos;      // 生产者位置（CAS）
+  unsigned long long* dequeue_pos;      // 消费者位置（CAS）
+  int queue_capacity;                   // 2 的幂
+  int queue_mask;                       // queue_capacity - 1
+
+  // ========== 安全退出与统计 ==========
+  unsigned long long* pending_tasks;     // 未完成任务数（安全退出判据）
+  unsigned long long* processed_tasks;   // 已完成任务数
+  unsigned long long* overflow_count;    // 队列溢出计数
+  unsigned long long* unknown_count;     // UNKNOWN world 计数
+
+  // ========== CTA-local 策略 ==========
+  int cta_pop_batch;                     // 批量 pop 大小 K
+  int local_buffer_capacity;             // CTA 本地缓冲容量 L
+  int lock_retry_limit;                  // world_lock 拿锁失败重试次数
+  int lock_backoff;                      // 拿锁失败时 backoff 迭代数
+  int enable_cid_grouping;               // 1=启用按 cid 分桶
+  int enable_parallel_group_check;       // 1=启用分桶后并行检查
+  int group_warps_per_cta;               // 分组检查最多使用的 warp 数
+  int group_degrade_threshold;           // max_bucket_size<=threshold 时退化到逐任务
+
+  // ========== 可选统计 ==========
+  unsigned long long* total_constraint_checks;  // 约束检查次数
+  unsigned long long* total_deletions;          // 总删值数
+  unsigned long long* stale_drop_count;         // 陈旧任务丢弃数
+  unsigned long long* lock_fail_count;          // 拿锁失败次数（task 维度）
+  unsigned long long* lock_retry_count;         // 拿锁重试总次数（attempt 维度）
+  unsigned long long* bucket_count;             // 实际触发分桶次数
+  unsigned long long* bucket_task_sum;          // 分桶任务总数
+  unsigned long long* bucket_active_warp_sum;   // 分桶活跃 warp 总数
+
+  __host__ __device__ FQPTControl()
+      : num_worlds(0),
+        world_probes(nullptr),
+        workspaces(nullptr),
+        domain_snapshot(nullptr),
+        dom_size_snapshot(nullptr),
+        world_results(nullptr),
+        world_status(nullptr),
+        world_locks(nullptr),
+        queue_slots(nullptr),
+        enqueue_pos(nullptr),
+        dequeue_pos(nullptr),
+        queue_capacity(0),
+        queue_mask(0),
+        pending_tasks(nullptr),
+        processed_tasks(nullptr),
+        overflow_count(nullptr),
+        unknown_count(nullptr),
+        cta_pop_batch(4),
+        local_buffer_capacity(64),
+        lock_retry_limit(8),
+        lock_backoff(32),
+        enable_cid_grouping(0),
+        enable_parallel_group_check(0),
+        group_warps_per_cta(4),
+        group_degrade_threshold(1),
+        total_constraint_checks(nullptr),
+        total_deletions(nullptr),
+        stale_drop_count(nullptr),
+        lock_fail_count(nullptr),
+        lock_retry_count(nullptr),
+        bucket_count(nullptr),
+        bucket_task_sum(nullptr),
+        bucket_active_warp_sum(nullptr) {}
+};
+
+// FQ-PT 运行统计（Host 侧）
+struct FQPTStatistics {
+  int total_worlds = 0;
+  int dwo_worlds = 0;
+  int ok_worlds = 0;
+  int unknown_worlds = 0;
+
+  unsigned long long processed_tasks = 0;
+  unsigned long long overflow_count = 0;
+  unsigned long long constraint_checks = 0;
+  unsigned long long deletions = 0;
+  unsigned long long stale_drop_count = 0;
+  unsigned long long lock_fail_count = 0;
+  unsigned long long lock_retry_count = 0;
+  double avg_bucket_size = 0.0;
+  double avg_bucket_utilization = 0.0;
+};
+
+// FQ-PT Baseline Host 管理器
+class FQPTBaselineManager {
+ public:
+  explicit FQPTBaselineManager(GModel* model, int num_blocks = -1);
+  ~FQPTBaselineManager();
+
+  FQPTBaselineManager(const FQPTBaselineManager&) = delete;
+  FQPTBaselineManager& operator=(const FQPTBaselineManager&) = delete;
+
+  void AddTask(int var_id, int value);
+  void Clear();
+  int GetTaskCount() const { return static_cast<int>(task_queue_.size()); }
+
+  int Execute(std::vector<int>& failed_vars,
+              std::vector<int>& failed_values,
+              std::vector<int>* unknown_vars,
+              std::vector<int>* unknown_values);
+  int Execute(std::vector<int>& failed_vars,
+              std::vector<int>& failed_values) {
+    return Execute(failed_vars, failed_values, nullptr, nullptr);
+  }
+
+  void EnableStats(bool enabled) { stats_enabled_ = enabled; }
+
+  void SetQueueCapacity(int capacity_pow2);
+  void SetCtaPopBatch(int k) { cta_pop_batch_ = std::max(1, k); }
+  void SetLocalBufferCapacity(int l) { local_buffer_capacity_ = std::max(8, l); }
+  void SetLockRetryLimit(int n) { lock_retry_limit_ = std::max(1, n); }
+  void SetLockBackoff(int n) { lock_backoff_ = std::max(0, n); }
+  void SetEnableCidGrouping(bool enabled) {
+    enable_cid_grouping_ = enabled;
+  }
+  void SetEnableParallelGroupCheck(bool enabled) {
+    enable_parallel_group_check_ = enabled;
+  }
+  void SetGroupWarpsPerCta(int warps) { group_warps_per_cta_ = std::max(1, warps); }
+  void SetGroupDegradeThreshold(int threshold) {
+    group_degrade_threshold_ = std::max(1, threshold);
+  }
+
+  int GetNumBlocks() const { return num_blocks_; }
+  const FQPTStatistics& GetLastStatistics() const { return last_stats_; }
+
+  static int ComputeRecommendedNumBlocks(int device_id = 0);
+  static int RoundUpPow2(int v);
+
+ private:
+  void AllocateMemory();
+  void FreeMemory();
+  void EnsureTaskCapacity(int required_tasks);
+  void SaveSnapshot();
+  void InitializeWorldsFromSnapshot(int num_worlds);
+  void InitializeGlobalQueueWithSeedTasks(int num_worlds);
+  void LaunchKernel(int num_worlds);
+  int CollectResults(int num_worlds,
+                     std::vector<int>& failed_vars,
+                     std::vector<int>& failed_values,
+                     std::vector<int>* unknown_vars,
+                     std::vector<int>* unknown_values);
+
+  GModel* model_ = nullptr;
+  int num_blocks_ = 0;
+  int max_tasks_ = 0;
+  std::vector<ProbeTask> task_queue_;
+
+  // ========== 运行时配置 ==========
+  int queue_capacity_ = 0;         // 必须是 2 的幂
+  int cta_pop_batch_ = 4;
+  int local_buffer_capacity_ = 64;
+  int lock_retry_limit_ = 8;
+  int lock_backoff_ = 32;
+  bool enable_cid_grouping_ = false;
+  bool enable_parallel_group_check_ = false;
+  int group_warps_per_cta_ = 4;
+  int group_degrade_threshold_ = 1;
+  bool stats_enabled_ = true;
+
+  // ========== Device 端内存（统一内存）==========
+  ProbeTask* d_tasks_ = nullptr;               // [max_tasks_]
+  bool* d_world_results_ = nullptr;            // [max_tasks_]
+  int* d_world_status_ = nullptr;              // [max_tasks_]
+  u32* d_snapshot_ = nullptr;                  // [num_vars * bit_dom_int_size]
+  int* d_dom_size_snapshot_ = nullptr;         // [num_vars]
+
+  WorldWorkspace* d_workspaces_ = nullptr;     // [max_tasks_]
+  u32* d_ws_bitdom_ = nullptr;                 // [max_tasks_ * num_vars * bit_dom_int_size]
+  int* d_ws_dom_size_ = nullptr;               // [max_tasks_ * num_vars]
+  u32* d_ws_frontier_A_ = nullptr;             // [max_tasks_ * bitmap_size_words]
+  u32* d_ws_frontier_B_ = nullptr;             // [max_tasks_ * bitmap_size_words]
+  int* d_world_locks_ = nullptr;               // [max_tasks_]
+
+  FQPTRingSlot* d_queue_slots_ = nullptr;      // [queue_capacity_]
+  unsigned long long* d_enqueue_pos_ = nullptr;
+  unsigned long long* d_dequeue_pos_ = nullptr;
+  unsigned long long* d_pending_tasks_ = nullptr;
+  unsigned long long* d_processed_tasks_ = nullptr;
+  unsigned long long* d_overflow_count_ = nullptr;
+  unsigned long long* d_unknown_count_ = nullptr;
+
+  unsigned long long* d_total_constraint_checks_ = nullptr;
+  unsigned long long* d_total_deletions_ = nullptr;
+  unsigned long long* d_stale_drop_count_ = nullptr;
+  unsigned long long* d_lock_fail_count_ = nullptr;
+  unsigned long long* d_lock_retry_count_ = nullptr;
+  unsigned long long* d_bucket_count_ = nullptr;
+  unsigned long long* d_bucket_task_sum_ = nullptr;
+  unsigned long long* d_bucket_active_warp_sum_ = nullptr;
+
+  FQPTControl* d_control_ = nullptr;
+  bool memory_allocated_ = false;
+
+  FQPTStatistics last_stats_;
+};
+
+// FQ-PT Kernel Wrapper（实现在 GModel.cu）
+void LaunchFQPTBaselineKernelWrapper(
+    GModelData model_data,
+    FQPTControl* control,
+    int num_blocks);
 
 }  // namespace cpim
 

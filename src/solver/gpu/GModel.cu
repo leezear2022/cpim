@@ -2052,6 +2052,124 @@ PropagateResult ExecuteConstraintCheck_BpC_Workspace(
   return ExecuteConstraintCheck_BpC_Workspace_WarpPerWord(cid, model, ws, shared_mem);
 }
 
+// ExecuteConstraintCheck_BpC_Workspace_WarpPerWorld
+// 供 FQ-PT 分组并行路径使用：1 warp 处理 1 个 world 的单个约束检查。
+// 仅依赖 warp 同步（__syncwarp），避免 block 级同步阻塞其它 warp。
+__device__
+PropagateResult ExecuteConstraintCheck_BpC_Workspace_WarpPerWorld(
+    int cid,
+    const GModelData& model,
+    WorldWorkspace* ws,
+    u32* shared_mem) {
+  PropagateResult r{};
+  r.x_changed = r.y_changed = r.inconsistent = false;
+  r.deletions = 0;
+
+  const int lane_id = threadIdx.x & 31;
+  const int2 scope = model.constraint_scopes[cid];
+  const int x = scope.x;
+  const int y = scope.y;
+  if (x < 0 || y < 0) {
+    return r;
+  }
+
+  u32* dom_x = ws->bitDom + x * model.bit_dom_int_size;
+  u32* dom_y = ws->bitDom + y * model.bit_dom_int_size;
+
+  u32* new_dom_x = shared_mem;
+  u32* new_dom_y = shared_mem + model.bit_dom_int_size;
+
+  int local_del_x = 0;
+  int local_del_y = 0;
+
+  for (int word = 0; word < model.bit_dom_int_size; ++word) {
+    const int value = word * 32 + lane_id;
+    const u32 lane_mask = 1u << lane_id;
+
+    const u32 old_x = dom_x[word];
+    const u32 old_y = dom_y[word];
+
+    const bool valid_value = (value < model.max_dom_size);
+    const bool active_x = valid_value && ((old_x & lane_mask) != 0u);
+    const bool active_y = valid_value && ((old_y & lane_mask) != 0u);
+
+    bool keep_x = true;
+    bool keep_y = true;
+
+    if (active_x) {
+      const int sup_idx_base =
+          cid * model.bitsup_per_constraint +
+          (0 * model.max_dom_size + value) * model.bit_dom_int_size;
+      bool has_sup = false;
+      for (int w = 0; w < model.bit_dom_int_size; ++w) {
+        has_sup |= (model.bitSupData[sup_idx_base + w].x & dom_y[w]) != 0u;
+      }
+      keep_x = has_sup;
+    }
+
+    if (active_y) {
+      const int sup_idx_base =
+          cid * model.bitsup_per_constraint +
+          (1 * model.max_dom_size + value) * model.bit_dom_int_size;
+      bool has_sup = false;
+      for (int w = 0; w < model.bit_dom_int_size; ++w) {
+        has_sup |= (model.bitSupData[sup_idx_base + w].y & dom_x[w]) != 0u;
+      }
+      keep_y = has_sup;
+    }
+
+    const u32 keep_mask_x = __ballot_sync(0xFFFFFFFFu, keep_x || !active_x);
+    const u32 keep_mask_y = __ballot_sync(0xFFFFFFFFu, keep_y || !active_y);
+
+    if (lane_id == 0) {
+      const u32 result_x = old_x & keep_mask_x;
+      const u32 result_y = old_y & keep_mask_y;
+      new_dom_x[word] = result_x;
+      new_dom_y[word] = result_y;
+
+      const u32 removed_x = old_x & ~result_x;
+      const u32 removed_y = old_y & ~result_y;
+      if (removed_x) local_del_x += __popc(removed_x);
+      if (removed_y) local_del_y += __popc(removed_y);
+    }
+  }
+
+  __syncwarp();
+
+  if (lane_id == 0) {
+    int size_x = ws->d_cur_dom_size[x];
+    int size_y = ws->d_cur_dom_size[y];
+
+    for (int w = 0; w < model.bit_dom_int_size; ++w) {
+      if (dom_x[w] != new_dom_x[w]) {
+        dom_x[w] = new_dom_x[w];
+        r.x_changed = true;
+      }
+      if (dom_y[w] != new_dom_y[w]) {
+        dom_y[w] = new_dom_y[w];
+        r.y_changed = true;
+      }
+    }
+
+    if (local_del_x > 0) {
+      size_x -= local_del_x;
+      ws->d_cur_dom_size[x] = size_x;
+      r.deletions += local_del_x;
+    }
+    if (local_del_y > 0) {
+      size_y -= local_del_y;
+      ws->d_cur_dom_size[y] = size_y;
+      r.deletions += local_del_y;
+    }
+
+    if (size_x == 0 || size_y == 0) {
+      r.inconsistent = true;
+    }
+  }
+
+  return r;
+}
+
 // CheckValueSupportBitSup_BlockSync - Cheap Precheck（安全"早失败"）
 // 返回：true=需要完整 GAC；false=已确定 DWO（可短路）
 __device__
@@ -2434,6 +2552,707 @@ void Batch2ProbeKernel_MicroBatch(
   }
 }
 
+// ============================================================================
+// FQ-PT Baseline: MPMC ring + Persistent blocks（无 world_mask 聚合）
+// ============================================================================
+
+__device__ inline unsigned long long FQPTLoadU64(
+    const unsigned long long* ptr) {
+  return atomicAdd(const_cast<unsigned long long*>(ptr), 0ULL);
+}
+
+__device__ inline bool FQPTQueueTryPushBatch(
+    FQPTControl* control,
+    const FQPTTask* tasks,
+    int count) {
+  if (count <= 0) return true;
+  if (count > control->queue_capacity) return false;
+
+  unsigned long long base = 0;
+  while (true) {
+    const unsigned long long tail = FQPTLoadU64(control->enqueue_pos);
+    const unsigned long long head = FQPTLoadU64(control->dequeue_pos);
+    if (tail + static_cast<unsigned long long>(count) >
+        head + static_cast<unsigned long long>(control->queue_capacity)) {
+      return false;  // bounded queue: full
+    }
+    if (atomicCAS(control->enqueue_pos, tail, tail + count) == tail) {
+      base = tail;
+      break;
+    }
+  }
+
+  for (int i = 0; i < count; ++i) {
+    const unsigned long long ticket = base + static_cast<unsigned long long>(i);
+    FQPTRingSlot* slot = &control->queue_slots[ticket & control->queue_mask];
+    while (FQPTLoadU64(&slot->seq) != ticket) {
+      __nanosleep(64);
+    }
+    slot->task = tasks[i];
+  }
+
+  __threadfence();  // 发布顺序：payload 可见后再发布 seq
+
+  for (int i = 0; i < count; ++i) {
+    const unsigned long long ticket = base + static_cast<unsigned long long>(i);
+    FQPTRingSlot* slot = &control->queue_slots[ticket & control->queue_mask];
+    slot->seq = ticket + 1ULL;
+  }
+  return true;
+}
+
+__device__ inline int FQPTQueueTryPopBatch(
+    FQPTControl* control,
+    FQPTTask* out_tasks,
+    int max_count) {
+  if (max_count <= 0) return 0;
+  while (true) {
+    const unsigned long long head = FQPTLoadU64(control->dequeue_pos);
+    int ready = 0;
+    for (; ready < max_count; ++ready) {
+      const unsigned long long ticket = head + static_cast<unsigned long long>(ready);
+      const FQPTRingSlot* slot = &control->queue_slots[ticket & control->queue_mask];
+      const unsigned long long seq = FQPTLoadU64(&slot->seq);
+      const long long diff =
+          static_cast<long long>(seq) - static_cast<long long>(ticket + 1ULL);
+      if (diff == 0) {
+        continue;
+      }
+      break;
+    }
+
+    if (ready == 0) return 0;
+    if (atomicCAS(control->dequeue_pos, head, head + ready) != head) {
+      continue;
+    }
+
+    for (int i = 0; i < ready; ++i) {
+      const unsigned long long ticket = head + static_cast<unsigned long long>(i);
+      FQPTRingSlot* slot = &control->queue_slots[ticket & control->queue_mask];
+      out_tasks[i] = slot->task;
+    }
+
+    __threadfence();
+
+    for (int i = 0; i < ready; ++i) {
+      const unsigned long long ticket = head + static_cast<unsigned long long>(i);
+      FQPTRingSlot* slot = &control->queue_slots[ticket & control->queue_mask];
+      slot->seq = ticket + static_cast<unsigned long long>(control->queue_capacity);
+    }
+    return ready;
+  }
+}
+
+__device__ inline bool FQPTQueueEmpty(const FQPTControl* control) {
+  const unsigned long long head = FQPTLoadU64(control->dequeue_pos);
+  const FQPTRingSlot* slot = &control->queue_slots[head & control->queue_mask];
+  const unsigned long long seq = FQPTLoadU64(&slot->seq);
+  const long long diff =
+      static_cast<long long>(seq) - static_cast<long long>(head + 1ULL);
+  return diff < 0;
+}
+
+__device__ inline void FQPTMarkWorldUnknown(FQPTControl* control, int world_id) {
+  if (world_id < 0 || world_id >= control->num_worlds) return;
+  int* status = &control->world_status[world_id];
+  const int kOk = static_cast<int>(ProbeStatus::kOK);
+  const int kUnknown = static_cast<int>(ProbeStatus::kUNKNOWN);
+  const int old = atomicCAS(status, kOk, kUnknown);
+  if (old == kOk) {
+    if (control->unknown_count != nullptr) {
+      atomicAdd(control->unknown_count, 1ULL);
+    }
+    control->world_results[world_id] = true;
+  }
+}
+
+__device__ inline void FQPTMarkWorldDwo(FQPTControl* control, int world_id) {
+  if (world_id < 0 || world_id >= control->num_worlds) return;
+  int* status = &control->world_status[world_id];
+  const int kOk = static_cast<int>(ProbeStatus::kOK);
+  const int kDwo = static_cast<int>(ProbeStatus::kDWO);
+  const int old = atomicCAS(status, kOk, kDwo);
+  if (old == kOk) {
+    control->world_results[world_id] = false;
+  }
+}
+
+__device__ inline bool FQPTTryMarkConstraintQueued(
+    FQPTControl* control,
+    int world_id,
+    int cid) {
+  if (world_id < 0 || world_id >= control->num_worlds) return false;
+  if (cid < 0) return false;
+  WorldWorkspace* ws = &control->workspaces[world_id];
+  const int word = cid >> 5;
+  const u32 bit = (1u << (cid & 31));
+  const u32 old = atomicOr(&ws->frontier_A[word], bit);
+  return (old & bit) == 0u;
+}
+
+__device__ inline bool FQPTIsConstraintQueued(
+    FQPTControl* control,
+    int world_id,
+    int cid) {
+  if (world_id < 0 || world_id >= control->num_worlds) return false;
+  if (cid < 0) return false;
+  WorldWorkspace* ws = &control->workspaces[world_id];
+  const int word = cid >> 5;
+  const u32 bit = (1u << (cid & 31));
+  const u32 v = atomicOr(&ws->frontier_A[word], 0u);
+  return (v & bit) != 0u;
+}
+
+__device__ inline void FQPTClearConstraintQueued(
+    FQPTControl* control,
+    int world_id,
+    int cid) {
+  if (world_id < 0 || world_id >= control->num_worlds) return;
+  if (cid < 0) return;
+  WorldWorkspace* ws = &control->workspaces[world_id];
+  const int word = cid >> 5;
+  const u32 bit = (1u << (cid & 31));
+  atomicAnd(&ws->frontier_A[word], ~bit);
+}
+
+__device__ inline bool FQPTFlushGeneratedBuffer(
+    FQPTControl* control,
+    FQPTTask* local_gen,
+    int* gen_count) {
+  if (*gen_count <= 0) return true;
+  const int count = *gen_count;
+  // 先增加 pending，再发布任务，避免消费者先完成导致 pending 下溢。
+  atomicAdd(control->pending_tasks, static_cast<unsigned long long>(count));
+  if (!FQPTQueueTryPushBatch(control, local_gen, count)) {
+    atomicAdd(control->pending_tasks, static_cast<unsigned long long>(-count));
+    if (control->overflow_count != nullptr) {
+      atomicAdd(control->overflow_count, 1ULL);
+    }
+    for (int i = 0; i < count; ++i) {
+      FQPTMarkWorldUnknown(control, local_gen[i].world_id);
+    }
+    *gen_count = 0;
+    return false;
+  }
+  *gen_count = 0;
+  return true;
+}
+
+__device__ inline void FQPTEnqueueNeighborConstraints(
+    FQPTControl* control,
+    const GModelData& model,
+    int world,
+    int var,
+    FQPTTask* local_gen,
+    int* gen_count,
+    int local_cap) {
+  const int start = model.d_subscription_offset[var];
+  const int end = model.d_subscription_offset[var + 1];
+  for (int i = start; i < end; ++i) {
+    const int ncid = model.d_subscription[i].z;
+    if (!FQPTTryMarkConstraintQueued(control, world, ncid)) continue;
+    if (*gen_count >= local_cap) {
+      FQPTFlushGeneratedBuffer(control, local_gen, gen_count);
+    }
+    if (*gen_count < local_cap) {
+      local_gen[(*gen_count)++] = FQPTTask(world, ncid);
+    } else {
+      if (control->overflow_count != nullptr) {
+        atomicAdd(control->overflow_count, 1ULL);
+      }
+      FQPTMarkWorldUnknown(control, world);
+      break;
+    }
+  }
+}
+
+__global__ void FQPTBaselineKernel(
+    const GModelData model,
+    FQPTControl* control) {
+  extern __shared__ unsigned char shared_raw[];
+  constexpr int kMaxGroupWarps = 8;
+
+  const int local_cap = max(8, control->local_buffer_capacity);
+  const int pop_batch = max(1, min(control->cta_pop_batch, local_cap));
+  const int block_warps = max(1, blockDim.x / 32);
+  const int max_group_warps = max(
+      1,
+      min(min(control->group_warps_per_cta, block_warps), kMaxGroupWarps));
+  const bool enable_grouping = (control->enable_cid_grouping != 0);
+  const bool enable_parallel_group_check =
+      enable_grouping &&
+      (control->enable_parallel_group_check != 0) &&
+      (model.bit_dom_int_size > 1);
+  const int check_words_per_warp = 2 * model.bit_dom_int_size + 16;
+  const int check_warp_slots = enable_parallel_group_check ? max_group_warps : 1;
+  const int check_words = check_words_per_warp * check_warp_slots;
+  const int check_bytes = check_words * static_cast<int>(sizeof(u32));
+  const int align = static_cast<int>(alignof(FQPTTask));
+
+  int offset = (check_bytes + align - 1) / align * align;
+  FQPTTask* local_pop = reinterpret_cast<FQPTTask*>(shared_raw + offset);
+  offset += local_cap * static_cast<int>(sizeof(FQPTTask));
+  FQPTTask* local_gen = reinterpret_cast<FQPTTask*>(shared_raw + offset);
+  offset += local_cap * static_cast<int>(sizeof(FQPTTask));
+  FQPTTask* local_retry = reinterpret_cast<FQPTTask*>(shared_raw + offset);
+  u32* check_shared = reinterpret_cast<u32*>(shared_raw);
+
+  __shared__ int pop_count;
+  __shared__ int pop_head;
+  __shared__ int gen_count;
+  __shared__ int retry_count;
+  __shared__ int batch_task_count;
+  __shared__ int batch_parallel;
+  __shared__ int should_exit;
+  __shared__ int lock_acquired;
+  __shared__ int drop_task;
+  __shared__ int cur_world;
+  __shared__ int cur_cid;
+  __shared__ int batch_worlds[kMaxGroupWarps];
+  __shared__ int batch_cids[kMaxGroupWarps];
+  __shared__ int warp_locked[kMaxGroupWarps];
+  __shared__ int warp_retry[kMaxGroupWarps];
+  __shared__ int warp_drop[kMaxGroupWarps];
+  __shared__ PropagateResult warp_results[kMaxGroupWarps];
+
+  if (threadIdx.x == 0) {
+    pop_count = 0;
+    pop_head = 0;
+    gen_count = 0;
+    retry_count = 0;
+    batch_task_count = 0;
+    batch_parallel = 0;
+    should_exit = 0;
+    lock_acquired = 0;
+    drop_task = 0;
+  }
+  __syncthreads();
+
+  while (true) {
+    if (threadIdx.x == 0) {
+      if (gen_count >= local_cap) {
+        FQPTFlushGeneratedBuffer(control, local_gen, &gen_count);
+      }
+
+      if (pop_head >= pop_count) {
+        int moved = min(retry_count, local_cap);
+        for (int i = 0; i < moved; ++i) {
+          local_pop[i] = local_retry[i];
+        }
+        for (int i = moved; i < retry_count; ++i) {
+          local_retry[i - moved] = local_retry[i];
+        }
+        retry_count -= moved;
+        pop_count = moved;
+        pop_head = 0;
+
+        const int remain = local_cap - pop_count;
+        if (remain > 0) {
+          const int popped = FQPTQueueTryPopBatch(
+              control, local_pop + pop_count, min(pop_batch, remain));
+          pop_count += popped;
+        }
+      }
+
+      if (pop_head >= pop_count && gen_count > 0) {
+        FQPTFlushGeneratedBuffer(control, local_gen, &gen_count);
+      }
+
+      const bool local_empty =
+          (pop_head >= pop_count) && (retry_count == 0) && (gen_count == 0);
+      const bool global_empty = FQPTQueueEmpty(control);
+      const bool no_pending = (FQPTLoadU64(control->pending_tasks) == 0ULL);
+      should_exit = (local_empty && global_empty && no_pending) ? 1 : 0;
+    }
+    __syncthreads();
+
+    if (should_exit) break;
+
+    if (threadIdx.x == 0) {
+      batch_task_count = 0;
+      batch_parallel = 0;
+
+      if (pop_head < pop_count) {
+        if (!enable_grouping || max_group_warps <= 1) {
+          const FQPTTask t = local_pop[pop_head++];
+          batch_worlds[0] = t.world_id;
+          batch_cids[0] = t.cid;
+          batch_task_count = 1;
+        } else {
+          int best_cid = -1;
+          int best_count = 0;
+          for (int i = pop_head; i < pop_count; ++i) {
+            const int cid_i = local_pop[i].cid;
+            int count = 0;
+            for (int j = pop_head; j < pop_count; ++j) {
+              if (local_pop[j].cid == cid_i) {
+                ++count;
+              }
+            }
+            if (count > best_count) {
+              best_count = count;
+              best_cid = cid_i;
+            }
+          }
+
+          const int degrade_threshold = max(1, control->group_degrade_threshold);
+          if (best_cid < 0 || best_count <= degrade_threshold) {
+            const FQPTTask t = local_pop[pop_head++];
+            batch_worlds[0] = t.world_id;
+            batch_cids[0] = t.cid;
+            batch_task_count = 1;
+          } else {
+            int group_count = 0;
+            int write_pos = pop_head;
+            for (int i = pop_head; i < pop_count; ++i) {
+              const FQPTTask t = local_pop[i];
+              if (t.cid == best_cid && group_count < max_group_warps) {
+                batch_worlds[group_count] = t.world_id;
+                batch_cids[group_count] = t.cid;
+                ++group_count;
+              } else {
+                local_pop[write_pos++] = t;
+              }
+            }
+            pop_count = write_pos;
+            batch_task_count = group_count;
+
+            if (control->bucket_count != nullptr) {
+              atomicAdd(control->bucket_count, 1ULL);
+            }
+            if (control->bucket_task_sum != nullptr) {
+              atomicAdd(control->bucket_task_sum,
+                        static_cast<unsigned long long>(group_count));
+            }
+            if (control->bucket_active_warp_sum != nullptr) {
+              atomicAdd(control->bucket_active_warp_sum,
+                        static_cast<unsigned long long>(group_count));
+            }
+
+            if (enable_parallel_group_check && group_count > 1) {
+              batch_parallel = 1;
+            }
+          }
+        }
+      }
+    }
+    __syncthreads();
+
+    if (batch_task_count <= 0) {
+      continue;
+    }
+
+    if (!batch_parallel) {
+      for (int task_i = 0; task_i < batch_task_count; ++task_i) {
+        if (threadIdx.x == 0) {
+          cur_world = batch_worlds[task_i];
+          cur_cid = batch_cids[task_i];
+        }
+        __syncthreads();
+
+        const int world = cur_world;
+        const int cid = cur_cid;
+
+        if (threadIdx.x == 0) {
+          lock_acquired = 0;
+          drop_task = 0;
+          int retry_attempts = 0;
+
+          if (world < 0 || world >= control->num_worlds ||
+              cid < 0 || cid >= model.num_constraints) {
+            atomicAdd(control->pending_tasks, static_cast<unsigned long long>(-1));
+            drop_task = 1;
+          } else {
+            const int status = control->world_status[world];
+            if (status == static_cast<int>(ProbeStatus::kOK)) {
+              if (!FQPTIsConstraintQueued(control, world, cid)) {
+                atomicAdd(control->pending_tasks, static_cast<unsigned long long>(-1));
+                if (control->stale_drop_count != nullptr) {
+                  atomicAdd(control->stale_drop_count, 1ULL);
+                }
+                drop_task = 1;
+              } else {
+                for (int attempt = 0; attempt < control->lock_retry_limit; ++attempt) {
+                  if (atomicCAS(&control->world_locks[world], 0, 1) == 0) {
+                    lock_acquired = 1;
+                    break;
+                  }
+                  ++retry_attempts;
+                  for (int spin = 0; spin < control->lock_backoff; ++spin) {
+                    __nanosleep(64);
+                  }
+                }
+                if (retry_attempts > 0 && control->lock_retry_count != nullptr) {
+                  atomicAdd(control->lock_retry_count,
+                            static_cast<unsigned long long>(retry_attempts));
+                }
+                if (!lock_acquired && control->lock_fail_count != nullptr) {
+                  atomicAdd(control->lock_fail_count, 1ULL);
+                }
+              }
+            }
+          }
+        }
+        __syncthreads();
+
+        if (world < 0 || world >= control->num_worlds ||
+            cid < 0 || cid >= model.num_constraints) {
+          continue;
+        }
+        if (drop_task) {
+          continue;
+        }
+
+        if (!lock_acquired) {
+          if (threadIdx.x == 0) {
+            if (control->world_status[world] == static_cast<int>(ProbeStatus::kOK)) {
+              if (retry_count < local_cap) {
+                local_retry[retry_count++] = FQPTTask(world, cid);
+              } else {
+                const FQPTTask retry_task(world, cid);
+                const bool pushed = FQPTQueueTryPushBatch(control, &retry_task, 1);
+                if (!pushed) {
+                  if (control->overflow_count != nullptr) {
+                    atomicAdd(control->overflow_count, 1ULL);
+                  }
+                  FQPTMarkWorldUnknown(control, world);
+                  FQPTClearConstraintQueued(control, world, cid);
+                  atomicAdd(control->pending_tasks, static_cast<unsigned long long>(-1));
+                }
+              }
+            } else {
+              FQPTClearConstraintQueued(control, world, cid);
+              atomicAdd(control->pending_tasks, static_cast<unsigned long long>(-1));
+            }
+          }
+          __syncthreads();
+          continue;
+        }
+
+        WorldWorkspace* ws = &control->workspaces[world];
+        PropagateResult r =
+            ExecuteConstraintCheck_BpC_Workspace(cid, model, ws, check_shared);
+        __syncthreads();
+
+        if (threadIdx.x == 0) {
+          if (control->total_constraint_checks != nullptr) {
+            atomicAdd(control->total_constraint_checks, 1ULL);
+          }
+          if (control->total_deletions != nullptr && r.deletions > 0) {
+            atomicAdd(control->total_deletions,
+                      static_cast<unsigned long long>(r.deletions));
+          }
+
+          if (r.inconsistent) {
+            ws->inconsistent_flag = 1;
+            FQPTMarkWorldDwo(control, world);
+          } else if (control->world_status[world] == static_cast<int>(ProbeStatus::kOK)) {
+            const int2 scope = model.constraint_scopes[cid];
+            if (r.x_changed) {
+              FQPTEnqueueNeighborConstraints(
+                  control,
+                  model,
+                  world,
+                  scope.x,
+                  local_gen,
+                  &gen_count,
+                  local_cap);
+            }
+            if (r.y_changed &&
+                control->world_status[world] == static_cast<int>(ProbeStatus::kOK)) {
+              FQPTEnqueueNeighborConstraints(
+                  control,
+                  model,
+                  world,
+                  scope.y,
+                  local_gen,
+                  &gen_count,
+                  local_cap);
+            }
+          }
+
+          FQPTClearConstraintQueued(control, world, cid);
+          control->world_locks[world] = 0;
+          atomicAdd(control->pending_tasks, static_cast<unsigned long long>(-1));
+          atomicAdd(control->processed_tasks, 1ULL);
+        }
+        __syncthreads();
+      }
+      continue;
+    }
+
+    const int warp_id = threadIdx.x >> 5;
+    const int lane_id = threadIdx.x & 31;
+
+    if (threadIdx.x == 0) {
+      for (int i = 0; i < batch_task_count; ++i) {
+        warp_locked[i] = 0;
+        warp_retry[i] = 0;
+        warp_drop[i] = 0;
+        warp_results[i].x_changed = false;
+        warp_results[i].y_changed = false;
+        warp_results[i].inconsistent = false;
+        warp_results[i].deletions = 0;
+      }
+    }
+    __syncthreads();
+
+    if (warp_id < batch_task_count && lane_id == 0) {
+      const int world = batch_worlds[warp_id];
+      const int cid = batch_cids[warp_id];
+      int retry_attempts = 0;
+      int locked = 0;
+      int retry_task = 0;
+      int drop = 0;
+
+      if (world < 0 || world >= control->num_worlds ||
+          cid < 0 || cid >= model.num_constraints) {
+        atomicAdd(control->pending_tasks, static_cast<unsigned long long>(-1));
+        drop = 1;
+      } else {
+        const int status = control->world_status[world];
+        if (status == static_cast<int>(ProbeStatus::kOK)) {
+          if (!FQPTIsConstraintQueued(control, world, cid)) {
+            atomicAdd(control->pending_tasks, static_cast<unsigned long long>(-1));
+            if (control->stale_drop_count != nullptr) {
+              atomicAdd(control->stale_drop_count, 1ULL);
+            }
+            drop = 1;
+          } else {
+            for (int attempt = 0; attempt < control->lock_retry_limit; ++attempt) {
+              if (atomicCAS(&control->world_locks[world], 0, 1) == 0) {
+                locked = 1;
+                break;
+              }
+              ++retry_attempts;
+              for (int spin = 0; spin < control->lock_backoff; ++spin) {
+                __nanosleep(64);
+              }
+            }
+            if (!locked) {
+              retry_task = 1;
+            }
+          }
+        } else {
+          FQPTClearConstraintQueued(control, world, cid);
+          atomicAdd(control->pending_tasks, static_cast<unsigned long long>(-1));
+          drop = 1;
+        }
+      }
+
+      if (retry_attempts > 0 && control->lock_retry_count != nullptr) {
+        atomicAdd(control->lock_retry_count,
+                  static_cast<unsigned long long>(retry_attempts));
+      }
+      if (retry_task && control->lock_fail_count != nullptr) {
+        atomicAdd(control->lock_fail_count, 1ULL);
+      }
+
+      warp_locked[warp_id] = locked;
+      warp_retry[warp_id] = retry_task;
+      warp_drop[warp_id] = drop;
+    }
+    __syncthreads();
+
+    if (warp_id < batch_task_count && warp_locked[warp_id]) {
+      const int world = batch_worlds[warp_id];
+      const int cid = batch_cids[warp_id];
+      WorldWorkspace* ws = &control->workspaces[world];
+      u32* warp_check = check_shared + warp_id * check_words_per_warp;
+      const PropagateResult r =
+          ExecuteConstraintCheck_BpC_Workspace_WarpPerWorld(
+              cid, model, ws, warp_check);
+      if (lane_id == 0) {
+        warp_results[warp_id] = r;
+      }
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+      for (int i = 0; i < batch_task_count; ++i) {
+        const int world = batch_worlds[i];
+        const int cid = batch_cids[i];
+        if (world < 0 || world >= control->num_worlds ||
+            cid < 0 || cid >= model.num_constraints) {
+          continue;
+        }
+
+        if (warp_locked[i]) {
+          const PropagateResult r = warp_results[i];
+          if (control->total_constraint_checks != nullptr) {
+            atomicAdd(control->total_constraint_checks, 1ULL);
+          }
+          if (control->total_deletions != nullptr && r.deletions > 0) {
+            atomicAdd(control->total_deletions,
+                      static_cast<unsigned long long>(r.deletions));
+          }
+
+          WorldWorkspace* ws = &control->workspaces[world];
+          if (r.inconsistent) {
+            ws->inconsistent_flag = 1;
+            FQPTMarkWorldDwo(control, world);
+          } else if (control->world_status[world] == static_cast<int>(ProbeStatus::kOK)) {
+            const int2 scope = model.constraint_scopes[cid];
+            if (r.x_changed) {
+              FQPTEnqueueNeighborConstraints(
+                  control,
+                  model,
+                  world,
+                  scope.x,
+                  local_gen,
+                  &gen_count,
+                  local_cap);
+            }
+            if (r.y_changed &&
+                control->world_status[world] == static_cast<int>(ProbeStatus::kOK)) {
+              FQPTEnqueueNeighborConstraints(
+                  control,
+                  model,
+                  world,
+                  scope.y,
+                  local_gen,
+                  &gen_count,
+                  local_cap);
+            }
+          }
+
+          FQPTClearConstraintQueued(control, world, cid);
+          control->world_locks[world] = 0;
+          atomicAdd(control->pending_tasks, static_cast<unsigned long long>(-1));
+          atomicAdd(control->processed_tasks, 1ULL);
+        } else if (warp_retry[i]) {
+          if (control->world_status[world] == static_cast<int>(ProbeStatus::kOK)) {
+            if (retry_count < local_cap) {
+              local_retry[retry_count++] = FQPTTask(world, cid);
+            } else {
+              const FQPTTask retry_task(world, cid);
+              const bool pushed = FQPTQueueTryPushBatch(control, &retry_task, 1);
+              if (!pushed) {
+                if (control->overflow_count != nullptr) {
+                  atomicAdd(control->overflow_count, 1ULL);
+                }
+                FQPTMarkWorldUnknown(control, world);
+                FQPTClearConstraintQueued(control, world, cid);
+                atomicAdd(control->pending_tasks, static_cast<unsigned long long>(-1));
+              }
+            }
+          } else {
+            FQPTClearConstraintQueued(control, world, cid);
+            atomicAdd(control->pending_tasks, static_cast<unsigned long long>(-1));
+          }
+        } else if (warp_drop[i]) {
+          // drop 分支的 pending 结算已在 warp leader 侧完成。
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0 && gen_count > 0) {
+    FQPTFlushGeneratedBuffer(control, local_gen, &gen_count);
+  }
+}
+
 }  // namespace
 
 // ============================================================================
@@ -2809,6 +3628,40 @@ void LaunchBatch2PersistentBlocksKernelWrapper(
                << cudaGetErrorString(err);
     throw std::runtime_error(
         std::string("Failed to launch Batch2ProbeKernel_PersistentBlocks: ") +
+        cudaGetErrorString(err));
+  }
+}
+
+void LaunchFQPTBaselineKernelWrapper(
+    GModelData model_data,
+    FQPTControl* control,
+    int num_blocks) {
+  const int block_size = 256;
+  const int local_cap = std::max(8, control->local_buffer_capacity);
+  const int block_warps = std::max(1, block_size / 32);
+  const int max_group_warps = std::max(
+      1,
+      std::min(std::min(control->group_warps_per_cta, block_warps), 8));
+  const bool enable_parallel_group_check =
+      (control->enable_cid_grouping != 0) &&
+      (control->enable_parallel_group_check != 0) &&
+      (model_data.bit_dom_int_size > 1);
+  const int check_words_per_warp = 2 * model_data.bit_dom_int_size + 16;
+  const int check_warp_slots = enable_parallel_group_check ? max_group_warps : 1;
+  const int check_bytes =
+      check_words_per_warp * check_warp_slots * static_cast<int>(sizeof(u32));
+  const int task_bytes = local_cap * static_cast<int>(sizeof(FQPTTask));
+  const int shared_mem_bytes = check_bytes + task_bytes * 3;
+
+  FQPTBaselineKernel<<<dim3(num_blocks), dim3(block_size), shared_mem_bytes>>>(
+      model_data, control);
+
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    LOG(ERROR) << "Failed to launch FQPTBaselineKernel: "
+               << cudaGetErrorString(err);
+    throw std::runtime_error(
+        std::string("Failed to launch FQPTBaselineKernel: ") +
         cudaGetErrorString(err));
   }
 }

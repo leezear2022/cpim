@@ -1,5 +1,199 @@
 # 修改清单（中文）
 
+## 2026-02-17
+
+### FQ-PT：分步实施落地（D0/P0/P1/P2）
+
+**范围**：按 `FQ-PT-CID-CTA-MB` 分步计划落地文档修订与代码实现，保持可回退、可观测、soundness 不变（UNKNOWN 不删值）。
+
+**D0（文档修订）**：
+- `docs/planning/SACGPU_NEW_CODEX_REVIEW_2026_02.md`
+  - 明确 Phase1 可能平收益（`-2%~+2%`）的预期边界；
+  - 增加 Phase1 -> Phase2 的 stop/go 条件；
+  - 新增 back-of-envelope 估算（`R/B/W` 指标 + 低/中/高聚合三档）；
+  - 附录锚点改为“函数名优先 + 行号提示”。
+
+**P0（观测闭环与开关）**：
+- `include/solver/gpu/batch_probe_manager.h`
+  - `FQPTControl` 新增运行时开关：
+    `enable_cid_grouping`、`enable_parallel_group_check`、
+    `group_warps_per_cta`、`group_degrade_threshold`
+  - `FQPTControl` 新增统计指针：
+    `stale_drop_count`、`lock_fail_count`、`lock_retry_count`、
+    `bucket_count`、`bucket_task_sum`、`bucket_active_warp_sum`
+  - `FQPTStatistics` 新增统计字段：
+    `stale_drop_count`、`lock_fail_count`、`lock_retry_count`、
+    `avg_bucket_size`、`avg_bucket_utilization`
+  - `FQPTBaselineManager` 新增 setter：
+    `SetEnableCidGrouping`、`SetEnableParallelGroupCheck`、
+    `SetGroupWarpsPerCta`、`SetGroupDegradeThreshold`
+- `src/solver/gpu/batch_probe_manager.cu`
+  - 新增上述统计计数的分配/释放/清零；
+  - Launch 前填充 `FQPTControl` 新开关与统计指针；
+  - `CollectResults` 汇总新统计并计算 `avg_bucket_*`。
+- `apps/sac_benchmark.cpp`
+  - 新增 FQPT 参数：
+    `--fqpt_enable_cid_grouping`、`--fqpt_enable_parallel_group_check`、
+    `--fqpt_group_warps`、`--fqpt_group_degrade_threshold`
+  - benchmark 结果新增 `stale/lock/bucket` 输出与聚合。
+
+**P1（仅分桶 + 退化路径）**：
+- `src/solver/gpu/GModel.cu::FQPTBaselineKernel`
+  - 加入 CTA-local 线性分桶（thread0 选取最热 `cid`）；
+  - `max_bucket_size <= group_degrade_threshold` 时退化为逐任务路径；
+  - 分桶统计埋点：`bucket_count/task_sum/active_warp_sum`；
+  - 保持原 block 级检查语义与 commit 单点提交。
+
+**P2（并行检查路径）**：
+- `src/solver/gpu/GModel.cu`
+  - 新增 `ExecuteConstraintCheck_BpC_Workspace_WarpPerWorld`（warp 级检查）；
+  - `FQPTBaselineKernel` 新增“分桶后并行检查”路径：
+    - 每 warp 处理 1 个 world；
+    - `check_shared` 按 warp 切片；
+    - 每 warp 产出 `PropagateResult`，thread0 统一 commit；
+  - legacy 小域仍保留原路径回退（并行路径默认要求 `bit_dom_int_size > 1`）。
+- `src/solver/gpu/GModel.cu::LaunchFQPTBaselineKernelWrapper`
+  - shared memory 计算改为按 `check_words_per_warp * check_warp_slots` 动态估算，
+    支持并行分组场景。
+
+**语义保证**：
+- 去重标记、pending 结算、lock/retry、UNKNOWN 语义保持不变；
+- 新路径默认由开关控制，可一键回退到旧路径。
+
+**验证与门槛判定（固定 5 例 + `--num_probes=64 --warmup=1 --iterations=5`）**：
+- 构建与正确性：
+  - `cmake .. && make -j$(nproc)` 通过；
+  - `ctest --test-dir build -R test_fqpt_baseline --output-on-failure` 通过；
+  - 5 例 `test_fqpt_baseline --input=<case> --num_probes=64` 全部通过。
+- 观测闭环：
+  - `sac_benchmark --mode=fqpt` 新字段可稳定输出并可解析（包含 0 值）：
+    `unknown/checks/stale/lock_fail/lock_retry/bsz/butil`。
+- P1 gate（以每样例 3 次重复的中位数判定）：
+  - `median(P1 vs P0)=+0.43%`（满足“median 回退 <=3%”）；
+  - 但 `haystacks-11` 出现 `+8.79%` 回退（不满足“单例 <=5%”）；
+  - 聚合信号达标（`bsz>=1.4` 与 `butil>=0.35` 均为 `5/5`）。
+  - 结论：**P1 作为 default-off 消融路径保留，不满足直接进入默认开启条件**。
+- P2 gate（相对 P1）：
+  - `median(P2 vs P1)=-3.79%`（有提升但未达到 `>=8%`）；
+  - 结论：**并行路径默认保持关闭，仅保留开关用于后续调优/消融**。
+
+### 文档：FQ-PT vs Batch2 归因报告（可转发版）
+
+- 新增/重写 `gemini_doc/SACGPU_MB_implementation_review.md`：
+  - 固化 P0/P1/P2 全面慢于 Batch2 的实测证据（固定 5 例口径）；
+  - 汇总关键根因（任务粒度、队列/锁、分桶 O(n²)、`bit_dom_int_size==1` 门控）；
+  - 给出可执行优化路线（A 止损、B 调度面重构、C 小域并行增强）；
+  - 附关键代码片段，供外部模型快速复核。
+
+## 2026-02-16
+
+### Docs：新增 SACGPU 新方案独立裁决文档（Codex 版）
+
+**动机**：`docs/planning/SACGPU_new.md` 与 `gemini_doc/SACGPU_new_review.md` 的观点存在交叠与表述强弱不一，
+需要一份“可执行裁决稿”统一结论、落地顺序与风险边界，减少后续实现分歧。
+
+**交付内容**：
+- 新增 `docs/planning/SACGPU_NEW_CODEX_REVIEW_2026_02.md`：
+  - 明确评审口径为“静态代码证据、无运行数据”；
+  - 对 FQ-PT-CID-CTA-MB 方案给出逐项裁决（成立/部分成立/不成立）；
+  - 固化分阶段路线（Phase 0~3）、启停条件、回退条件与验收门槛；
+  - 补充“本次仅文档改动，后续接口扩展建议未实施”的边界说明；
+  - 附关键代码锚点（`GModel.cu`、`batch_probe_manager.h/.cu`、`test_fqpt_baseline.cpp`）。
+- 更新 `docs/README.md`：
+  - 在“关键规划文档”中注册新文档入口，说明其用途为
+    “FQ-PT-CID-CTA-MB 独立裁决与落地门槛”。
+
+**本次不做**：
+- 不修改任何 C++/CUDA 公共接口；
+- 不跑 benchmark、不新增 smoke test 输出；
+- 不回写清理 `docs/planning/SACGPU_new.md` 的草稿内容。
+
+## 2026-02-11
+
+### FQ-PT Baseline：摊平队列持久线程基线（Task = `(world_id, cid)`）
+
+**动机**：Batch-3A 在低聚合度场景存在较高固定开销。为了建立可对照的“无聚合”动态队列基线，
+新增 FQ-PT 路径：复用 ACgpu 约束检查核心，只替换传播基础设施为 GPU 端 persistent blocks + work queue。
+
+**交付内容**：
+- `include/solver/gpu/batch_probe_manager.h`：
+  - 新增 FQ-PT 数据结构与接口：`FQPTTask`、`FQPTRingSlot(seq+task)`、`FQPTControl`、
+    `FQPTStatistics`、`FQPTBaselineManager`、`LaunchFQPTBaselineKernelWrapper(...)`。
+- `src/solver/gpu/GModel.cu`：
+  - 新增 MPMC ring 原语（每槽 `seq`，避免 MPMC holes）；
+  - 明确发布顺序：producer 写 payload 后 `__threadfence()` 再发布 `seq`；
+  - 新增 `FQPTBaselineKernel`：persistent blocks 循环消费 `(world_id,cid)`，复用
+    `ExecuteConstraintCheck_BpC_Workspace` 做检查/删值，删值后按 subscription 推后继任务；
+  - 新增 CTA-local 缓冲（批量 pop + 本地生成缓冲 + 批量 flush）；
+  - 新增 world 级互斥锁 `world_locks`，拿锁失败先本地重试；
+  - 新增安全退出：`pending==0 && global queue empty && local empty`。
+- `src/solver/gpu/batch_probe_manager.cu`：
+  - 新增 `FQPTBaselineManager` 实现（快照保存、world 初始化、seed tasks、kernel 启动、结果回收）；
+  - 队列溢出可观测：`overflow_count`，并按 world 标记 `UNKNOWN`（不删值，保持 soundness）。
+- `apps/sac_benchmark.cpp`：
+  - 新增 `--mode=fqpt`；
+  - 新增 FQ-PT 参数：`--fqpt_num_blocks/--fqpt_queue_capacity/--fqpt_pop_batch/--fqpt_local_buffer/--fqpt_lock_retry/--fqpt_lock_backoff`；
+  - 输出 `unknown/overflow/checks` 等统计字段。
+- 测试与构建：
+  - 新增 `tests/cpp/test_fqpt_baseline.cpp`（Stage2 对照：无 UNKNOWN 时结果全等；有 UNKNOWN 时仅要求 FQPT 的 DWO 为 Stage2 子集）；
+  - `CMakeLists.txt` 新增 `test_fqpt_baseline` 目标与 `ctest` 注册。
+
+### FQ-PT：修复高并发下偶发 timeout（pending 计数竞态）
+
+**问题现象**：`sac_benchmark --mode=fqpt` 在中等实例/较高 block 数下偶发卡住；`test_fqpt_baseline`
+也可能触发超时。
+
+**根因**：
+- 生成任务时先发布到队列、后执行 `pending++`，在高并发下可能出现“消费者先完成并 `pending--`”，造成
+  `pending` 下溢，退出条件永远不满足；
+- 拿锁失败路径中，`status!=OK` 的任务曾存在 pending 递减时序不一致，导致计数不稳。
+
+**修复**（`src/solver/gpu/GModel.cu`）：
+- `FQPTFlushGeneratedBuffer` 调整为“先 `pending += count`，再发布任务；发布失败则回滚 pending”；
+- 统一 `status!=OK` 任务在拿锁失败路径中的完成逻辑，确保每个 task 对 pending 只结算一次。
+
+**验证**：
+- `ctest --test-dir build -R test_fqpt_baseline --output-on-failure`：通过；
+- `sac_benchmark --mode=fqpt` 在 `queens-12` 的 `--fqpt_num_blocks=16/32` 复现用例不再 timeout。
+
+### FQ-PT：`(world,cid)` 去重入队（降低重复检查风暴）
+
+**问题现象**：即使无 timeout，FQ-PT 仍存在大量重复任务（`processed_tasks/constraint_checks` 远大于必要值），
+导致调度开销居高不下。
+
+**改动**：
+- `src/solver/gpu/GModel.cu`：
+  - 新增 `FQPTTryMarkConstraintQueued/FQPTIsConstraintQueued/FQPTClearConstraintQueued`；
+  - 生成后继任务时先 `mark`，仅在首次入队时追加到 local/global queue；
+  - 弹出任务后若发现已是陈旧重复任务（标记已清），直接结算 pending，避免再次检查；
+  - 任务完成/世界终止路径补充 `clear mark`，保持标记与队列状态一致。
+- `src/solver/gpu/batch_probe_manager.cu`：
+  - world 初始化时清零 `frontier_A/B`；
+  - seed 初始化阶段按 world 的 `frontier_A` 去重，避免初始重复入队。
+
+**结果（同口径 smoke）**：
+- 正确性：`test_fqpt_baseline` 与典型样例回归均通过（`unknown=0` 时与 Stage2 一致）；
+- 任务量：`constraint_checks` 约下降 40%~50%
+  - `queens-12`: `16896 -> 8448`
+  - `rand-2-23`: `64680 -> 32384`
+  - `haystacks-11`: `17904 -> 10032`
+- 耗时：FQ-PT 相比去重前提升约 10%~30%（仍慢于 Stage2）。
+
+## 2026-02-07
+
+### Docs：新增 Batch-3A Walkthrough（核心思想 / 算法 / 代码实现）
+
+**动机**：现有 Batch-3A 文档偏向“复盘/救火/设计草案”，对首次接手代码的同学不够线性；
+需要一份从概念到代码落点的一站式 walkthrough，降低理解门槛与上手成本。
+
+**交付内容**：
+- 新增 `docs/planning/BATCH3A_WALKTHROUGH_2026_02.md`，覆盖：
+  - Batch-3A 的聚合对象（`<cid, world_mask>`）与关键不变量（world 写入互斥、UNKNOWN 语义）
+  - `Batch3AManager::Execute()` → `Batch3AKernel_MultiBlock()` → `CollectResults()` 的端到端执行链
+  - 三种 mapping（0/1/2）及其代码入口
+  - SAC3 中的 Batch-3A gating / fallback 逻辑与调参、验证命令
+- 更新 `docs/README.md`：在“关键规划文档”中注册 walkthrough 入口。
+
 ## 2026-02-05
 
 ### Batch-3A：Dynamic Submission 队列版（去掉 kernel 内全量扫描）

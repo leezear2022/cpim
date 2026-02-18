@@ -2539,6 +2539,15 @@ void FQPTBaselineManager::SetQueueCapacity(int capacity_pow2) {
   }
 }
 
+void FQPTBaselineManager::SetEnableWorldOwner(bool enabled) {
+  if (enable_world_owner_ == enabled) return;
+  enable_world_owner_ = enabled;
+  if (memory_allocated_) {
+    FreeMemory();
+    AllocateMemory();
+  }
+}
+
 void FQPTBaselineManager::AllocateMemory() {
   if (memory_allocated_) return;
 
@@ -2600,23 +2609,25 @@ void FQPTBaselineManager::AllocateMemory() {
   CHECK(err == cudaSuccess) << "Failed to allocate d_ws_frontier_B_: "
                             << cudaGetErrorString(err);
 
-  err = cudaMallocManaged(&d_world_locks_, max_tasks_ * sizeof(int));
-  CHECK(err == cudaSuccess) << "Failed to allocate d_world_locks_: "
-                            << cudaGetErrorString(err);
+  if (!enable_world_owner_) {
+    err = cudaMallocManaged(&d_world_locks_, max_tasks_ * sizeof(int));
+    CHECK(err == cudaSuccess) << "Failed to allocate d_world_locks_: "
+                              << cudaGetErrorString(err);
 
-  err = cudaMallocManaged(&d_queue_slots_, queue_capacity_ * sizeof(FQPTRingSlot));
-  CHECK(err == cudaSuccess) << "Failed to allocate d_queue_slots_: "
-                            << cudaGetErrorString(err);
+    err = cudaMallocManaged(&d_queue_slots_, queue_capacity_ * sizeof(FQPTRingSlot));
+    CHECK(err == cudaSuccess) << "Failed to allocate d_queue_slots_: "
+                              << cudaGetErrorString(err);
 
-  err = cudaMallocManaged(&d_enqueue_pos_, sizeof(unsigned long long));
-  CHECK(err == cudaSuccess) << "Failed to allocate d_enqueue_pos_: "
-                            << cudaGetErrorString(err);
-  err = cudaMallocManaged(&d_dequeue_pos_, sizeof(unsigned long long));
-  CHECK(err == cudaSuccess) << "Failed to allocate d_dequeue_pos_: "
-                            << cudaGetErrorString(err);
-  err = cudaMallocManaged(&d_pending_tasks_, sizeof(unsigned long long));
-  CHECK(err == cudaSuccess) << "Failed to allocate d_pending_tasks_: "
-                            << cudaGetErrorString(err);
+    err = cudaMallocManaged(&d_enqueue_pos_, sizeof(unsigned long long));
+    CHECK(err == cudaSuccess) << "Failed to allocate d_enqueue_pos_: "
+                              << cudaGetErrorString(err);
+    err = cudaMallocManaged(&d_dequeue_pos_, sizeof(unsigned long long));
+    CHECK(err == cudaSuccess) << "Failed to allocate d_dequeue_pos_: "
+                              << cudaGetErrorString(err);
+    err = cudaMallocManaged(&d_pending_tasks_, sizeof(unsigned long long));
+    CHECK(err == cudaSuccess) << "Failed to allocate d_pending_tasks_: "
+                              << cudaGetErrorString(err);
+  }
   err = cudaMallocManaged(&d_processed_tasks_, sizeof(unsigned long long));
   CHECK(err == cudaSuccess) << "Failed to allocate d_processed_tasks_: "
                             << cudaGetErrorString(err);
@@ -2650,6 +2661,12 @@ void FQPTBaselineManager::AllocateMemory() {
                             << cudaGetErrorString(err);
   err = cudaMallocManaged(&d_bucket_active_warp_sum_, sizeof(unsigned long long));
   CHECK(err == cudaSuccess) << "Failed to allocate d_bucket_active_warp_sum_: "
+                            << cudaGetErrorString(err);
+  err = cudaMallocManaged(&d_frontier_pop_count_, sizeof(unsigned long long));
+  CHECK(err == cudaSuccess) << "Failed to allocate d_frontier_pop_count_: "
+                            << cudaGetErrorString(err);
+  err = cudaMallocManaged(&d_frontier_scan_steps_, sizeof(unsigned long long));
+  CHECK(err == cudaSuccess) << "Failed to allocate d_frontier_scan_steps_: "
                             << cudaGetErrorString(err);
 
   err = cudaMallocManaged(&d_control_, sizeof(FQPTControl));
@@ -2703,6 +2720,8 @@ void FQPTBaselineManager::FreeMemory() {
   if (d_bucket_count_) cudaFree(d_bucket_count_);
   if (d_bucket_task_sum_) cudaFree(d_bucket_task_sum_);
   if (d_bucket_active_warp_sum_) cudaFree(d_bucket_active_warp_sum_);
+  if (d_frontier_pop_count_) cudaFree(d_frontier_pop_count_);
+  if (d_frontier_scan_steps_) cudaFree(d_frontier_scan_steps_);
   if (d_control_) cudaFree(d_control_);
 
   d_tasks_ = nullptr;
@@ -2731,6 +2750,8 @@ void FQPTBaselineManager::FreeMemory() {
   d_bucket_count_ = nullptr;
   d_bucket_task_sum_ = nullptr;
   d_bucket_active_warp_sum_ = nullptr;
+  d_frontier_pop_count_ = nullptr;
+  d_frontier_scan_steps_ = nullptr;
   d_control_ = nullptr;
   memory_allocated_ = false;
 }
@@ -2888,6 +2909,8 @@ void FQPTBaselineManager::InitializeWorldsFromSnapshot(int num_worlds) {
   *d_bucket_count_ = 0;
   *d_bucket_task_sum_ = 0;
   *d_bucket_active_warp_sum_ = 0;
+  *d_frontier_pop_count_ = 0;
+  *d_frontier_scan_steps_ = 0;
 }
 
 void FQPTBaselineManager::InitializeGlobalQueueWithSeedTasks(int num_worlds) {
@@ -2955,17 +2978,17 @@ void FQPTBaselineManager::LaunchKernel(int num_worlds) {
   d_control_->dom_size_snapshot = d_dom_size_snapshot_;
   d_control_->world_results = d_world_results_;
   d_control_->world_status = d_world_status_;
-  d_control_->world_locks = d_world_locks_;
+  d_control_->world_locks = enable_world_owner_ ? nullptr : d_world_locks_;
 
-  d_control_->queue_slots = d_queue_slots_;
-  d_control_->enqueue_pos = d_enqueue_pos_;
-  d_control_->dequeue_pos = d_dequeue_pos_;
-  d_control_->queue_capacity = queue_capacity_;
-  d_control_->queue_mask = queue_capacity_ - 1;
+  d_control_->queue_slots = enable_world_owner_ ? nullptr : d_queue_slots_;
+  d_control_->enqueue_pos = enable_world_owner_ ? nullptr : d_enqueue_pos_;
+  d_control_->dequeue_pos = enable_world_owner_ ? nullptr : d_dequeue_pos_;
+  d_control_->queue_capacity = enable_world_owner_ ? 0 : queue_capacity_;
+  d_control_->queue_mask = enable_world_owner_ ? 0 : (queue_capacity_ - 1);
 
-  d_control_->pending_tasks = d_pending_tasks_;
+  d_control_->pending_tasks = enable_world_owner_ ? nullptr : d_pending_tasks_;
   d_control_->processed_tasks = d_processed_tasks_;
-  d_control_->overflow_count = d_overflow_count_;
+  d_control_->overflow_count = enable_world_owner_ ? nullptr : d_overflow_count_;
   d_control_->unknown_count = d_unknown_count_;
 
   d_control_->cta_pop_batch = cta_pop_batch_;
@@ -2976,28 +2999,35 @@ void FQPTBaselineManager::LaunchKernel(int num_worlds) {
   d_control_->enable_parallel_group_check = enable_parallel_group_check_ ? 1 : 0;
   d_control_->group_warps_per_cta = group_warps_per_cta_;
   d_control_->group_degrade_threshold = group_degrade_threshold_;
+  d_control_->enable_world_owner = enable_world_owner_ ? 1 : 0;
 
   d_control_->total_constraint_checks =
       stats_enabled_ ? d_total_constraint_checks_ : nullptr;
   d_control_->total_deletions =
       stats_enabled_ ? d_total_deletions_ : nullptr;
   d_control_->stale_drop_count =
-      stats_enabled_ ? d_stale_drop_count_ : nullptr;
+      (stats_enabled_ && !enable_world_owner_) ? d_stale_drop_count_ : nullptr;
   d_control_->lock_fail_count =
-      stats_enabled_ ? d_lock_fail_count_ : nullptr;
+      (stats_enabled_ && !enable_world_owner_) ? d_lock_fail_count_ : nullptr;
   d_control_->lock_retry_count =
-      stats_enabled_ ? d_lock_retry_count_ : nullptr;
+      (stats_enabled_ && !enable_world_owner_) ? d_lock_retry_count_ : nullptr;
   d_control_->bucket_count =
-      stats_enabled_ ? d_bucket_count_ : nullptr;
+      (stats_enabled_ && !enable_world_owner_) ? d_bucket_count_ : nullptr;
   d_control_->bucket_task_sum =
-      stats_enabled_ ? d_bucket_task_sum_ : nullptr;
+      (stats_enabled_ && !enable_world_owner_) ? d_bucket_task_sum_ : nullptr;
   d_control_->bucket_active_warp_sum =
-      stats_enabled_ ? d_bucket_active_warp_sum_ : nullptr;
+      (stats_enabled_ && !enable_world_owner_) ? d_bucket_active_warp_sum_ : nullptr;
+  d_control_->frontier_pop_count =
+      stats_enabled_ ? d_frontier_pop_count_ : nullptr;
+  d_control_->frontier_scan_steps =
+      stats_enabled_ ? d_frontier_scan_steps_ : nullptr;
 
   cudaError_t err = cudaDeviceSynchronize();
   CHECK(err == cudaSuccess) << "cudaDeviceSynchronize failed before FQPT kernel: "
                             << cudaGetErrorString(err);
 
+  // Commit A 仅接入控制面字段与内存策略，行为仍保持 legacy kernel；
+  // OWF kernel 切换在后续内核提交中启用，确保本提交可独立编译通过。
   LaunchFQPTBaselineKernelWrapper(model_->GetModelData(), d_control_, num_blocks_);
 
   err = cudaDeviceSynchronize();
@@ -3043,6 +3073,15 @@ int FQPTBaselineManager::CollectResults(
         static_cast<double>(bucket_active_warp_sum) /
         static_cast<double>(bucket_count * static_cast<unsigned long long>(denom_warps));
   }
+  last_stats_.frontier_pop_count =
+      stats_enabled_ && d_frontier_pop_count_ ? *d_frontier_pop_count_ : 0ULL;
+  last_stats_.frontier_scan_steps =
+      stats_enabled_ && d_frontier_scan_steps_ ? *d_frontier_scan_steps_ : 0ULL;
+  if (last_stats_.frontier_pop_count > 0ULL) {
+    last_stats_.avg_frontier_scan_steps =
+        static_cast<double>(last_stats_.frontier_scan_steps) /
+        static_cast<double>(last_stats_.frontier_pop_count);
+  }
 
   int failed = 0;
   for (int w = 0; w < num_worlds; ++w) {
@@ -3082,8 +3121,32 @@ int FQPTBaselineManager::Execute(
 
   EnsureTaskCapacity(num_tasks);
   SaveSnapshot();
-  InitializeWorldsFromSnapshot(num_tasks);
-  InitializeGlobalQueueWithSeedTasks(num_tasks);
+  if (d_processed_tasks_ != nullptr) *d_processed_tasks_ = 0ULL;
+  if (d_total_constraint_checks_ != nullptr) *d_total_constraint_checks_ = 0ULL;
+  if (d_total_deletions_ != nullptr) *d_total_deletions_ = 0ULL;
+  if (d_overflow_count_ != nullptr) *d_overflow_count_ = 0ULL;
+  if (d_unknown_count_ != nullptr) *d_unknown_count_ = 0ULL;
+  if (d_stale_drop_count_ != nullptr) *d_stale_drop_count_ = 0ULL;
+  if (d_lock_fail_count_ != nullptr) *d_lock_fail_count_ = 0ULL;
+  if (d_lock_retry_count_ != nullptr) *d_lock_retry_count_ = 0ULL;
+  if (d_bucket_count_ != nullptr) *d_bucket_count_ = 0ULL;
+  if (d_bucket_task_sum_ != nullptr) *d_bucket_task_sum_ = 0ULL;
+  if (d_bucket_active_warp_sum_ != nullptr) *d_bucket_active_warp_sum_ = 0ULL;
+  if (d_frontier_pop_count_ != nullptr) *d_frontier_pop_count_ = 0ULL;
+  if (d_frontier_scan_steps_ != nullptr) *d_frontier_scan_steps_ = 0ULL;
+
+  if (!enable_world_owner_) {
+    InitializeWorldsFromSnapshot(num_tasks);
+    InitializeGlobalQueueWithSeedTasks(num_tasks);
+  } else {
+    cudaError_t err = cudaMemcpy(
+        d_tasks_,
+        task_queue_.data(),
+        num_tasks * sizeof(ProbeTask),
+        cudaMemcpyHostToDevice);
+    CHECK(err == cudaSuccess) << "Failed to copy probe tasks: "
+                              << cudaGetErrorString(err);
+  }
   LaunchKernel(num_tasks);
   const int failed = CollectResults(
       num_tasks, failed_vars, failed_values, unknown_vars, unknown_values);

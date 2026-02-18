@@ -1072,6 +1072,7 @@ struct FQPTControl {
   int enable_parallel_group_check;       // 1=启用分桶后并行检查
   int group_warps_per_cta;               // 分组检查最多使用的 warp 数
   int group_degrade_threshold;           // max_bucket_size<=threshold 时退化到逐任务
+  int enable_world_owner;                // 1=启用 Owner-World + Frontier 路径
 
   // ========== 可选统计 ==========
   unsigned long long* total_constraint_checks;  // 约束检查次数
@@ -1082,6 +1083,8 @@ struct FQPTControl {
   unsigned long long* bucket_count;             // 实际触发分桶次数
   unsigned long long* bucket_task_sum;          // 分桶任务总数
   unsigned long long* bucket_active_warp_sum;   // 分桶活跃 warp 总数
+  unsigned long long* frontier_pop_count;       // Owner-World: frontier pop 次数
+  unsigned long long* frontier_scan_steps;      // Owner-World: L1 扫描步数
 
   __host__ __device__ FQPTControl()
       : num_worlds(0),
@@ -1109,6 +1112,7 @@ struct FQPTControl {
         enable_parallel_group_check(0),
         group_warps_per_cta(4),
         group_degrade_threshold(1),
+        enable_world_owner(0),
         total_constraint_checks(nullptr),
         total_deletions(nullptr),
         stale_drop_count(nullptr),
@@ -1116,7 +1120,9 @@ struct FQPTControl {
         lock_retry_count(nullptr),
         bucket_count(nullptr),
         bucket_task_sum(nullptr),
-        bucket_active_warp_sum(nullptr) {}
+        bucket_active_warp_sum(nullptr),
+        frontier_pop_count(nullptr),
+        frontier_scan_steps(nullptr) {}
 };
 
 // FQ-PT 运行统计（Host 侧）
@@ -1135,6 +1141,9 @@ struct FQPTStatistics {
   unsigned long long lock_retry_count = 0;
   double avg_bucket_size = 0.0;
   double avg_bucket_utilization = 0.0;
+  unsigned long long frontier_pop_count = 0;
+  unsigned long long frontier_scan_steps = 0;
+  double avg_frontier_scan_steps = 0.0;
 };
 
 // FQ-PT Baseline Host 管理器
@@ -1176,6 +1185,7 @@ class FQPTBaselineManager {
   void SetGroupDegradeThreshold(int threshold) {
     group_degrade_threshold_ = std::max(1, threshold);
   }
+  void SetEnableWorldOwner(bool enabled);
 
   int GetNumBlocks() const { return num_blocks_; }
   const FQPTStatistics& GetLastStatistics() const { return last_stats_; }
@@ -1212,6 +1222,7 @@ class FQPTBaselineManager {
   bool enable_parallel_group_check_ = false;
   int group_warps_per_cta_ = 4;
   int group_degrade_threshold_ = 1;
+  bool enable_world_owner_ = false;
   bool stats_enabled_ = true;
 
   // ========== Device 端内存（统一内存）==========
@@ -1244,6 +1255,8 @@ class FQPTBaselineManager {
   unsigned long long* d_bucket_count_ = nullptr;
   unsigned long long* d_bucket_task_sum_ = nullptr;
   unsigned long long* d_bucket_active_warp_sum_ = nullptr;
+  unsigned long long* d_frontier_pop_count_ = nullptr;
+  unsigned long long* d_frontier_scan_steps_ = nullptr;
 
   FQPTControl* d_control_ = nullptr;
   bool memory_allocated_ = false;
@@ -1253,6 +1266,10 @@ class FQPTBaselineManager {
 
 // FQ-PT Kernel Wrapper（实现在 GModel.cu）
 void LaunchFQPTBaselineKernelWrapper(
+    GModelData model_data,
+    FQPTControl* control,
+    int num_blocks);
+void LaunchFQPTOwnerFrontierKernelWrapper(
     GModelData model_data,
     FQPTControl* control,
     int num_blocks);

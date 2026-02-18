@@ -2,6 +2,49 @@
 
 ## 2026-02-18
 
+### FQ-PT：OW1 实验迭代（mode=2 + 可观测化，允许退化）
+
+**目标**：将 OW1 从“单一优化开关”扩展为可扫频实验框架，允许阶段性性能退化用于摸索，
+但保持正确性硬约束与 default-off 回退能力。
+
+**核心改动**：
+- `include/solver/gpu/batch_probe_manager.h`
+  - `FQPTControl` 新增：
+    - `ow1_scatter_mode`（`0=OW0 fallback, 1=OW1, 2=OW1_v2(match_any)`）
+    - `ow1_force_scatter`（忽略 `ow1_min_degree` 强制 scatter）
+    - `ow1_scatter_calls`、`ow1_fallback_calls`、`ow1_word_leader_writes`
+  - `FQPTStatistics` 新增上述三项 host 统计镜像
+  - `FQPTBaselineManager` 新增 setter：
+    - `SetOW1ScatterMode(int)`
+    - `SetOW1ForceScatter(bool)`
+- `src/solver/gpu/batch_probe_manager.cu`
+  - 分配/释放/清零 OW1 新统计计数器
+  - `LaunchKernel()` 下发 `ow1_scatter_mode/ow1_force_scatter`
+  - `CollectResults()` 汇总 `ow1_*` 统计
+- `apps/sac_benchmark.cpp`
+  - 新增 CLI：
+    - `--fqpt_ow1_scatter_mode`
+    - `--fqpt_ow1_force_scatter`
+  - 输出新增统计：
+    - `ow1_sc`（scatter 调用次数）
+    - `ow1_fb`（fallback 调用次数）
+    - `ow1_w`（leader 写回 frontier word 次数）
+  - 模式名支持 `FQ-PT(OWF+OW1m2)` 以区分 `mode=2`
+- `tests/cpp/test_fqpt_baseline.cpp`
+  - 新增 OW1 实验参数接线，覆盖 `mode/force` 切换场景
+- `src/solver/gpu/GModel.cu`
+  - 新增 `FQPTPushVarNeighborsToFrontierTwoLevelWarpMatchAny(...)`（OW1_v2）
+  - 新增统一分流函数 `FQPTPushVarNeighborsToFrontierTwoLevelDispatch(...)`
+  - OWF 的 seed 与 `x_changed/y_changed` 回写统一走分流逻辑：
+    - `mode=0` 始终 lane0 fallback
+    - `mode=1/2` 按 `ow1_force_scatter` 与 `ow1_min_degree` 决定 scatter/fallback
+  - 仅使用 warp 级原语；不引入 block barrier 到 OWF 主循环
+
+**语义与回退**：
+- OW1 继续 default-off（需显式开启 `--fqpt_enable_ow1_frontier_scatter=1`）
+- Stage2 与 legacy FQ-PT 默认行为不变
+- soundness 不变：`UNKNOWN` 语义不变，正确性门槛不放松
+
 ### FQ-PT：新增 OW1（S3）frontier 邻接写回优化（default-off）
 
 **目标**：降低 OWF 路径在高 degree 变量上的 `lane0` 串行邻接写回瓶颈，

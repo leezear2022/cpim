@@ -104,6 +104,10 @@ DEFINE_bool(fqpt_enable_ow1_frontier_scatter, false,
             "FQ-PT OW1: enable warp-cooperative frontier neighbor scatter");
 DEFINE_int32(fqpt_ow1_min_degree, 32,
              "FQ-PT OW1: min var degree to enable warp scatter");
+DEFINE_int32(fqpt_ow1_scatter_mode, 1,
+             "FQ-PT OW1: scatter mode (0=fallback, 1=legacy warp, 2=match_any)");
+DEFINE_bool(fqpt_ow1_force_scatter, false,
+            "FQ-PT OW1: force scatter regardless of min_degree");
 
 namespace cpim {
 
@@ -145,6 +149,8 @@ void ConfigureFQPTManager(FQPTBaselineManager& manager) {
     manager.SetEnableWorldOwner(FLAGS_fqpt_enable_world_owner);
     manager.SetEnableOW1FrontierScatter(FLAGS_fqpt_enable_ow1_frontier_scatter);
     manager.SetOW1MinDegree(FLAGS_fqpt_ow1_min_degree);
+    manager.SetOW1ScatterMode(FLAGS_fqpt_ow1_scatter_mode);
+    manager.SetOW1ForceScatter(FLAGS_fqpt_ow1_force_scatter);
 }
 
 // ============================================================================
@@ -429,6 +435,9 @@ struct BenchmarkResult {
     unsigned long long frontier_pop_count = 0;
     unsigned long long frontier_scan_steps = 0;
     double avg_frontier_scan_steps = 0.0;
+    unsigned long long ow1_scatter_calls = 0;
+    unsigned long long ow1_fallback_calls = 0;
+    unsigned long long ow1_word_leader_writes = 0;
 };
 
 void PrintResult(const BenchmarkResult& result) {
@@ -450,6 +459,9 @@ void PrintResult(const BenchmarkResult& result) {
     std::cout << "  fpop=" << result.frontier_pop_count;
     std::cout << "  fscan=" << std::setprecision(2)
               << result.avg_frontier_scan_steps;
+    std::cout << "  ow1_sc=" << result.ow1_scatter_calls;
+    std::cout << "  ow1_fb=" << result.ow1_fallback_calls;
+    std::cout << "  ow1_w=" << result.ow1_word_leader_writes;
     std::cout << std::endl;
 }
 
@@ -644,8 +656,12 @@ BenchmarkResult RunFQPTBenchmark(GModel* gmodel,
                                  int warmup, int iterations) {
     BenchmarkResult result;
     if (FLAGS_fqpt_enable_world_owner) {
-        result.mode_name = FLAGS_fqpt_enable_ow1_frontier_scatter ? "FQ-PT(OWF+OW1)"
-                                                                   : "FQ-PT(OWF)";
+        if (FLAGS_fqpt_enable_ow1_frontier_scatter) {
+            result.mode_name = FLAGS_fqpt_ow1_scatter_mode == 2 ? "FQ-PT(OWF+OW1m2)"
+                                                                 : "FQ-PT(OWF+OW1)";
+        } else {
+            result.mode_name = "FQ-PT(OWF)";
+        }
     } else {
         result.mode_name = "FQ-PT";
     }
@@ -678,6 +694,9 @@ BenchmarkResult RunFQPTBenchmark(GModel* gmodel,
     unsigned long long total_frontier_pop = 0;
     unsigned long long total_frontier_scan = 0;
     double total_avg_frontier_scan = 0.0;
+    unsigned long long total_ow1_scatter_calls = 0;
+    unsigned long long total_ow1_fallback_calls = 0;
+    unsigned long long total_ow1_word_leader_writes = 0;
 
     for (int iter = 0; iter < iterations; ++iter) {
         for (const auto& t : tasks) {
@@ -704,6 +723,9 @@ BenchmarkResult RunFQPTBenchmark(GModel* gmodel,
         total_frontier_pop += st.frontier_pop_count;
         total_frontier_scan += st.frontier_scan_steps;
         total_avg_frontier_scan += st.avg_frontier_scan_steps;
+        total_ow1_scatter_calls += st.ow1_scatter_calls;
+        total_ow1_fallback_calls += st.ow1_fallback_calls;
+        total_ow1_word_leader_writes += st.ow1_word_leader_writes;
         manager.Clear();
     }
 
@@ -726,6 +748,10 @@ BenchmarkResult RunFQPTBenchmark(GModel* gmodel,
     result.frontier_scan_steps = total_frontier_scan / std::max(1, iterations);
     result.avg_frontier_scan_steps =
         total_avg_frontier_scan / std::max(1, iterations);
+    result.ow1_scatter_calls = total_ow1_scatter_calls / std::max(1, iterations);
+    result.ow1_fallback_calls = total_ow1_fallback_calls / std::max(1, iterations);
+    result.ow1_word_leader_writes =
+        total_ow1_word_leader_writes / std::max(1, iterations);
     result.probes_per_sec = result.num_probes * 1000.0 / result.avg_time_ms;
     result.valid = true;
     return result;

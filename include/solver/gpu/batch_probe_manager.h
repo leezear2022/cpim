@@ -1075,6 +1075,8 @@ struct FQPTControl {
   int enable_world_owner;                // 1=启用 Owner-World + Frontier 路径
   int enable_ow1_frontier_scatter;       // 1=启用 OW1 邻接写回 warp 协作
   int ow1_min_degree;                    // OW1 触发最小 degree（低于阈值走 OW0）
+  int ow1_scatter_mode;                  // 0=OW0 fallback, 1=OW1, 2=OW1_v2(match_any)
+  int ow1_force_scatter;                 // 1=忽略 min_degree，强制 scatter
 
   // ========== 可选统计 ==========
   unsigned long long* total_constraint_checks;  // 约束检查次数
@@ -1087,6 +1089,9 @@ struct FQPTControl {
   unsigned long long* bucket_active_warp_sum;   // 分桶活跃 warp 总数
   unsigned long long* frontier_pop_count;       // Owner-World: frontier pop 次数
   unsigned long long* frontier_scan_steps;      // Owner-World: L1 扫描步数
+  unsigned long long* ow1_scatter_calls;        // OW1: scatter 分支触发次数
+  unsigned long long* ow1_fallback_calls;       // OW1: fallback 分支触发次数
+  unsigned long long* ow1_word_leader_writes;   // OW1: leader 写回 frontier word 次数
 
   __host__ __device__ FQPTControl()
       : num_worlds(0),
@@ -1117,6 +1122,8 @@ struct FQPTControl {
         enable_world_owner(0),
         enable_ow1_frontier_scatter(0),
         ow1_min_degree(32),
+        ow1_scatter_mode(1),
+        ow1_force_scatter(0),
         total_constraint_checks(nullptr),
         total_deletions(nullptr),
         stale_drop_count(nullptr),
@@ -1126,7 +1133,10 @@ struct FQPTControl {
         bucket_task_sum(nullptr),
         bucket_active_warp_sum(nullptr),
         frontier_pop_count(nullptr),
-        frontier_scan_steps(nullptr) {}
+        frontier_scan_steps(nullptr),
+        ow1_scatter_calls(nullptr),
+        ow1_fallback_calls(nullptr),
+        ow1_word_leader_writes(nullptr) {}
 };
 
 // FQ-PT 运行统计（Host 侧）
@@ -1148,6 +1158,9 @@ struct FQPTStatistics {
   unsigned long long frontier_pop_count = 0;
   unsigned long long frontier_scan_steps = 0;
   double avg_frontier_scan_steps = 0.0;
+  unsigned long long ow1_scatter_calls = 0;
+  unsigned long long ow1_fallback_calls = 0;
+  unsigned long long ow1_word_leader_writes = 0;
 };
 
 // FQ-PT Baseline Host 管理器
@@ -1194,6 +1207,8 @@ class FQPTBaselineManager {
     enable_ow1_frontier_scatter_ = enabled;
   }
   void SetOW1MinDegree(int degree) { ow1_min_degree_ = std::max(1, degree); }
+  void SetOW1ScatterMode(int mode) { ow1_scatter_mode_ = std::clamp(mode, 0, 2); }
+  void SetOW1ForceScatter(bool enabled) { ow1_force_scatter_ = enabled; }
 
   int GetNumBlocks() const { return num_blocks_; }
   const FQPTStatistics& GetLastStatistics() const { return last_stats_; }
@@ -1233,6 +1248,8 @@ class FQPTBaselineManager {
   bool enable_world_owner_ = false;
   bool enable_ow1_frontier_scatter_ = false;
   int ow1_min_degree_ = 32;
+  int ow1_scatter_mode_ = 1;
+  bool ow1_force_scatter_ = false;
   bool stats_enabled_ = true;
 
   // ========== Device 端内存（统一内存）==========
@@ -1267,6 +1284,9 @@ class FQPTBaselineManager {
   unsigned long long* d_bucket_active_warp_sum_ = nullptr;
   unsigned long long* d_frontier_pop_count_ = nullptr;
   unsigned long long* d_frontier_scan_steps_ = nullptr;
+  unsigned long long* d_ow1_scatter_calls_ = nullptr;
+  unsigned long long* d_ow1_fallback_calls_ = nullptr;
+  unsigned long long* d_ow1_word_leader_writes_ = nullptr;
 
   FQPTControl* d_control_ = nullptr;
   bool memory_allocated_ = false;

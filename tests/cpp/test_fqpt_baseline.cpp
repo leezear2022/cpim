@@ -33,6 +33,10 @@ DEFINE_bool(fqpt_enable_ow1_frontier_scatter, false,
             "Enable OW1 warp-cooperative frontier scatter");
 DEFINE_int32(fqpt_ow1_min_degree, 32,
              "OW1 min variable degree to trigger warp scatter");
+DEFINE_int32(fqpt_ow1_scatter_mode, 1,
+             "OW1 scatter mode (0=fallback, 1=legacy warp, 2=match_any)");
+DEFINE_bool(fqpt_ow1_force_scatter, false,
+            "OW1 force scatter regardless of min degree");
 
 namespace cpim {
 
@@ -89,6 +93,8 @@ void RunFQPT(
   mgr.SetEnableWorldOwner(FLAGS_fqpt_enable_world_owner);
   mgr.SetEnableOW1FrontierScatter(FLAGS_fqpt_enable_ow1_frontier_scatter);
   mgr.SetOW1MinDegree(FLAGS_fqpt_ow1_min_degree);
+  mgr.SetOW1ScatterMode(FLAGS_fqpt_ow1_scatter_mode);
+  mgr.SetOW1ForceScatter(FLAGS_fqpt_ow1_force_scatter);
 
   for (const auto& t : tasks) {
     mgr.AddTask(t.var_id, t.value);

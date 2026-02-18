@@ -2,6 +2,39 @@
 
 ## 2026-02-18
 
+### FQ-PT：新增 OW1（S3）frontier 邻接写回优化（default-off）
+
+**目标**：降低 OWF 路径在高 degree 变量上的 `lane0` 串行邻接写回瓶颈，
+仅优化 frontier 回写，不引入 S1/S2 变更，保持归因清晰。
+
+**核心改动**：
+- `include/solver/gpu/batch_probe_manager.h`
+  - `FQPTControl` 新增：
+    - `enable_ow1_frontier_scatter`
+    - `ow1_min_degree`
+  - `FQPTBaselineManager` 新增 setter：
+    - `SetEnableOW1FrontierScatter(bool)`
+    - `SetOW1MinDegree(int)`
+- `src/solver/gpu/batch_probe_manager.cu`
+  - `LaunchKernel()` 下发 OW1 控制字段；
+  - 仅在 `enable_world_owner` 下允许 OW1 生效，其它路径保持关闭。
+- `src/solver/gpu/GModel.cu`
+  - 保留 `FQPTPushVarNeighborsToFrontierTwoLevel(...)` 作为 fallback；
+  - 新增 warp 协作写回逻辑：按 `word` 聚合同轮 lane bit，
+    由 leader 一次写回 L0/L1 frontier；
+  - 调用分流：`enable_world_owner && enable_ow1_frontier_scatter && degree>=ow1_min_degree`
+    走 OW1，否则走 OW0 旧路径。
+- `apps/sac_benchmark.cpp` / `tests/cpp/test_fqpt_baseline.cpp`
+  - 新增 CLI：
+    - `--fqpt_enable_ow1_frontier_scatter`
+    - `--fqpt_ow1_min_degree`
+  - benchmark 模式名区分 `FQ-PT(OWF+OW1)` 与 `FQ-PT(OWF)`。
+
+**语义与回退**：
+- OW1 默认关闭（default-off）；
+- 仅在 OWF 路径启用，保持 Stage2 与 legacy FQ-PT 默认行为不变；
+- 保持 soundness：`UNKNOWN` 语义与 DWO/OK 判定逻辑不变。
+
 ### FQ-PT：新增 OW0（Owner-World + Two-Level Frontier）路径（default-off）
 
 **目标**：在 `--mode=fqpt` 下引入 Owner-World 执行路径，移除全局 `(world,cid)` MPMC 与 `world_lock`

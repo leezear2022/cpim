@@ -3287,6 +3287,82 @@ __device__ inline void FQPTPushVarNeighborsToFrontierTwoLevel(
   }
 }
 
+__device__ inline int FQPTGetVarSubscriptionDegree(
+    const GModelData& model,
+    int var) {
+  if (var < 0 || var >= model.num_vars) return 0;
+  const int start = model.d_subscription_offset[var];
+  const int end = model.d_subscription_offset[var + 1];
+  return max(0, end - start);
+}
+
+__device__ inline void FQPTPushVarNeighborsToFrontierTwoLevelWarp(
+    const GModelData& model,
+    WorldWorkspace* ws,
+    int var,
+    int bitmap_words,
+    int l1_words,
+    int lane_id,
+    u32 full_mask) {
+  if (var < 0 || var >= model.num_vars) return;
+  const int start = model.d_subscription_offset[var];
+  const int end = model.d_subscription_offset[var + 1];
+  const int degree = end - start;
+  if (degree <= 0) return;
+  const int rounds = (degree + 31) / 32;
+
+  for (int r = 0; r < rounds; ++r) {
+    const int idx = start + (r << 5) + lane_id;
+    int word = -1;
+    u32 cid_bit = 0u;
+    bool valid = false;
+
+    if (idx < end) {
+      const int cid = model.d_subscription[idx].z;
+      if (cid >= 0 && cid < model.num_constraints) {
+        const int cid_word = cid >> 5;
+        if (cid_word >= 0 && cid_word < bitmap_words) {
+          word = cid_word;
+          cid_bit = (1u << (cid & 31));
+          valid = true;
+        }
+      }
+    }
+
+    u32 pending = __ballot_sync(full_mask, valid);
+    while (pending != 0u) {
+      const int leader_lane = __ffs(static_cast<int>(pending)) - 1;
+      const int leader_word = __shfl_sync(full_mask, word, leader_lane);
+      const u32 same_word_mask =
+          __ballot_sync(full_mask, valid && (word == leader_word));
+
+      if (lane_id == leader_lane) {
+        u32 merged_bits = 0u;
+        u32 peers = same_word_mask;
+        while (peers != 0u) {
+          const int peer_lane = __ffs(static_cast<int>(peers)) - 1;
+          merged_bits |= __shfl_sync(full_mask, cid_bit, peer_lane);
+          peers &= (peers - 1u);
+        }
+
+        if (leader_word >= 0 && leader_word < bitmap_words && merged_bits != 0u) {
+          const u32 old_word = ws->frontier_A[leader_word];
+          const u32 new_word = old_word | merged_bits;
+          if (new_word != old_word) {
+            ws->frontier_A[leader_word] = new_word;
+            const int l1_word = leader_word >> 5;
+            if (l1_word >= 0 && l1_word < l1_words) {
+              ws->frontier_B[l1_word] |= (1u << (leader_word & 31));
+            }
+          }
+        }
+      }
+
+      pending &= ~same_word_mask;
+    }
+  }
+}
+
 __device__ inline bool FQPTPopFrontierCidTwoLevel(
     WorldWorkspace* ws,
     int bitmap_words,
@@ -3360,6 +3436,9 @@ __global__ void FQPTOwnerFrontierKernel(
   const int world_stride = block_warps * gridDim.x;
   const int check_words_per_warp = 2 * model.bit_dom_int_size + 16;
   const u32 full_mask = 0xFFFFFFFFu;
+  const bool enable_ow1_frontier_scatter =
+      (control->enable_ow1_frontier_scatter != 0);
+  const int ow1_min_degree = max(1, control->ow1_min_degree);
 
   unsigned long long local_checks = 0ULL;
   unsigned long long local_deletions = 0ULL;
@@ -3398,6 +3477,7 @@ __global__ void FQPTOwnerFrontierKernel(
     __syncwarp(full_mask);
 
     int world_ok = 1;
+    int seed_var = -1;
     if (lane_id == 0) {
       const int var = probe.var_id;
       const int value = probe.value;
@@ -3429,16 +3509,27 @@ __global__ void FQPTOwnerFrontierKernel(
             }
             ws->bitDom[dom_base + word_idx] = (1u << bit_idx);
             ws->d_cur_dom_size[var] = 1;
-            FQPTPushVarNeighborsToFrontierTwoLevel(
-                model, ws, var, bitmap_words, l1_words);
+            seed_var = var;
           }
         }
       }
     }
     world_ok = __shfl_sync(full_mask, world_ok, 0);
+    seed_var = __shfl_sync(full_mask, seed_var, 0);
     if (!world_ok) {
       continue;
     }
+    if (seed_var >= 0) {
+      const int seed_degree = FQPTGetVarSubscriptionDegree(model, seed_var);
+      if (enable_ow1_frontier_scatter && seed_degree >= ow1_min_degree) {
+        FQPTPushVarNeighborsToFrontierTwoLevelWarp(
+            model, ws, seed_var, bitmap_words, l1_words, lane_id, full_mask);
+      } else if (lane_id == 0) {
+        FQPTPushVarNeighborsToFrontierTwoLevel(
+            model, ws, seed_var, bitmap_words, l1_words);
+      }
+    }
+    __syncwarp(full_mask);
 
     int cursor_l1 = (world + 17) % l1_words;
     while (true) {
@@ -3468,6 +3559,8 @@ __global__ void FQPTOwnerFrontierKernel(
           ExecuteConstraintCheck_BpC_Workspace_WarpPerWorld(
               cid, model, ws, warp_scratch);
 
+      int push_var_x = -1;
+      int push_var_y = -1;
       if (lane_id == 0) {
         ++local_checks;
         ++local_processed;
@@ -3481,13 +3574,34 @@ __global__ void FQPTOwnerFrontierKernel(
         } else if (control->world_status[world] == static_cast<int>(ProbeStatus::kOK)) {
           const int2 scope = model.constraint_scopes[cid];
           if (r.x_changed) {
-            FQPTPushVarNeighborsToFrontierTwoLevel(
-                model, ws, scope.x, bitmap_words, l1_words);
+            push_var_x = scope.x;
           }
           if (r.y_changed) {
-            FQPTPushVarNeighborsToFrontierTwoLevel(
-                model, ws, scope.y, bitmap_words, l1_words);
+            push_var_y = scope.y;
           }
+        }
+      }
+      push_var_x = __shfl_sync(full_mask, push_var_x, 0);
+      push_var_y = __shfl_sync(full_mask, push_var_y, 0);
+
+      if (push_var_x >= 0) {
+        const int degree_x = FQPTGetVarSubscriptionDegree(model, push_var_x);
+        if (enable_ow1_frontier_scatter && degree_x >= ow1_min_degree) {
+          FQPTPushVarNeighborsToFrontierTwoLevelWarp(
+              model, ws, push_var_x, bitmap_words, l1_words, lane_id, full_mask);
+        } else if (lane_id == 0) {
+          FQPTPushVarNeighborsToFrontierTwoLevel(
+              model, ws, push_var_x, bitmap_words, l1_words);
+        }
+      }
+      if (push_var_y >= 0) {
+        const int degree_y = FQPTGetVarSubscriptionDegree(model, push_var_y);
+        if (enable_ow1_frontier_scatter && degree_y >= ow1_min_degree) {
+          FQPTPushVarNeighborsToFrontierTwoLevelWarp(
+              model, ws, push_var_y, bitmap_words, l1_words, lane_id, full_mask);
+        } else if (lane_id == 0) {
+          FQPTPushVarNeighborsToFrontierTwoLevel(
+              model, ws, push_var_y, bitmap_words, l1_words);
         }
       }
       __syncwarp(full_mask);

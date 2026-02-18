@@ -27,6 +27,8 @@ DEFINE_int32(num_probes, 16, "Number of probe tasks to run");
 DEFINE_int32(fqpt_queue_capacity, 0, "FQ-PT queue capacity (power of two, 0=auto)");
 DEFINE_int32(fqpt_pop_batch, 4, "FQ-PT CTA batch pop size");
 DEFINE_int32(fqpt_local_buffer, 64, "FQ-PT CTA local buffer size");
+DEFINE_bool(fqpt_enable_world_owner, false,
+            "Enable Owner-World + two-level frontier path");
 
 namespace cpim {
 
@@ -80,6 +82,7 @@ void RunFQPT(
   }
   mgr.SetCtaPopBatch(FLAGS_fqpt_pop_batch);
   mgr.SetLocalBufferCapacity(FLAGS_fqpt_local_buffer);
+  mgr.SetEnableWorldOwner(FLAGS_fqpt_enable_world_owner);
 
   for (const auto& t : tasks) {
     mgr.AddTask(t.var_id, t.value);

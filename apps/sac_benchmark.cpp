@@ -98,6 +98,8 @@ DEFINE_int32(fqpt_group_warps, 4,
              "FQ-PT: group warps per CTA for grouped check");
 DEFINE_int32(fqpt_group_degrade_threshold, 1,
              "FQ-PT: degrade to single-task when max bucket <= threshold");
+DEFINE_bool(fqpt_enable_world_owner, false,
+            "FQ-PT: enable Owner-World + two-level frontier path");
 
 namespace cpim {
 
@@ -136,6 +138,7 @@ void ConfigureFQPTManager(FQPTBaselineManager& manager) {
     manager.SetEnableParallelGroupCheck(FLAGS_fqpt_enable_parallel_group_check);
     manager.SetGroupWarpsPerCta(FLAGS_fqpt_group_warps);
     manager.SetGroupDegradeThreshold(FLAGS_fqpt_group_degrade_threshold);
+    manager.SetEnableWorldOwner(FLAGS_fqpt_enable_world_owner);
 }
 
 // ============================================================================
@@ -417,6 +420,9 @@ struct BenchmarkResult {
     unsigned long long lock_retry_count = 0;
     double avg_bucket_size = 0.0;
     double avg_bucket_utilization = 0.0;
+    unsigned long long frontier_pop_count = 0;
+    unsigned long long frontier_scan_steps = 0;
+    double avg_frontier_scan_steps = 0.0;
 };
 
 void PrintResult(const BenchmarkResult& result) {
@@ -435,6 +441,9 @@ void PrintResult(const BenchmarkResult& result) {
     std::cout << "  bsz=" << std::setprecision(2) << result.avg_bucket_size;
     std::cout << "  butil=" << std::setprecision(2)
               << result.avg_bucket_utilization;
+    std::cout << "  fpop=" << result.frontier_pop_count;
+    std::cout << "  fscan=" << std::setprecision(2)
+              << result.avg_frontier_scan_steps;
     std::cout << std::endl;
 }
 
@@ -628,7 +637,7 @@ BenchmarkResult RunFQPTBenchmark(GModel* gmodel,
                                  const std::vector<ProbeTask>& tasks,
                                  int warmup, int iterations) {
     BenchmarkResult result;
-    result.mode_name = "FQ-PT";
+    result.mode_name = FLAGS_fqpt_enable_world_owner ? "FQ-PT(OWF)" : "FQ-PT";
     result.num_probes = tasks.size();
     result.valid = false;
 
@@ -655,6 +664,9 @@ BenchmarkResult RunFQPTBenchmark(GModel* gmodel,
     unsigned long long total_lock_retry = 0;
     double total_bucket_size = 0.0;
     double total_bucket_util = 0.0;
+    unsigned long long total_frontier_pop = 0;
+    unsigned long long total_frontier_scan = 0;
+    double total_avg_frontier_scan = 0.0;
 
     for (int iter = 0; iter < iterations; ++iter) {
         for (const auto& t : tasks) {
@@ -678,6 +690,9 @@ BenchmarkResult RunFQPTBenchmark(GModel* gmodel,
         total_lock_retry += st.lock_retry_count;
         total_bucket_size += st.avg_bucket_size;
         total_bucket_util += st.avg_bucket_utilization;
+        total_frontier_pop += st.frontier_pop_count;
+        total_frontier_scan += st.frontier_scan_steps;
+        total_avg_frontier_scan += st.avg_frontier_scan_steps;
         manager.Clear();
     }
 
@@ -696,6 +711,10 @@ BenchmarkResult RunFQPTBenchmark(GModel* gmodel,
     result.lock_retry_count = total_lock_retry / std::max(1, iterations);
     result.avg_bucket_size = total_bucket_size / std::max(1, iterations);
     result.avg_bucket_utilization = total_bucket_util / std::max(1, iterations);
+    result.frontier_pop_count = total_frontier_pop / std::max(1, iterations);
+    result.frontier_scan_steps = total_frontier_scan / std::max(1, iterations);
+    result.avg_frontier_scan_steps =
+        total_avg_frontier_scan / std::max(1, iterations);
     result.probes_per_sec = result.num_probes * 1000.0 / result.avg_time_ms;
     result.valid = true;
     return result;

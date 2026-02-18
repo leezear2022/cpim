@@ -1,5 +1,35 @@
 # 修改清单（中文）
 
+## 2026-02-18
+
+### FQ-PT：新增 OW0（Owner-World + Two-Level Frontier）路径（default-off）
+
+**目标**：在 `--mode=fqpt` 下引入 Owner-World 执行路径，移除全局 `(world,cid)` MPMC 与 `world_lock`
+在该路径上的热冲突，把瓶颈从控制面迁回约束检查算子。
+
+**核心改动**：
+- `src/solver/gpu/GModel.cu`
+  - 新增 `FQPTOwnerFrontierKernel` 与 `LaunchFQPTOwnerFrontierKernelWrapper(...)`；
+  - 采用 `owner(world)=world%gridDim.x` 的 warp-per-world 静态映射；
+  - 使用 two-level frontier（`frontier_A` 作为 L0，`frontier_B` 作为 L1）做摊销 O(1) pop；
+  - 初始化下沉到 device Phase0（snapshot 恢复、singleton assign、seed frontier）；
+  - OW0 路径仅调用 warp-only 检查函数（不进入 block-sync 检查路径）。
+- `include/solver/gpu/batch_probe_manager.h` / `src/solver/gpu/batch_probe_manager.cu`
+  - `FQPTControl` 新增 `enable_world_owner` 与 frontier 统计指针：
+    `frontier_pop_count`、`frontier_scan_steps`；
+  - `FQPTBaselineManager` 新增 `SetEnableWorldOwner(bool)`；
+  - `LaunchKernel()` 新增 owner/legacy 双路径分流；
+  - owner 路径下 ring/lock 指针可为空，统计聚焦 checks/deletions/frontier 扫描。
+- `apps/sac_benchmark.cpp`
+  - 新增 flag：`--fqpt_enable_world_owner`；
+  - `RunFQPTBenchmark` 输出新增 `fpop/fscan`（frontier pop 与平均扫描步数）。
+- `tests/cpp/test_fqpt_baseline.cpp`
+  - 新增 `--fqpt_enable_world_owner` 参数，支持 correctness 对照测试 OW0 路径。
+
+**语义与回退**：
+- 新路径默认关闭（default-off），旧 FQPT ring+lock 路径完整保留；
+- soundness 不变：`UNKNOWN` 不删值，`unknown=0` 时仍要求与 Stage2 对齐。
+
 ## 2026-02-17
 
 ### FQ-PT：分步实施落地（D0/P0/P1/P2）

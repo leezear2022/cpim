@@ -3296,7 +3296,14 @@ __device__ inline int FQPTGetVarSubscriptionDegree(
   return max(0, end - start);
 }
 
-__device__ inline void FQPTPushVarNeighborsToFrontierTwoLevelWarp(
+__device__ inline int FQPTWarpReduceSumInt(int value, u32 full_mask) {
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    value += __shfl_down_sync(full_mask, value, offset);
+  }
+  return value;
+}
+
+__device__ inline int FQPTPushVarNeighborsToFrontierTwoLevelWarp(
     const GModelData& model,
     WorldWorkspace* ws,
     int var,
@@ -3304,12 +3311,13 @@ __device__ inline void FQPTPushVarNeighborsToFrontierTwoLevelWarp(
     int l1_words,
     int lane_id,
     u32 full_mask) {
-  if (var < 0 || var >= model.num_vars) return;
+  if (var < 0 || var >= model.num_vars) return 0;
   const int start = model.d_subscription_offset[var];
   const int end = model.d_subscription_offset[var + 1];
   const int degree = end - start;
-  if (degree <= 0) return;
+  if (degree <= 0) return 0;
   const int rounds = (degree + 31) / 32;
+  int local_leader_writes = 0;
 
   for (int r = 0; r < rounds; ++r) {
     const int idx = start + (r << 5) + lane_id;
@@ -3354,6 +3362,7 @@ __device__ inline void FQPTPushVarNeighborsToFrontierTwoLevelWarp(
             if (l1_word >= 0 && l1_word < l1_words) {
               ws->frontier_B[l1_word] |= (1u << (leader_word & 31));
             }
+            ++local_leader_writes;
           }
         }
       }
@@ -3361,6 +3370,115 @@ __device__ inline void FQPTPushVarNeighborsToFrontierTwoLevelWarp(
       pending &= ~same_word_mask;
     }
   }
+  const int total_leader_writes = FQPTWarpReduceSumInt(local_leader_writes, full_mask);
+  return __shfl_sync(full_mask, total_leader_writes, 0);
+}
+
+__device__ inline int FQPTPushVarNeighborsToFrontierTwoLevelWarpMatchAny(
+    const GModelData& model,
+    WorldWorkspace* ws,
+    int var,
+    int bitmap_words,
+    int l1_words,
+    int lane_id,
+    u32 full_mask) {
+  if (var < 0 || var >= model.num_vars) return 0;
+  const int start = model.d_subscription_offset[var];
+  const int end = model.d_subscription_offset[var + 1];
+  const int degree = end - start;
+  if (degree <= 0) return 0;
+  const int rounds = (degree + 31) / 32;
+  int local_leader_writes = 0;
+
+  for (int r = 0; r < rounds; ++r) {
+    const int idx = start + (r << 5) + lane_id;
+    int word = -1;
+    u32 cid_bit = 0u;
+    bool valid = false;
+
+    if (idx < end) {
+      const int cid = model.d_subscription[idx].z;
+      if (cid >= 0 && cid < model.num_constraints) {
+        const int cid_word = cid >> 5;
+        if (cid_word >= 0 && cid_word < bitmap_words) {
+          word = cid_word;
+          cid_bit = (1u << (cid & 31));
+          valid = true;
+        }
+      }
+    }
+
+    const u32 group_mask = valid ? __match_any_sync(full_mask, word) : 0u;
+    if (!valid || group_mask == 0u) {
+      continue;
+    }
+
+    const int leader_lane = __ffs(static_cast<int>(group_mask)) - 1;
+    const u32 merged_bits = __reduce_or_sync(group_mask, cid_bit);
+    if (lane_id == leader_lane && merged_bits != 0u) {
+      const u32 old_word = ws->frontier_A[word];
+      const u32 new_word = old_word | merged_bits;
+      if (new_word != old_word) {
+        ws->frontier_A[word] = new_word;
+        const int l1_word = word >> 5;
+        if (l1_word >= 0 && l1_word < l1_words) {
+          ws->frontier_B[l1_word] |= (1u << (word & 31));
+        }
+        ++local_leader_writes;
+      }
+    }
+  }
+
+  const int total_leader_writes = FQPTWarpReduceSumInt(local_leader_writes, full_mask);
+  return __shfl_sync(full_mask, total_leader_writes, 0);
+}
+
+__device__ inline int FQPTPushVarNeighborsToFrontierTwoLevelDispatch(
+    const GModelData& model,
+    WorldWorkspace* ws,
+    int var,
+    int bitmap_words,
+    int l1_words,
+    int lane_id,
+    u32 full_mask,
+    bool enable_ow1_frontier_scatter,
+    int ow1_scatter_mode,
+    bool ow1_force_scatter,
+    int ow1_min_degree,
+    unsigned long long* local_scatter_calls,
+    unsigned long long* local_fallback_calls) {
+  if (var < 0 || var >= model.num_vars) return 0;
+
+  bool use_scatter = false;
+  if (enable_ow1_frontier_scatter && ow1_scatter_mode != 0) {
+    if (ow1_force_scatter) {
+      use_scatter = true;
+    } else {
+      const int degree = FQPTGetVarSubscriptionDegree(model, var);
+      use_scatter = (degree >= ow1_min_degree);
+    }
+  }
+
+  if (use_scatter) {
+    if (lane_id == 0 && local_scatter_calls != nullptr) {
+      ++(*local_scatter_calls);
+    }
+    if (ow1_scatter_mode == 2) {
+      return FQPTPushVarNeighborsToFrontierTwoLevelWarpMatchAny(
+          model, ws, var, bitmap_words, l1_words, lane_id, full_mask);
+    }
+    return FQPTPushVarNeighborsToFrontierTwoLevelWarp(
+        model, ws, var, bitmap_words, l1_words, lane_id, full_mask);
+  }
+
+  if (lane_id == 0) {
+    if (local_fallback_calls != nullptr) {
+      ++(*local_fallback_calls);
+    }
+    FQPTPushVarNeighborsToFrontierTwoLevel(
+        model, ws, var, bitmap_words, l1_words);
+  }
+  return 0;
 }
 
 __device__ inline bool FQPTPopFrontierCidTwoLevel(
@@ -3439,12 +3557,17 @@ __global__ void FQPTOwnerFrontierKernel(
   const bool enable_ow1_frontier_scatter =
       (control->enable_ow1_frontier_scatter != 0);
   const int ow1_min_degree = max(1, control->ow1_min_degree);
+  const int ow1_scatter_mode = max(0, min(2, control->ow1_scatter_mode));
+  const bool ow1_force_scatter = (control->ow1_force_scatter != 0);
 
   unsigned long long local_checks = 0ULL;
   unsigned long long local_deletions = 0ULL;
   unsigned long long local_processed = 0ULL;
   unsigned long long local_frontier_pops = 0ULL;
   unsigned long long local_frontier_scan_steps = 0ULL;
+  unsigned long long local_ow1_scatter_calls = 0ULL;
+  unsigned long long local_ow1_fallback_calls = 0ULL;
+  unsigned long long local_ow1_word_leader_writes = 0ULL;
 
   for (int world = blockIdx.x + warp_id * gridDim.x;
        world < control->num_worlds;
@@ -3520,13 +3643,22 @@ __global__ void FQPTOwnerFrontierKernel(
       continue;
     }
     if (seed_var >= 0) {
-      const int seed_degree = FQPTGetVarSubscriptionDegree(model, seed_var);
-      if (enable_ow1_frontier_scatter && seed_degree >= ow1_min_degree) {
-        FQPTPushVarNeighborsToFrontierTwoLevelWarp(
-            model, ws, seed_var, bitmap_words, l1_words, lane_id, full_mask);
-      } else if (lane_id == 0) {
-        FQPTPushVarNeighborsToFrontierTwoLevel(
-            model, ws, seed_var, bitmap_words, l1_words);
+      const int writes = FQPTPushVarNeighborsToFrontierTwoLevelDispatch(
+          model,
+          ws,
+          seed_var,
+          bitmap_words,
+          l1_words,
+          lane_id,
+          full_mask,
+          enable_ow1_frontier_scatter,
+          ow1_scatter_mode,
+          ow1_force_scatter,
+          ow1_min_degree,
+          &local_ow1_scatter_calls,
+          &local_ow1_fallback_calls);
+      if (lane_id == 0) {
+        local_ow1_word_leader_writes += static_cast<unsigned long long>(writes);
       }
     }
     __syncwarp(full_mask);
@@ -3585,23 +3717,41 @@ __global__ void FQPTOwnerFrontierKernel(
       push_var_y = __shfl_sync(full_mask, push_var_y, 0);
 
       if (push_var_x >= 0) {
-        const int degree_x = FQPTGetVarSubscriptionDegree(model, push_var_x);
-        if (enable_ow1_frontier_scatter && degree_x >= ow1_min_degree) {
-          FQPTPushVarNeighborsToFrontierTwoLevelWarp(
-              model, ws, push_var_x, bitmap_words, l1_words, lane_id, full_mask);
-        } else if (lane_id == 0) {
-          FQPTPushVarNeighborsToFrontierTwoLevel(
-              model, ws, push_var_x, bitmap_words, l1_words);
+        const int writes_x = FQPTPushVarNeighborsToFrontierTwoLevelDispatch(
+            model,
+            ws,
+            push_var_x,
+            bitmap_words,
+            l1_words,
+            lane_id,
+            full_mask,
+            enable_ow1_frontier_scatter,
+            ow1_scatter_mode,
+            ow1_force_scatter,
+            ow1_min_degree,
+            &local_ow1_scatter_calls,
+            &local_ow1_fallback_calls);
+        if (lane_id == 0) {
+          local_ow1_word_leader_writes += static_cast<unsigned long long>(writes_x);
         }
       }
       if (push_var_y >= 0) {
-        const int degree_y = FQPTGetVarSubscriptionDegree(model, push_var_y);
-        if (enable_ow1_frontier_scatter && degree_y >= ow1_min_degree) {
-          FQPTPushVarNeighborsToFrontierTwoLevelWarp(
-              model, ws, push_var_y, bitmap_words, l1_words, lane_id, full_mask);
-        } else if (lane_id == 0) {
-          FQPTPushVarNeighborsToFrontierTwoLevel(
-              model, ws, push_var_y, bitmap_words, l1_words);
+        const int writes_y = FQPTPushVarNeighborsToFrontierTwoLevelDispatch(
+            model,
+            ws,
+            push_var_y,
+            bitmap_words,
+            l1_words,
+            lane_id,
+            full_mask,
+            enable_ow1_frontier_scatter,
+            ow1_scatter_mode,
+            ow1_force_scatter,
+            ow1_min_degree,
+            &local_ow1_scatter_calls,
+            &local_ow1_fallback_calls);
+        if (lane_id == 0) {
+          local_ow1_word_leader_writes += static_cast<unsigned long long>(writes_y);
         }
       }
       __syncwarp(full_mask);
@@ -3628,6 +3778,15 @@ __global__ void FQPTOwnerFrontierKernel(
     }
     if (control->frontier_scan_steps != nullptr) {
       atomicAdd(control->frontier_scan_steps, local_frontier_scan_steps);
+    }
+    if (control->ow1_scatter_calls != nullptr) {
+      atomicAdd(control->ow1_scatter_calls, local_ow1_scatter_calls);
+    }
+    if (control->ow1_fallback_calls != nullptr) {
+      atomicAdd(control->ow1_fallback_calls, local_ow1_fallback_calls);
+    }
+    if (control->ow1_word_leader_writes != nullptr) {
+      atomicAdd(control->ow1_word_leader_writes, local_ow1_word_leader_writes);
     }
   }
 }

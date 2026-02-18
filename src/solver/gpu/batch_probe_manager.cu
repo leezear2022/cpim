@@ -3026,9 +3026,11 @@ void FQPTBaselineManager::LaunchKernel(int num_worlds) {
   CHECK(err == cudaSuccess) << "cudaDeviceSynchronize failed before FQPT kernel: "
                             << cudaGetErrorString(err);
 
-  // Commit A 仅接入控制面字段与内存策略，行为仍保持 legacy kernel；
-  // OWF kernel 切换在后续内核提交中启用，确保本提交可独立编译通过。
-  LaunchFQPTBaselineKernelWrapper(model_->GetModelData(), d_control_, num_blocks_);
+  if (enable_world_owner_) {
+    LaunchFQPTOwnerFrontierKernelWrapper(model_->GetModelData(), d_control_, num_blocks_);
+  } else {
+    LaunchFQPTBaselineKernelWrapper(model_->GetModelData(), d_control_, num_blocks_);
+  }
 
   err = cudaDeviceSynchronize();
   CHECK(err == cudaSuccess) << "FQPT kernel failed: " << cudaGetErrorString(err);

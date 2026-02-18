@@ -3253,6 +3253,271 @@ __global__ void FQPTBaselineKernel(
   }
 }
 
+__device__ inline void FQPTSetFrontierCidTwoLevel(
+    WorldWorkspace* ws,
+    int cid,
+    int bitmap_words,
+    int l1_words) {
+  if (cid < 0) return;
+  const int word = cid >> 5;
+  if (word < 0 || word >= bitmap_words) return;
+  const u32 cid_bit = (1u << (cid & 31));
+  const u32 old = ws->frontier_A[word];
+  if ((old & cid_bit) != 0u) return;
+  ws->frontier_A[word] = old | cid_bit;
+
+  const int l1_word = word >> 5;
+  if (l1_word < 0 || l1_word >= l1_words) return;
+  ws->frontier_B[l1_word] |= (1u << (word & 31));
+}
+
+__device__ inline void FQPTPushVarNeighborsToFrontierTwoLevel(
+    const GModelData& model,
+    WorldWorkspace* ws,
+    int var,
+    int bitmap_words,
+    int l1_words) {
+  if (var < 0 || var >= model.num_vars) return;
+  const int start = model.d_subscription_offset[var];
+  const int end = model.d_subscription_offset[var + 1];
+  for (int i = start; i < end; ++i) {
+    const int cid = model.d_subscription[i].z;
+    if (cid < 0 || cid >= model.num_constraints) continue;
+    FQPTSetFrontierCidTwoLevel(ws, cid, bitmap_words, l1_words);
+  }
+}
+
+__device__ inline bool FQPTPopFrontierCidTwoLevel(
+    WorldWorkspace* ws,
+    int bitmap_words,
+    int l1_words,
+    int* cursor_l1,
+    int* cid_out,
+    int* scan_steps) {
+  if (cid_out == nullptr || cursor_l1 == nullptr || l1_words <= 0) {
+    return false;
+  }
+
+  int steps = 0;
+  int start = *cursor_l1;
+  if (start < 0 || start >= l1_words) start = 0;
+
+  for (int s = 0; s < l1_words; ++s) {
+    int l1_idx = start + s;
+    if (l1_idx >= l1_words) l1_idx -= l1_words;
+    ++steps;
+
+    u32 group = ws->frontier_B[l1_idx];
+    if (group == 0u) continue;
+
+    while (group != 0u) {
+      const int l0_bit = __ffs(static_cast<int>(group)) - 1;
+      const int word = (l1_idx << 5) + l0_bit;
+      if (word < 0 || word >= bitmap_words) {
+        group &= ~(1u << l0_bit);
+        ws->frontier_B[l1_idx] = group;
+        continue;
+      }
+
+      u32 cid_word = ws->frontier_A[word];
+      if (cid_word == 0u) {
+        group &= ~(1u << l0_bit);
+        ws->frontier_B[l1_idx] = group;
+        continue;
+      }
+
+      const int cid_bit = __ffs(static_cast<int>(cid_word)) - 1;
+      cid_word &= ~(1u << cid_bit);
+      ws->frontier_A[word] = cid_word;
+      if (cid_word == 0u) {
+        group &= ~(1u << l0_bit);
+        ws->frontier_B[l1_idx] = group;
+      }
+
+      *cid_out = (word << 5) + cid_bit;
+      *cursor_l1 = l1_idx;
+      if (scan_steps != nullptr) *scan_steps = steps;
+      return true;
+    }
+  }
+
+  if (scan_steps != nullptr) *scan_steps = steps;
+  *cursor_l1 = (start + 1 < l1_words) ? (start + 1) : 0;
+  return false;
+}
+
+__global__ void FQPTOwnerFrontierKernel(
+    const GModelData model,
+    FQPTControl* control) {
+  extern __shared__ u32 check_shared[];
+
+  const int lane_id = threadIdx.x & 31;
+  const int warp_id = threadIdx.x >> 5;
+  const int block_warps = max(1, blockDim.x / 32);
+  const int total_dom_words = model.num_vars * model.bit_dom_int_size;
+  const int bitmap_words = (model.num_constraints + 31) / 32;
+  const int l1_words = max(1, (bitmap_words + 31) / 32);
+  const int world_stride = block_warps * gridDim.x;
+  const int check_words_per_warp = 2 * model.bit_dom_int_size + 16;
+  const u32 full_mask = 0xFFFFFFFFu;
+
+  unsigned long long local_checks = 0ULL;
+  unsigned long long local_deletions = 0ULL;
+  unsigned long long local_processed = 0ULL;
+  unsigned long long local_frontier_pops = 0ULL;
+  unsigned long long local_frontier_scan_steps = 0ULL;
+
+  for (int world = blockIdx.x + warp_id * gridDim.x;
+       world < control->num_worlds;
+       world += world_stride) {
+    WorldWorkspace* ws = &control->workspaces[world];
+    const ProbeTask probe = control->world_probes[world];
+
+    if (lane_id == 0) {
+      ws->inconsistent_flag = 0;
+      ws->scanner_index = 0;
+      ws->deletions = 0;
+      ws->iterations = 0;
+      ws->frontier_nonempty = 0;
+      control->world_results[world] = true;
+      control->world_status[world] = static_cast<int>(ProbeStatus::kOK);
+    }
+
+    for (int idx = lane_id; idx < total_dom_words; idx += 32) {
+      ws->bitDom[idx] = control->domain_snapshot[idx];
+    }
+    for (int v = lane_id; v < model.num_vars; v += 32) {
+      ws->d_cur_dom_size[v] = control->dom_size_snapshot[v];
+    }
+    for (int w = lane_id; w < bitmap_words; w += 32) {
+      ws->frontier_A[w] = 0u;
+    }
+    for (int w = lane_id; w < l1_words; w += 32) {
+      ws->frontier_B[w] = 0u;
+    }
+    __syncwarp(full_mask);
+
+    int world_ok = 1;
+    if (lane_id == 0) {
+      const int var = probe.var_id;
+      const int value = probe.value;
+      if (var < 0 || var >= model.num_vars ||
+          value < 0 || value >= model.max_dom_size) {
+        ws->inconsistent_flag = 1;
+        control->world_results[world] = false;
+        control->world_status[world] = static_cast<int>(ProbeStatus::kDWO);
+        world_ok = 0;
+      } else {
+        const int word_idx = value / 32;
+        const int bit_idx = value % 32;
+        if (word_idx < 0 || word_idx >= model.bit_dom_int_size) {
+          ws->inconsistent_flag = 1;
+          control->world_results[world] = false;
+          control->world_status[world] = static_cast<int>(ProbeStatus::kDWO);
+          world_ok = 0;
+        } else {
+          const int dom_base = var * model.bit_dom_int_size;
+          const u32 old_word = ws->bitDom[dom_base + word_idx];
+          if ((old_word & (1u << bit_idx)) == 0u) {
+            ws->inconsistent_flag = 1;
+            control->world_results[world] = false;
+            control->world_status[world] = static_cast<int>(ProbeStatus::kDWO);
+            world_ok = 0;
+          } else {
+            for (int w = 0; w < model.bit_dom_int_size; ++w) {
+              ws->bitDom[dom_base + w] = 0u;
+            }
+            ws->bitDom[dom_base + word_idx] = (1u << bit_idx);
+            ws->d_cur_dom_size[var] = 1;
+            FQPTPushVarNeighborsToFrontierTwoLevel(
+                model, ws, var, bitmap_words, l1_words);
+          }
+        }
+      }
+    }
+    world_ok = __shfl_sync(full_mask, world_ok, 0);
+    if (!world_ok) {
+      continue;
+    }
+
+    int cursor_l1 = (world + 17) % l1_words;
+    while (true) {
+      int cid = -1;
+      int scan_steps = 0;
+      int has_work = 0;
+      if (lane_id == 0) {
+        has_work = FQPTPopFrontierCidTwoLevel(
+            ws, bitmap_words, l1_words, &cursor_l1, &cid, &scan_steps) ? 1 : 0;
+      }
+      has_work = __shfl_sync(full_mask, has_work, 0);
+      cid = __shfl_sync(full_mask, cid, 0);
+      scan_steps = __shfl_sync(full_mask, scan_steps, 0);
+
+      if (lane_id == 0) {
+        local_frontier_scan_steps += static_cast<unsigned long long>(scan_steps);
+      }
+      if (!has_work) {
+        break;
+      }
+      if (lane_id == 0) {
+        ++local_frontier_pops;
+      }
+
+      u32* warp_scratch = check_shared + warp_id * check_words_per_warp;
+      const PropagateResult r =
+          ExecuteConstraintCheck_BpC_Workspace_WarpPerWorld(
+              cid, model, ws, warp_scratch);
+
+      if (lane_id == 0) {
+        ++local_checks;
+        ++local_processed;
+        if (r.deletions > 0) {
+          local_deletions += static_cast<unsigned long long>(r.deletions);
+        }
+        if (r.inconsistent) {
+          ws->inconsistent_flag = 1;
+          control->world_results[world] = false;
+          control->world_status[world] = static_cast<int>(ProbeStatus::kDWO);
+        } else if (control->world_status[world] == static_cast<int>(ProbeStatus::kOK)) {
+          const int2 scope = model.constraint_scopes[cid];
+          if (r.x_changed) {
+            FQPTPushVarNeighborsToFrontierTwoLevel(
+                model, ws, scope.x, bitmap_words, l1_words);
+          }
+          if (r.y_changed) {
+            FQPTPushVarNeighborsToFrontierTwoLevel(
+                model, ws, scope.y, bitmap_words, l1_words);
+          }
+        }
+      }
+      __syncwarp(full_mask);
+
+      const int world_status = __shfl_sync(full_mask, control->world_status[world], 0);
+      if (world_status != static_cast<int>(ProbeStatus::kOK)) {
+        break;
+      }
+    }
+  }
+
+  if (lane_id == 0) {
+    if (control->processed_tasks != nullptr) {
+      atomicAdd(control->processed_tasks, local_processed);
+    }
+    if (control->total_constraint_checks != nullptr) {
+      atomicAdd(control->total_constraint_checks, local_checks);
+    }
+    if (control->total_deletions != nullptr) {
+      atomicAdd(control->total_deletions, local_deletions);
+    }
+    if (control->frontier_pop_count != nullptr) {
+      atomicAdd(control->frontier_pop_count, local_frontier_pops);
+    }
+    if (control->frontier_scan_steps != nullptr) {
+      atomicAdd(control->frontier_scan_steps, local_frontier_scan_steps);
+    }
+  }
+}
+
 }  // namespace
 
 // ============================================================================
@@ -3662,6 +3927,34 @@ void LaunchFQPTBaselineKernelWrapper(
                << cudaGetErrorString(err);
     throw std::runtime_error(
         std::string("Failed to launch FQPTBaselineKernel: ") +
+        cudaGetErrorString(err));
+  }
+}
+
+void LaunchFQPTOwnerFrontierKernelWrapper(
+    GModelData model_data,
+    FQPTControl* control,
+    int num_blocks) {
+  if (control == nullptr || control->num_worlds <= 0) return;
+
+  const int block_size = 256;
+  const int block_warps = std::max(1, block_size / 32);
+  const int max_useful_blocks =
+      std::max(1, (control->num_worlds + block_warps - 1) / block_warps);
+  const int effective_blocks = std::max(1, std::min(num_blocks, max_useful_blocks));
+  const int check_words_per_warp = 2 * model_data.bit_dom_int_size + 16;
+  const int shared_mem_bytes =
+      check_words_per_warp * block_warps * static_cast<int>(sizeof(u32));
+
+  FQPTOwnerFrontierKernel<<<dim3(effective_blocks), dim3(block_size), shared_mem_bytes>>>(
+      model_data, control);
+
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    LOG(ERROR) << "Failed to launch FQPTOwnerFrontierKernel: "
+               << cudaGetErrorString(err);
+    throw std::runtime_error(
+        std::string("Failed to launch FQPTOwnerFrontierKernel: ") +
         cudaGetErrorString(err));
   }
 }

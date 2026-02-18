@@ -1073,6 +1073,8 @@ struct FQPTControl {
   int group_warps_per_cta;               // 分组检查最多使用的 warp 数
   int group_degrade_threshold;           // max_bucket_size<=threshold 时退化到逐任务
   int enable_world_owner;                // 1=启用 Owner-World + Frontier 路径
+  int enable_ow1_frontier_scatter;       // 1=启用 OW1 邻接写回 warp 协作
+  int ow1_min_degree;                    // OW1 触发最小 degree（低于阈值走 OW0）
 
   // ========== 可选统计 ==========
   unsigned long long* total_constraint_checks;  // 约束检查次数
@@ -1113,6 +1115,8 @@ struct FQPTControl {
         group_warps_per_cta(4),
         group_degrade_threshold(1),
         enable_world_owner(0),
+        enable_ow1_frontier_scatter(0),
+        ow1_min_degree(32),
         total_constraint_checks(nullptr),
         total_deletions(nullptr),
         stale_drop_count(nullptr),
@@ -1186,6 +1190,10 @@ class FQPTBaselineManager {
     group_degrade_threshold_ = std::max(1, threshold);
   }
   void SetEnableWorldOwner(bool enabled);
+  void SetEnableOW1FrontierScatter(bool enabled) {
+    enable_ow1_frontier_scatter_ = enabled;
+  }
+  void SetOW1MinDegree(int degree) { ow1_min_degree_ = std::max(1, degree); }
 
   int GetNumBlocks() const { return num_blocks_; }
   const FQPTStatistics& GetLastStatistics() const { return last_stats_; }
@@ -1223,6 +1231,8 @@ class FQPTBaselineManager {
   int group_warps_per_cta_ = 4;
   int group_degrade_threshold_ = 1;
   bool enable_world_owner_ = false;
+  bool enable_ow1_frontier_scatter_ = false;
+  int ow1_min_degree_ = 32;
   bool stats_enabled_ = true;
 
   // ========== Device 端内存（统一内存）==========

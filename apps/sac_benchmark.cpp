@@ -100,6 +100,10 @@ DEFINE_int32(fqpt_group_degrade_threshold, 1,
              "FQ-PT: degrade to single-task when max bucket <= threshold");
 DEFINE_bool(fqpt_enable_world_owner, false,
             "FQ-PT: enable Owner-World + two-level frontier path");
+DEFINE_bool(fqpt_enable_ow1_frontier_scatter, false,
+            "FQ-PT OW1: enable warp-cooperative frontier neighbor scatter");
+DEFINE_int32(fqpt_ow1_min_degree, 32,
+             "FQ-PT OW1: min var degree to enable warp scatter");
 
 namespace cpim {
 
@@ -139,6 +143,8 @@ void ConfigureFQPTManager(FQPTBaselineManager& manager) {
     manager.SetGroupWarpsPerCta(FLAGS_fqpt_group_warps);
     manager.SetGroupDegradeThreshold(FLAGS_fqpt_group_degrade_threshold);
     manager.SetEnableWorldOwner(FLAGS_fqpt_enable_world_owner);
+    manager.SetEnableOW1FrontierScatter(FLAGS_fqpt_enable_ow1_frontier_scatter);
+    manager.SetOW1MinDegree(FLAGS_fqpt_ow1_min_degree);
 }
 
 // ============================================================================
@@ -637,7 +643,12 @@ BenchmarkResult RunFQPTBenchmark(GModel* gmodel,
                                  const std::vector<ProbeTask>& tasks,
                                  int warmup, int iterations) {
     BenchmarkResult result;
-    result.mode_name = FLAGS_fqpt_enable_world_owner ? "FQ-PT(OWF)" : "FQ-PT";
+    if (FLAGS_fqpt_enable_world_owner) {
+        result.mode_name = FLAGS_fqpt_enable_ow1_frontier_scatter ? "FQ-PT(OWF+OW1)"
+                                                                   : "FQ-PT(OWF)";
+    } else {
+        result.mode_name = "FQ-PT";
+    }
     result.num_probes = tasks.size();
     result.valid = false;
 

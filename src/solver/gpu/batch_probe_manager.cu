@@ -3000,6 +3000,9 @@ void FQPTBaselineManager::LaunchKernel(int num_worlds) {
   d_control_->group_warps_per_cta = group_warps_per_cta_;
   d_control_->group_degrade_threshold = group_degrade_threshold_;
   d_control_->enable_world_owner = enable_world_owner_ ? 1 : 0;
+  d_control_->enable_ow1_frontier_scatter =
+      (enable_world_owner_ && enable_ow1_frontier_scatter_) ? 1 : 0;
+  d_control_->ow1_min_degree = ow1_min_degree_;
 
   d_control_->total_constraint_checks =
       stats_enabled_ ? d_total_constraint_checks_ : nullptr;

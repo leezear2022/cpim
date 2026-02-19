@@ -2,6 +2,45 @@
 
 ## 2026-02-19
 
+### FQ-PT：OW3b O3B-B 严格 CTA 对齐执行（default-off）
+
+**目标**：在 O3B-A 控制面基础上，落地真实 micro-batch 执行逻辑（`sel_cid` 选桶、
+`min_sel` 退化、`max_rounds` 止损），并补齐 O3B 统计链路。
+
+**核心改动**：
+- `src/solver/gpu/GModel.cu`
+  - `FQPTOwnerFrontierKernel(...)` 新增双路径：
+    - `enable_cid_microbatch=0`：保留原 OW2/OW3a warp 独立路径；
+    - `enable_cid_microbatch=1`：启用严格 CTA lockstep micro-batch 路径。
+  - micro-batch 路径要点：
+    - CTA 轮次内按 `W=min(block_warps, microbatch_warps)` 做 `O(W^2)` 选 `sel_cid`；
+    - `sel_count < microbatch_min_sel` 走 degrade（各 warp 执行自己的 candidate）；
+    - `sel_count >= microbatch_min_sel` 走 aligned（仅命中 warp 执行，未命中 parked 到 `pending_cid`）；
+    - `microbatch_max_rounds > 0` 且超限时触发 round-cap fallback。
+  - O3B 统计在 kernel 内累计并写回：
+    - `microbatch_aligned_rounds`
+    - `microbatch_degrade_rounds`
+    - `microbatch_parked_warps`
+    - `microbatch_round_cap_fallbacks`
+- `src/solver/gpu/batch_probe_manager.cu`
+  - `LaunchKernel()` 采用“micro-batch 优先”：
+    - `effective_microbatch = owner && microbatch`
+    - `effective_world_stealing = owner && stealing && !effective_microbatch`
+  - 同时开启 `stealing + microbatch` 时打印一次 warning，并自动禁用 stealing。
+  - `CollectResults()` 新增派生统计：
+    - `microbatch_align_ratio`
+    - `microbatch_parked_per_round`
+- `apps/sac_benchmark.cpp`
+  - 输出增加：
+    - `mb_align` / `mb_deg` / `mb_park` / `mb_cap` / `mb_ar`
+  - 模式名补充 OW3b 后缀（如 `FQ-PT(OWF+OW3b)` / `FQ-PT(OWF+OW1m2+OW3b)`）。
+
+**语义与回退**：
+- default-off：需显式 `--fqpt_enable_cid_microbatch=1` 才启用；
+- Stage2 路径不变；
+- `owner=0 && microbatch=1` 自动忽略；
+- `UNKNOWN` 语义保持不变（不引入额外删值路径）。
+
 ### FQ-PT：OW3b O3B-A 控制开关与框架接线（default-off）
 
 **目标**：完成 OW3b 的控制面与 kernel 占位框架，保持现有求解语义不变，为 O3B-B

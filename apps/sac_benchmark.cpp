@@ -463,6 +463,11 @@ struct BenchmarkResult {
     unsigned long long microbatch_sel_ge2_rounds = 0;
     unsigned long long microbatch_sel_sum = 0;
     double avg_sel_count = 0.0;
+    unsigned long long microbatch_aligned_rounds = 0;
+    unsigned long long microbatch_degrade_rounds = 0;
+    unsigned long long microbatch_parked_warps = 0;
+    unsigned long long microbatch_round_cap_fallbacks = 0;
+    double microbatch_align_ratio = 0.0;
 };
 
 void PrintResult(const BenchmarkResult& result) {
@@ -491,6 +496,11 @@ void PrintResult(const BenchmarkResult& result) {
     std::cout << "  mb_ge2=" << result.microbatch_sel_ge2_rounds;
     std::cout << "  mb_sel=" << result.microbatch_sel_sum;
     std::cout << "  mb_avg=" << std::setprecision(2) << result.avg_sel_count;
+    std::cout << "  mb_align=" << result.microbatch_aligned_rounds;
+    std::cout << "  mb_deg=" << result.microbatch_degrade_rounds;
+    std::cout << "  mb_park=" << result.microbatch_parked_warps;
+    std::cout << "  mb_cap=" << result.microbatch_round_cap_fallbacks;
+    std::cout << "  mb_ar=" << std::setprecision(2) << result.microbatch_align_ratio;
     std::cout << std::endl;
 }
 
@@ -685,11 +695,21 @@ BenchmarkResult RunFQPTBenchmark(GModel* gmodel,
                                  int warmup, int iterations) {
     BenchmarkResult result;
     if (FLAGS_fqpt_enable_world_owner) {
-        if (FLAGS_fqpt_enable_ow1_frontier_scatter) {
-            result.mode_name = FLAGS_fqpt_ow1_scatter_mode == 2 ? "FQ-PT(OWF+OW1m2)"
-                                                                 : "FQ-PT(OWF+OW1)";
+        if (FLAGS_fqpt_enable_cid_microbatch) {
+            if (FLAGS_fqpt_enable_ow1_frontier_scatter) {
+                result.mode_name = FLAGS_fqpt_ow1_scatter_mode == 2
+                                       ? "FQ-PT(OWF+OW1m2+OW3b)"
+                                       : "FQ-PT(OWF+OW1+OW3b)";
+            } else {
+                result.mode_name = "FQ-PT(OWF+OW3b)";
+            }
         } else {
-            result.mode_name = "FQ-PT(OWF)";
+            if (FLAGS_fqpt_enable_ow1_frontier_scatter) {
+                result.mode_name = FLAGS_fqpt_ow1_scatter_mode == 2 ? "FQ-PT(OWF+OW1m2)"
+                                                                     : "FQ-PT(OWF+OW1)";
+            } else {
+                result.mode_name = "FQ-PT(OWF)";
+            }
         }
     } else {
         result.mode_name = "FQ-PT";
@@ -730,6 +750,11 @@ BenchmarkResult RunFQPTBenchmark(GModel* gmodel,
     unsigned long long total_microbatch_sel_ge2_rounds = 0;
     unsigned long long total_microbatch_sel_sum = 0;
     double total_avg_sel_count = 0.0;
+    unsigned long long total_microbatch_aligned_rounds = 0;
+    unsigned long long total_microbatch_degrade_rounds = 0;
+    unsigned long long total_microbatch_parked_warps = 0;
+    unsigned long long total_microbatch_round_cap_fallbacks = 0;
+    double total_microbatch_align_ratio = 0.0;
 
     for (int iter = 0; iter < iterations; ++iter) {
         for (const auto& t : tasks) {
@@ -763,6 +788,11 @@ BenchmarkResult RunFQPTBenchmark(GModel* gmodel,
         total_microbatch_sel_ge2_rounds += st.microbatch_sel_ge2_rounds;
         total_microbatch_sel_sum += st.microbatch_sel_sum;
         total_avg_sel_count += st.avg_sel_count;
+        total_microbatch_aligned_rounds += st.microbatch_aligned_rounds;
+        total_microbatch_degrade_rounds += st.microbatch_degrade_rounds;
+        total_microbatch_parked_warps += st.microbatch_parked_warps;
+        total_microbatch_round_cap_fallbacks += st.microbatch_round_cap_fallbacks;
+        total_microbatch_align_ratio += st.microbatch_align_ratio;
         manager.Clear();
     }
 
@@ -794,6 +824,16 @@ BenchmarkResult RunFQPTBenchmark(GModel* gmodel,
         total_microbatch_sel_ge2_rounds / std::max(1, iterations);
     result.microbatch_sel_sum = total_microbatch_sel_sum / std::max(1, iterations);
     result.avg_sel_count = total_avg_sel_count / std::max(1, iterations);
+    result.microbatch_aligned_rounds =
+        total_microbatch_aligned_rounds / std::max(1, iterations);
+    result.microbatch_degrade_rounds =
+        total_microbatch_degrade_rounds / std::max(1, iterations);
+    result.microbatch_parked_warps =
+        total_microbatch_parked_warps / std::max(1, iterations);
+    result.microbatch_round_cap_fallbacks =
+        total_microbatch_round_cap_fallbacks / std::max(1, iterations);
+    result.microbatch_align_ratio =
+        total_microbatch_align_ratio / std::max(1, iterations);
     result.probes_per_sec = result.num_probes * 1000.0 / result.avg_time_ms;
     result.valid = true;
     return result;

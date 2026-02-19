@@ -52,6 +52,43 @@
 - 其余场景自动回退 OW0 静态映射；
 - 不引入 `world_lock`，保持 Owner-World 单写者约束与 soundness。
 
+### FQ-PT：OW3a O3A-A 统计字段与输出接线（default-off）
+
+**目标**：先完成 OW3a 命中率统计的控制字段与输出通路接线；本阶段不实现 kernel 采样逻辑，
+确保后续 O3A-B 仅需补充设备端计数更新。
+
+**核心改动**：
+- `include/solver/gpu/batch_probe_manager.h`
+  - `FQPTControl` 新增：
+    - `enable_cid_microbatch_profile`
+    - `microbatch_profile_interval`
+    - `microbatch_rounds` / `microbatch_sel_ge2_rounds` / `microbatch_sel_sum`
+  - `FQPTStatistics` 新增：
+    - `microbatch_rounds`
+    - `microbatch_sel_ge2_rounds`
+    - `microbatch_sel_sum`
+    - `avg_sel_count`
+  - `FQPTBaselineManager` 新增 setter：
+    - `SetEnableCidMicrobatchProfile(bool)`
+    - `SetMicrobatchProfileInterval(int)`
+- `src/solver/gpu/batch_probe_manager.cu`
+  - 新增三项 device 计数内存分配/释放/清零
+  - `LaunchKernel()` 下发 OW3a 控制字段与统计指针
+  - `CollectResults()` 汇总 `microbatch_*` 并计算 `avg_sel_count`
+- `apps/sac_benchmark.cpp`
+  - 新增 CLI：
+    - `--fqpt_enable_cid_microbatch_profile`
+    - `--fqpt_microbatch_profile_interval`
+  - benchmark 结果新增并打印：
+    - `mb_r` / `mb_ge2` / `mb_sel` / `mb_avg`
+- `tests/cpp/test_fqpt_baseline.cpp`
+  - 新增上述 OW3a flag 并接入 manager
+
+**语义与回退**：
+- 本阶段不改 kernel 执行路径，统计默认值保持 0；
+- 继续保持 default-off，可通过 flag 一键关闭；
+- O3A-B 将在此基础上补充实际采样更新逻辑。
+
 ## 2026-02-18
 
 ### FQ-PT：OW1 实验迭代（mode=2 + 可观测化，允许退化）

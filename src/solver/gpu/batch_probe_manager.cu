@@ -2681,6 +2681,15 @@ void FQPTBaselineManager::AllocateMemory() {
   err = cudaMallocManaged(&d_ow1_word_leader_writes_, sizeof(unsigned long long));
   CHECK(err == cudaSuccess) << "Failed to allocate d_ow1_word_leader_writes_: "
                             << cudaGetErrorString(err);
+  err = cudaMallocManaged(&d_microbatch_rounds_, sizeof(unsigned long long));
+  CHECK(err == cudaSuccess) << "Failed to allocate d_microbatch_rounds_: "
+                            << cudaGetErrorString(err);
+  err = cudaMallocManaged(&d_microbatch_sel_ge2_rounds_, sizeof(unsigned long long));
+  CHECK(err == cudaSuccess) << "Failed to allocate d_microbatch_sel_ge2_rounds_: "
+                            << cudaGetErrorString(err);
+  err = cudaMallocManaged(&d_microbatch_sel_sum_, sizeof(unsigned long long));
+  CHECK(err == cudaSuccess) << "Failed to allocate d_microbatch_sel_sum_: "
+                            << cudaGetErrorString(err);
   err = cudaMallocManaged(&d_world_cursor_, sizeof(unsigned int));
   CHECK(err == cudaSuccess) << "Failed to allocate d_world_cursor_: "
                             << cudaGetErrorString(err);
@@ -2742,6 +2751,9 @@ void FQPTBaselineManager::FreeMemory() {
   if (d_ow1_scatter_calls_) cudaFree(d_ow1_scatter_calls_);
   if (d_ow1_fallback_calls_) cudaFree(d_ow1_fallback_calls_);
   if (d_ow1_word_leader_writes_) cudaFree(d_ow1_word_leader_writes_);
+  if (d_microbatch_rounds_) cudaFree(d_microbatch_rounds_);
+  if (d_microbatch_sel_ge2_rounds_) cudaFree(d_microbatch_sel_ge2_rounds_);
+  if (d_microbatch_sel_sum_) cudaFree(d_microbatch_sel_sum_);
   if (d_world_cursor_) cudaFree(d_world_cursor_);
   if (d_control_) cudaFree(d_control_);
 
@@ -2776,6 +2788,9 @@ void FQPTBaselineManager::FreeMemory() {
   d_ow1_scatter_calls_ = nullptr;
   d_ow1_fallback_calls_ = nullptr;
   d_ow1_word_leader_writes_ = nullptr;
+  d_microbatch_rounds_ = nullptr;
+  d_microbatch_sel_ge2_rounds_ = nullptr;
+  d_microbatch_sel_sum_ = nullptr;
   d_world_cursor_ = nullptr;
   d_control_ = nullptr;
   memory_allocated_ = false;
@@ -2939,6 +2954,9 @@ void FQPTBaselineManager::InitializeWorldsFromSnapshot(int num_worlds) {
   *d_ow1_scatter_calls_ = 0;
   *d_ow1_fallback_calls_ = 0;
   *d_ow1_word_leader_writes_ = 0;
+  *d_microbatch_rounds_ = 0;
+  *d_microbatch_sel_ge2_rounds_ = 0;
+  *d_microbatch_sel_sum_ = 0;
 }
 
 void FQPTBaselineManager::InitializeGlobalQueueWithSeedTasks(int num_worlds) {
@@ -3037,6 +3055,9 @@ void FQPTBaselineManager::LaunchKernel(int num_worlds) {
   d_control_->ow1_min_degree = ow1_min_degree_;
   d_control_->ow1_scatter_mode = ow1_scatter_mode_;
   d_control_->ow1_force_scatter = ow1_force_scatter_ ? 1 : 0;
+  d_control_->enable_cid_microbatch_profile =
+      (enable_world_owner_ && enable_cid_microbatch_profile_) ? 1 : 0;
+  d_control_->microbatch_profile_interval = microbatch_profile_interval_;
 
   d_control_->total_constraint_checks =
       stats_enabled_ ? d_total_constraint_checks_ : nullptr;
@@ -3064,6 +3085,18 @@ void FQPTBaselineManager::LaunchKernel(int num_worlds) {
       (stats_enabled_ && enable_world_owner_) ? d_ow1_fallback_calls_ : nullptr;
   d_control_->ow1_word_leader_writes =
       (stats_enabled_ && enable_world_owner_) ? d_ow1_word_leader_writes_ : nullptr;
+  d_control_->microbatch_rounds =
+      (stats_enabled_ && enable_world_owner_ && enable_cid_microbatch_profile_)
+          ? d_microbatch_rounds_
+          : nullptr;
+  d_control_->microbatch_sel_ge2_rounds =
+      (stats_enabled_ && enable_world_owner_ && enable_cid_microbatch_profile_)
+          ? d_microbatch_sel_ge2_rounds_
+          : nullptr;
+  d_control_->microbatch_sel_sum =
+      (stats_enabled_ && enable_world_owner_ && enable_cid_microbatch_profile_)
+          ? d_microbatch_sel_sum_
+          : nullptr;
 
   cudaError_t err = cudaDeviceSynchronize();
   CHECK(err == cudaSuccess) << "cudaDeviceSynchronize failed before FQPT kernel: "
@@ -3133,6 +3166,19 @@ int FQPTBaselineManager::CollectResults(
       stats_enabled_ && d_ow1_fallback_calls_ ? *d_ow1_fallback_calls_ : 0ULL;
   last_stats_.ow1_word_leader_writes =
       stats_enabled_ && d_ow1_word_leader_writes_ ? *d_ow1_word_leader_writes_ : 0ULL;
+  last_stats_.microbatch_rounds =
+      stats_enabled_ && d_microbatch_rounds_ ? *d_microbatch_rounds_ : 0ULL;
+  last_stats_.microbatch_sel_ge2_rounds =
+      stats_enabled_ && d_microbatch_sel_ge2_rounds_
+          ? *d_microbatch_sel_ge2_rounds_
+          : 0ULL;
+  last_stats_.microbatch_sel_sum =
+      stats_enabled_ && d_microbatch_sel_sum_ ? *d_microbatch_sel_sum_ : 0ULL;
+  if (last_stats_.microbatch_rounds > 0ULL) {
+    last_stats_.avg_sel_count =
+        static_cast<double>(last_stats_.microbatch_sel_sum) /
+        static_cast<double>(last_stats_.microbatch_rounds);
+  }
 
   int failed = 0;
   for (int w = 0; w < num_worlds; ++w) {
@@ -3188,6 +3234,9 @@ int FQPTBaselineManager::Execute(
   if (d_ow1_scatter_calls_ != nullptr) *d_ow1_scatter_calls_ = 0ULL;
   if (d_ow1_fallback_calls_ != nullptr) *d_ow1_fallback_calls_ = 0ULL;
   if (d_ow1_word_leader_writes_ != nullptr) *d_ow1_word_leader_writes_ = 0ULL;
+  if (d_microbatch_rounds_ != nullptr) *d_microbatch_rounds_ = 0ULL;
+  if (d_microbatch_sel_ge2_rounds_ != nullptr) *d_microbatch_sel_ge2_rounds_ = 0ULL;
+  if (d_microbatch_sel_sum_ != nullptr) *d_microbatch_sel_sum_ = 0ULL;
   if (d_world_cursor_ != nullptr) *d_world_cursor_ = 0u;
 
   if (!enable_world_owner_) {

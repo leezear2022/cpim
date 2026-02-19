@@ -110,6 +110,10 @@ DEFINE_int32(fqpt_ow1_scatter_mode, 1,
              "FQ-PT OW1: scatter mode (0=fallback, 1=legacy warp, 2=match_any)");
 DEFINE_bool(fqpt_ow1_force_scatter, false,
             "FQ-PT OW1: force scatter regardless of min_degree");
+DEFINE_bool(fqpt_enable_cid_microbatch_profile, false,
+            "FQ-PT OW3a: enable cid micro-batch profile counters");
+DEFINE_int32(fqpt_microbatch_profile_interval, 64,
+             "FQ-PT OW3a: profile sampling interval in propagation rounds");
 
 namespace cpim {
 
@@ -154,6 +158,8 @@ void ConfigureFQPTManager(FQPTBaselineManager& manager) {
     manager.SetOW1MinDegree(FLAGS_fqpt_ow1_min_degree);
     manager.SetOW1ScatterMode(FLAGS_fqpt_ow1_scatter_mode);
     manager.SetOW1ForceScatter(FLAGS_fqpt_ow1_force_scatter);
+    manager.SetEnableCidMicrobatchProfile(FLAGS_fqpt_enable_cid_microbatch_profile);
+    manager.SetMicrobatchProfileInterval(FLAGS_fqpt_microbatch_profile_interval);
 }
 
 // ============================================================================
@@ -441,6 +447,10 @@ struct BenchmarkResult {
     unsigned long long ow1_scatter_calls = 0;
     unsigned long long ow1_fallback_calls = 0;
     unsigned long long ow1_word_leader_writes = 0;
+    unsigned long long microbatch_rounds = 0;
+    unsigned long long microbatch_sel_ge2_rounds = 0;
+    unsigned long long microbatch_sel_sum = 0;
+    double avg_sel_count = 0.0;
 };
 
 void PrintResult(const BenchmarkResult& result) {
@@ -465,6 +475,10 @@ void PrintResult(const BenchmarkResult& result) {
     std::cout << "  ow1_sc=" << result.ow1_scatter_calls;
     std::cout << "  ow1_fb=" << result.ow1_fallback_calls;
     std::cout << "  ow1_w=" << result.ow1_word_leader_writes;
+    std::cout << "  mb_r=" << result.microbatch_rounds;
+    std::cout << "  mb_ge2=" << result.microbatch_sel_ge2_rounds;
+    std::cout << "  mb_sel=" << result.microbatch_sel_sum;
+    std::cout << "  mb_avg=" << std::setprecision(2) << result.avg_sel_count;
     std::cout << std::endl;
 }
 
@@ -700,6 +714,10 @@ BenchmarkResult RunFQPTBenchmark(GModel* gmodel,
     unsigned long long total_ow1_scatter_calls = 0;
     unsigned long long total_ow1_fallback_calls = 0;
     unsigned long long total_ow1_word_leader_writes = 0;
+    unsigned long long total_microbatch_rounds = 0;
+    unsigned long long total_microbatch_sel_ge2_rounds = 0;
+    unsigned long long total_microbatch_sel_sum = 0;
+    double total_avg_sel_count = 0.0;
 
     for (int iter = 0; iter < iterations; ++iter) {
         for (const auto& t : tasks) {
@@ -729,6 +747,10 @@ BenchmarkResult RunFQPTBenchmark(GModel* gmodel,
         total_ow1_scatter_calls += st.ow1_scatter_calls;
         total_ow1_fallback_calls += st.ow1_fallback_calls;
         total_ow1_word_leader_writes += st.ow1_word_leader_writes;
+        total_microbatch_rounds += st.microbatch_rounds;
+        total_microbatch_sel_ge2_rounds += st.microbatch_sel_ge2_rounds;
+        total_microbatch_sel_sum += st.microbatch_sel_sum;
+        total_avg_sel_count += st.avg_sel_count;
         manager.Clear();
     }
 
@@ -755,6 +777,11 @@ BenchmarkResult RunFQPTBenchmark(GModel* gmodel,
     result.ow1_fallback_calls = total_ow1_fallback_calls / std::max(1, iterations);
     result.ow1_word_leader_writes =
         total_ow1_word_leader_writes / std::max(1, iterations);
+    result.microbatch_rounds = total_microbatch_rounds / std::max(1, iterations);
+    result.microbatch_sel_ge2_rounds =
+        total_microbatch_sel_ge2_rounds / std::max(1, iterations);
+    result.microbatch_sel_sum = total_microbatch_sel_sum / std::max(1, iterations);
+    result.avg_sel_count = total_avg_sel_count / std::max(1, iterations);
     result.probes_per_sec = result.num_probes * 1000.0 / result.avg_time_ms;
     result.valid = true;
     return result;

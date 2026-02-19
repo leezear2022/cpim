@@ -3554,6 +3554,8 @@ __global__ void FQPTOwnerFrontierKernel(
   const int world_stride = block_warps * gridDim.x;
   const int check_words_per_warp = 2 * model.bit_dom_int_size + 16;
   const u32 full_mask = 0xFFFFFFFFu;
+  const bool enable_world_stealing =
+      (control->enable_world_stealing != 0) && (control->world_cursor != nullptr);
   const bool enable_ow1_frontier_scatter =
       (control->enable_ow1_frontier_scatter != 0);
   const int ow1_min_degree = max(1, control->ow1_min_degree);
@@ -3569,9 +3571,22 @@ __global__ void FQPTOwnerFrontierKernel(
   unsigned long long local_ow1_fallback_calls = 0ULL;
   unsigned long long local_ow1_word_leader_writes = 0ULL;
 
-  for (int world = blockIdx.x + warp_id * gridDim.x;
-       world < control->num_worlds;
-       world += world_stride) {
+  int next_world_static = blockIdx.x + warp_id * gridDim.x;
+  while (true) {
+    int world = -1;
+    if (lane_id == 0) {
+      if (enable_world_stealing) {
+        world = static_cast<int>(atomicAdd(control->world_cursor, 1u));
+      } else {
+        world = next_world_static;
+        next_world_static += world_stride;
+      }
+    }
+    world = __shfl_sync(full_mask, world, 0);
+    if (world < 0 || world >= control->num_worlds) {
+      break;
+    }
+
     WorldWorkspace* ws = &control->workspaces[world];
     const ProbeTask probe = control->world_probes[world];
 

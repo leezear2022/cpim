@@ -100,6 +100,8 @@ DEFINE_int32(fqpt_group_degrade_threshold, 1,
              "FQ-PT: degrade to single-task when max bucket <= threshold");
 DEFINE_bool(fqpt_enable_world_owner, false,
             "FQ-PT: enable Owner-World + two-level frontier path");
+DEFINE_bool(fqpt_enable_world_stealing, false,
+            "FQ-PT OW2: enable world_cursor dynamic world assignment control path");
 DEFINE_bool(fqpt_enable_ow1_frontier_scatter, false,
             "FQ-PT OW1: enable warp-cooperative frontier neighbor scatter");
 DEFINE_int32(fqpt_ow1_min_degree, 32,
@@ -147,6 +149,7 @@ void ConfigureFQPTManager(FQPTBaselineManager& manager) {
     manager.SetGroupWarpsPerCta(FLAGS_fqpt_group_warps);
     manager.SetGroupDegradeThreshold(FLAGS_fqpt_group_degrade_threshold);
     manager.SetEnableWorldOwner(FLAGS_fqpt_enable_world_owner);
+    manager.SetEnableWorldStealing(FLAGS_fqpt_enable_world_stealing);
     manager.SetEnableOW1FrontierScatter(FLAGS_fqpt_enable_ow1_frontier_scatter);
     manager.SetOW1MinDegree(FLAGS_fqpt_ow1_min_degree);
     manager.SetOW1ScatterMode(FLAGS_fqpt_ow1_scatter_mode);

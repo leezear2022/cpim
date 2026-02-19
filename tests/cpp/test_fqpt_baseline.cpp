@@ -29,6 +29,8 @@ DEFINE_int32(fqpt_pop_batch, 4, "FQ-PT CTA batch pop size");
 DEFINE_int32(fqpt_local_buffer, 64, "FQ-PT CTA local buffer size");
 DEFINE_bool(fqpt_enable_world_owner, false,
             "Enable Owner-World + two-level frontier path");
+DEFINE_bool(fqpt_enable_world_stealing, false,
+            "Enable OW2 world_cursor dynamic world assignment control path");
 DEFINE_bool(fqpt_enable_ow1_frontier_scatter, false,
             "Enable OW1 warp-cooperative frontier scatter");
 DEFINE_int32(fqpt_ow1_min_degree, 32,
@@ -91,6 +93,7 @@ void RunFQPT(
   mgr.SetCtaPopBatch(FLAGS_fqpt_pop_batch);
   mgr.SetLocalBufferCapacity(FLAGS_fqpt_local_buffer);
   mgr.SetEnableWorldOwner(FLAGS_fqpt_enable_world_owner);
+  mgr.SetEnableWorldStealing(FLAGS_fqpt_enable_world_stealing);
   mgr.SetEnableOW1FrontierScatter(FLAGS_fqpt_enable_ow1_frontier_scatter);
   mgr.SetOW1MinDegree(FLAGS_fqpt_ow1_min_degree);
   mgr.SetOW1ScatterMode(FLAGS_fqpt_ow1_scatter_mode);

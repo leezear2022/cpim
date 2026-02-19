@@ -2548,6 +2548,10 @@ void FQPTBaselineManager::SetEnableWorldOwner(bool enabled) {
   }
 }
 
+void FQPTBaselineManager::SetEnableWorldStealing(bool enabled) {
+  enable_world_stealing_ = enabled;
+}
+
 void FQPTBaselineManager::AllocateMemory() {
   if (memory_allocated_) return;
 
@@ -2677,6 +2681,10 @@ void FQPTBaselineManager::AllocateMemory() {
   err = cudaMallocManaged(&d_ow1_word_leader_writes_, sizeof(unsigned long long));
   CHECK(err == cudaSuccess) << "Failed to allocate d_ow1_word_leader_writes_: "
                             << cudaGetErrorString(err);
+  err = cudaMallocManaged(&d_world_cursor_, sizeof(unsigned int));
+  CHECK(err == cudaSuccess) << "Failed to allocate d_world_cursor_: "
+                            << cudaGetErrorString(err);
+  *d_world_cursor_ = 0u;
 
   err = cudaMallocManaged(&d_control_, sizeof(FQPTControl));
   CHECK(err == cudaSuccess) << "Failed to allocate d_control_: "
@@ -2734,6 +2742,7 @@ void FQPTBaselineManager::FreeMemory() {
   if (d_ow1_scatter_calls_) cudaFree(d_ow1_scatter_calls_);
   if (d_ow1_fallback_calls_) cudaFree(d_ow1_fallback_calls_);
   if (d_ow1_word_leader_writes_) cudaFree(d_ow1_word_leader_writes_);
+  if (d_world_cursor_) cudaFree(d_world_cursor_);
   if (d_control_) cudaFree(d_control_);
 
   d_tasks_ = nullptr;
@@ -2767,6 +2776,7 @@ void FQPTBaselineManager::FreeMemory() {
   d_ow1_scatter_calls_ = nullptr;
   d_ow1_fallback_calls_ = nullptr;
   d_ow1_word_leader_writes_ = nullptr;
+  d_world_cursor_ = nullptr;
   d_control_ = nullptr;
   memory_allocated_ = false;
 }
@@ -3018,6 +3028,10 @@ void FQPTBaselineManager::LaunchKernel(int num_worlds) {
   d_control_->group_warps_per_cta = group_warps_per_cta_;
   d_control_->group_degrade_threshold = group_degrade_threshold_;
   d_control_->enable_world_owner = enable_world_owner_ ? 1 : 0;
+  d_control_->enable_world_stealing =
+      (enable_world_owner_ && enable_world_stealing_) ? 1 : 0;
+  d_control_->world_cursor =
+      (enable_world_owner_ && enable_world_stealing_) ? d_world_cursor_ : nullptr;
   d_control_->enable_ow1_frontier_scatter =
       (enable_world_owner_ && enable_ow1_frontier_scatter_) ? 1 : 0;
   d_control_->ow1_min_degree = ow1_min_degree_;
@@ -3174,6 +3188,7 @@ int FQPTBaselineManager::Execute(
   if (d_ow1_scatter_calls_ != nullptr) *d_ow1_scatter_calls_ = 0ULL;
   if (d_ow1_fallback_calls_ != nullptr) *d_ow1_fallback_calls_ = 0ULL;
   if (d_ow1_word_leader_writes_ != nullptr) *d_ow1_word_leader_writes_ = 0ULL;
+  if (d_world_cursor_ != nullptr) *d_world_cursor_ = 0u;
 
   if (!enable_world_owner_) {
     InitializeWorldsFromSnapshot(num_tasks);

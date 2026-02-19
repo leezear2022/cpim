@@ -1073,6 +1073,8 @@ struct FQPTControl {
   int group_warps_per_cta;               // 分组检查最多使用的 warp 数
   int group_degrade_threshold;           // max_bucket_size<=threshold 时退化到逐任务
   int enable_world_owner;                // 1=启用 Owner-World + Frontier 路径
+  int enable_world_stealing;             // 1=启用 world_cursor 动态领取（OW2）
+  unsigned int* world_cursor;            // OW2: world 动态领取游标
   int enable_ow1_frontier_scatter;       // 1=启用 OW1 邻接写回 warp 协作
   int ow1_min_degree;                    // OW1 触发最小 degree（低于阈值走 OW0）
   int ow1_scatter_mode;                  // 0=OW0 fallback, 1=OW1, 2=OW1_v2(match_any)
@@ -1120,6 +1122,8 @@ struct FQPTControl {
         group_warps_per_cta(4),
         group_degrade_threshold(1),
         enable_world_owner(0),
+        enable_world_stealing(0),
+        world_cursor(nullptr),
         enable_ow1_frontier_scatter(0),
         ow1_min_degree(32),
         ow1_scatter_mode(1),
@@ -1203,6 +1207,7 @@ class FQPTBaselineManager {
     group_degrade_threshold_ = std::max(1, threshold);
   }
   void SetEnableWorldOwner(bool enabled);
+  void SetEnableWorldStealing(bool enabled);
   void SetEnableOW1FrontierScatter(bool enabled) {
     enable_ow1_frontier_scatter_ = enabled;
   }
@@ -1246,6 +1251,7 @@ class FQPTBaselineManager {
   int group_warps_per_cta_ = 4;
   int group_degrade_threshold_ = 1;
   bool enable_world_owner_ = false;
+  bool enable_world_stealing_ = false;
   bool enable_ow1_frontier_scatter_ = false;
   int ow1_min_degree_ = 32;
   int ow1_scatter_mode_ = 1;
@@ -1287,6 +1293,7 @@ class FQPTBaselineManager {
   unsigned long long* d_ow1_scatter_calls_ = nullptr;
   unsigned long long* d_ow1_fallback_calls_ = nullptr;
   unsigned long long* d_ow1_word_leader_writes_ = nullptr;
+  unsigned int* d_world_cursor_ = nullptr;
 
   FQPTControl* d_control_ = nullptr;
   bool memory_allocated_ = false;

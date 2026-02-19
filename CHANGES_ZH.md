@@ -1,5 +1,57 @@
 # 修改清单（中文）
 
+## 2026-02-19
+
+### FQ-PT：OW2 O2-A 接口与 `world_stealing` 控制面接线（default-off）
+
+**目标**：仅完成 OW2 前置控制面（接口/flag/Host 下发）落地，不改 `FQPTOwnerFrontierKernel`
+现有静态 world 分配行为，为后续 O2-B（kernel 动态领取）提供无歧义接入点。
+
+**核心改动**：
+- `include/solver/gpu/batch_probe_manager.h`
+  - `FQPTControl` 新增：
+    - `enable_world_stealing`
+    - `world_cursor`
+  - `FQPTBaselineManager` 新增：
+    - `SetEnableWorldStealing(bool)`
+    - 成员 `enable_world_stealing_`
+    - 成员 `d_world_cursor_`
+- `src/solver/gpu/batch_probe_manager.cu`
+  - 新增 `SetEnableWorldStealing(bool)`（仅更新布尔开关，不触发重分配）
+  - `AllocateMemory()` 新增 `d_world_cursor_` 分配与初始化
+  - `FreeMemory()` 新增 `d_world_cursor_` 释放
+  - `Execute()` 每次执行前清零 `d_world_cursor_`
+  - `LaunchKernel()` 下发：
+    - `d_control_->enable_world_stealing`
+    - `d_control_->world_cursor`
+- `apps/sac_benchmark.cpp`
+  - 新增 CLI：`--fqpt_enable_world_stealing`
+  - `ConfigureFQPTManager()` 接线 `SetEnableWorldStealing(...)`
+- `tests/cpp/test_fqpt_baseline.cpp`
+  - 新增 CLI：`--fqpt_enable_world_stealing`
+  - `RunFQPT()` 接线 `SetEnableWorldStealing(...)`
+
+**语义与回退**：
+- O2-A 不改 kernel 调度行为（仍走 OW0 静态分配）；
+- `--fqpt_enable_world_stealing=1` 且 `--fqpt_enable_world_owner=0` 时安全忽略；
+- 继续保持 default-off、可回退、Stage2/legacy 默认行为不变。
+
+### FQ-PT：OW2 O2-B 动态 world 领取内核分支（default-off）
+
+**目标**：在 OWF kernel 内启用 `world_cursor` 动态领取分支，缓解静态 stride 在 world 工作量不均时的长尾空转。
+
+**核心改动**：
+- `src/solver/gpu/GModel.cu`
+  - `FQPTOwnerFrontierKernel(...)` 中将 world 外层循环改为统一 `while` 框架：
+    - `enable_world_stealing=0`：沿用 OW0 静态 `next_world += world_stride`
+    - `enable_world_stealing=1`：`lane0` 通过 `atomicAdd(world_cursor, 1)` 领取 world 并 warp 广播
+  - world 内 Phase0/传播/统计逻辑保持不变，避免引入语义漂移。
+
+**语义与回退**：
+- 仅当 `enable_world_owner=1 && enable_world_stealing=1 && world_cursor!=nullptr` 才走动态领取；
+- 其余场景自动回退 OW0 静态映射；
+- 不引入 `world_lock`，保持 Owner-World 单写者约束与 soundness。
+
 ## 2026-02-18
 
 ### FQ-PT：OW1 实验迭代（mode=2 + 可观测化，允许退化）

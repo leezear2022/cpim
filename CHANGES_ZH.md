@@ -89,6 +89,28 @@
 - 继续保持 default-off，可通过 flag 一键关闭；
 - O3A-B 将在此基础上补充实际采样更新逻辑。
 
+### FQ-PT：OW3a O3A-B 内核命中率采样更新（default-off）
+
+**目标**：在 OWF kernel 内补齐 OW3a 的实际采样逻辑，更新 `microbatch_*` 统计计数，
+继续保持不改变 check/commit 语义。
+
+**核心改动**：
+- `src/solver/gpu/GModel.cu`
+  - 在 `FQPTOwnerFrontierKernel(...)` 中新增 OW3a 采样分支：
+    - 仅在 `enable_cid_microbatch_profile=1` 且统计指针有效时启用
+    - 以 `microbatch_profile_interval` 对 `local_frontier_pops` 做间隔采样
+    - 每次采样记录当前 warp 的 `(round, cid)`，扫描同 CTA 的 warp 快照估算 `sel_count`
+    - 原子更新：
+      - `microbatch_rounds += 1`
+      - `microbatch_sel_sum += sel_count`
+      - `microbatch_sel_ge2_rounds += (sel_count >= 2)`
+  - 采样逻辑仅发生在 lane0，不改变现有 OWF 的 world 调度、check 执行与结果提交路径。
+
+**语义与回退**：
+- 仍为 default-off（需显式 `--fqpt_enable_cid_microbatch_profile=1`）；
+- 统计仅在启用时更新，禁用时路径与 O2-B 一致；
+- O3A-B 仅提供命中率观测，不引入 OW3b 的 micro-batch 对齐执行。
+
 ## 2026-02-18
 
 ### FQ-PT：OW1 实验迭代（mode=2 + 可观测化，允许退化）

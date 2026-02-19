@@ -3544,6 +3544,9 @@ __global__ void FQPTOwnerFrontierKernel(
     const GModelData model,
     FQPTControl* control) {
   extern __shared__ u32 check_shared[];
+  __shared__ volatile unsigned int profile_seq[32];
+  __shared__ volatile unsigned int profile_round[32];
+  __shared__ volatile int profile_cid[32];
 
   const int lane_id = threadIdx.x & 31;
   const int warp_id = threadIdx.x >> 5;
@@ -3561,6 +3564,23 @@ __global__ void FQPTOwnerFrontierKernel(
   const int ow1_min_degree = max(1, control->ow1_min_degree);
   const int ow1_scatter_mode = max(0, min(2, control->ow1_scatter_mode));
   const bool ow1_force_scatter = (control->ow1_force_scatter != 0);
+  const bool enable_microbatch_profile =
+      (control->enable_cid_microbatch_profile != 0) &&
+      (control->microbatch_rounds != nullptr) &&
+      (control->microbatch_sel_ge2_rounds != nullptr) &&
+      (control->microbatch_sel_sum != nullptr);
+  const int profile_interval = max(1, control->microbatch_profile_interval);
+
+  if (enable_microbatch_profile) {
+    if (threadIdx.x == 0) {
+      for (int w = 0; w < 32; ++w) {
+        profile_seq[w] = 0u;
+        profile_round[w] = 0xFFFFFFFFu;
+        profile_cid[w] = -1;
+      }
+    }
+    __syncthreads();
+  }
 
   unsigned long long local_checks = 0ULL;
   unsigned long long local_deletions = 0ULL;
@@ -3699,6 +3719,43 @@ __global__ void FQPTOwnerFrontierKernel(
       }
       if (lane_id == 0) {
         ++local_frontier_pops;
+      }
+      if (enable_microbatch_profile && lane_id == 0 &&
+          (local_frontier_pops %
+           static_cast<unsigned long long>(profile_interval) == 0ULL)) {
+        const unsigned int sample_round = static_cast<unsigned int>(
+            local_frontier_pops / static_cast<unsigned long long>(profile_interval));
+        const unsigned int seq0 = profile_seq[warp_id];
+        profile_seq[warp_id] = seq0 + 1u;  // odd: writer in progress
+        __threadfence_block();
+        profile_round[warp_id] = sample_round;
+        profile_cid[warp_id] = cid;
+        __threadfence_block();
+        profile_seq[warp_id] = seq0 + 2u;  // even: writer done
+
+        unsigned int sel_count = 0u;
+        for (int w = 0; w < block_warps; ++w) {
+          const unsigned int v0 = profile_seq[w];
+          if (v0 == 0u || ((v0 & 1u) != 0u)) continue;
+
+          const unsigned int other_round = profile_round[w];
+          const int other_cid = profile_cid[w];
+          __threadfence_block();
+          const unsigned int v1 = profile_seq[w];
+          if (v0 != v1 || ((v1 & 1u) != 0u)) continue;
+
+          if (other_round == sample_round && other_cid == cid) {
+            ++sel_count;
+          }
+        }
+
+        atomicAdd(control->microbatch_rounds, 1ULL);
+        atomicAdd(
+            control->microbatch_sel_sum,
+            static_cast<unsigned long long>(sel_count));
+        if (sel_count >= 2u) {
+          atomicAdd(control->microbatch_sel_ge2_rounds, 1ULL);
+        }
       }
 
       u32* warp_scratch = check_shared + warp_id * check_words_per_warp;

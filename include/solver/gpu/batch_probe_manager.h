@@ -1103,6 +1103,10 @@ struct FQPTControl {
   unsigned long long* microbatch_rounds;        // OW3a: 采样总轮数
   unsigned long long* microbatch_sel_ge2_rounds;  // OW3a: sel_count>=2 的轮数
   unsigned long long* microbatch_sel_sum;       // OW3a: sel_count 累计和
+  unsigned long long* microbatch_aligned_rounds;  // OW3b: 对齐执行轮数
+  unsigned long long* microbatch_degrade_rounds;  // OW3b: 退化执行轮数
+  unsigned long long* microbatch_parked_warps;  // OW3b: 对齐轮 parked warp 累计
+  unsigned long long* microbatch_round_cap_fallbacks;  // OW3b: round cap 触发次数
 
   __host__ __device__ FQPTControl()
       : num_worlds(0),
@@ -1158,7 +1162,11 @@ struct FQPTControl {
         ow1_word_leader_writes(nullptr),
         microbatch_rounds(nullptr),
         microbatch_sel_ge2_rounds(nullptr),
-        microbatch_sel_sum(nullptr) {}
+        microbatch_sel_sum(nullptr),
+        microbatch_aligned_rounds(nullptr),
+        microbatch_degrade_rounds(nullptr),
+        microbatch_parked_warps(nullptr),
+        microbatch_round_cap_fallbacks(nullptr) {}
 };
 
 // FQ-PT 运行统计（Host 侧）
@@ -1187,6 +1195,12 @@ struct FQPTStatistics {
   unsigned long long microbatch_sel_ge2_rounds = 0;
   unsigned long long microbatch_sel_sum = 0;
   double avg_sel_count = 0.0;
+  unsigned long long microbatch_aligned_rounds = 0;
+  unsigned long long microbatch_degrade_rounds = 0;
+  unsigned long long microbatch_parked_warps = 0;
+  unsigned long long microbatch_round_cap_fallbacks = 0;
+  double microbatch_align_ratio = 0.0;
+  double microbatch_parked_per_round = 0.0;
 };
 
 // FQ-PT Baseline Host 管理器
@@ -1342,6 +1356,10 @@ class FQPTBaselineManager {
   unsigned long long* d_microbatch_rounds_ = nullptr;
   unsigned long long* d_microbatch_sel_ge2_rounds_ = nullptr;
   unsigned long long* d_microbatch_sel_sum_ = nullptr;
+  unsigned long long* d_microbatch_aligned_rounds_ = nullptr;
+  unsigned long long* d_microbatch_degrade_rounds_ = nullptr;
+  unsigned long long* d_microbatch_parked_warps_ = nullptr;
+  unsigned long long* d_microbatch_round_cap_fallbacks_ = nullptr;
   unsigned int* d_world_cursor_ = nullptr;
 
   FQPTControl* d_control_ = nullptr;

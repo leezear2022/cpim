@@ -2690,6 +2690,18 @@ void FQPTBaselineManager::AllocateMemory() {
   err = cudaMallocManaged(&d_microbatch_sel_sum_, sizeof(unsigned long long));
   CHECK(err == cudaSuccess) << "Failed to allocate d_microbatch_sel_sum_: "
                             << cudaGetErrorString(err);
+  err = cudaMallocManaged(&d_microbatch_aligned_rounds_, sizeof(unsigned long long));
+  CHECK(err == cudaSuccess) << "Failed to allocate d_microbatch_aligned_rounds_: "
+                            << cudaGetErrorString(err);
+  err = cudaMallocManaged(&d_microbatch_degrade_rounds_, sizeof(unsigned long long));
+  CHECK(err == cudaSuccess) << "Failed to allocate d_microbatch_degrade_rounds_: "
+                            << cudaGetErrorString(err);
+  err = cudaMallocManaged(&d_microbatch_parked_warps_, sizeof(unsigned long long));
+  CHECK(err == cudaSuccess) << "Failed to allocate d_microbatch_parked_warps_: "
+                            << cudaGetErrorString(err);
+  err = cudaMallocManaged(&d_microbatch_round_cap_fallbacks_, sizeof(unsigned long long));
+  CHECK(err == cudaSuccess) << "Failed to allocate d_microbatch_round_cap_fallbacks_: "
+                            << cudaGetErrorString(err);
   err = cudaMallocManaged(&d_world_cursor_, sizeof(unsigned int));
   CHECK(err == cudaSuccess) << "Failed to allocate d_world_cursor_: "
                             << cudaGetErrorString(err);
@@ -2754,6 +2766,10 @@ void FQPTBaselineManager::FreeMemory() {
   if (d_microbatch_rounds_) cudaFree(d_microbatch_rounds_);
   if (d_microbatch_sel_ge2_rounds_) cudaFree(d_microbatch_sel_ge2_rounds_);
   if (d_microbatch_sel_sum_) cudaFree(d_microbatch_sel_sum_);
+  if (d_microbatch_aligned_rounds_) cudaFree(d_microbatch_aligned_rounds_);
+  if (d_microbatch_degrade_rounds_) cudaFree(d_microbatch_degrade_rounds_);
+  if (d_microbatch_parked_warps_) cudaFree(d_microbatch_parked_warps_);
+  if (d_microbatch_round_cap_fallbacks_) cudaFree(d_microbatch_round_cap_fallbacks_);
   if (d_world_cursor_) cudaFree(d_world_cursor_);
   if (d_control_) cudaFree(d_control_);
 
@@ -2791,6 +2807,10 @@ void FQPTBaselineManager::FreeMemory() {
   d_microbatch_rounds_ = nullptr;
   d_microbatch_sel_ge2_rounds_ = nullptr;
   d_microbatch_sel_sum_ = nullptr;
+  d_microbatch_aligned_rounds_ = nullptr;
+  d_microbatch_degrade_rounds_ = nullptr;
+  d_microbatch_parked_warps_ = nullptr;
+  d_microbatch_round_cap_fallbacks_ = nullptr;
   d_world_cursor_ = nullptr;
   d_control_ = nullptr;
   memory_allocated_ = false;
@@ -2957,6 +2977,10 @@ void FQPTBaselineManager::InitializeWorldsFromSnapshot(int num_worlds) {
   *d_microbatch_rounds_ = 0;
   *d_microbatch_sel_ge2_rounds_ = 0;
   *d_microbatch_sel_sum_ = 0;
+  *d_microbatch_aligned_rounds_ = 0;
+  *d_microbatch_degrade_rounds_ = 0;
+  *d_microbatch_parked_warps_ = 0;
+  *d_microbatch_round_cap_fallbacks_ = 0;
 }
 
 void FQPTBaselineManager::InitializeGlobalQueueWithSeedTasks(int num_worlds) {
@@ -3046,17 +3070,23 @@ void FQPTBaselineManager::LaunchKernel(int num_worlds) {
   d_control_->group_warps_per_cta = group_warps_per_cta_;
   d_control_->group_degrade_threshold = group_degrade_threshold_;
   d_control_->enable_world_owner = enable_world_owner_ ? 1 : 0;
+  const bool effective_microbatch = enable_world_owner_ && enable_cid_microbatch_;
+  const bool effective_world_stealing =
+      enable_world_owner_ && enable_world_stealing_ && !effective_microbatch;
+  if (enable_world_owner_ && enable_world_stealing_ && effective_microbatch) {
+    LOG_FIRST_N(WARNING, 1)
+        << "FQ-PT OW3b: cid micro-batch enabled, world_stealing is disabled.";
+  }
   d_control_->enable_world_stealing =
-      (enable_world_owner_ && enable_world_stealing_) ? 1 : 0;
+      effective_world_stealing ? 1 : 0;
   d_control_->world_cursor =
-      (enable_world_owner_ && enable_world_stealing_) ? d_world_cursor_ : nullptr;
+      effective_world_stealing ? d_world_cursor_ : nullptr;
   d_control_->enable_ow1_frontier_scatter =
       (enable_world_owner_ && enable_ow1_frontier_scatter_) ? 1 : 0;
   d_control_->ow1_min_degree = ow1_min_degree_;
   d_control_->ow1_scatter_mode = ow1_scatter_mode_;
   d_control_->ow1_force_scatter = ow1_force_scatter_ ? 1 : 0;
-  d_control_->enable_cid_microbatch =
-      (enable_world_owner_ && enable_cid_microbatch_) ? 1 : 0;
+  d_control_->enable_cid_microbatch = effective_microbatch ? 1 : 0;
   d_control_->microbatch_min_sel = microbatch_min_sel_;
   d_control_->microbatch_warps = microbatch_warps_;
   d_control_->microbatch_max_rounds = microbatch_max_rounds_;
@@ -3101,6 +3131,22 @@ void FQPTBaselineManager::LaunchKernel(int num_worlds) {
   d_control_->microbatch_sel_sum =
       (stats_enabled_ && enable_world_owner_ && enable_cid_microbatch_profile_)
           ? d_microbatch_sel_sum_
+          : nullptr;
+  d_control_->microbatch_aligned_rounds =
+      (stats_enabled_ && enable_world_owner_ && effective_microbatch)
+          ? d_microbatch_aligned_rounds_
+          : nullptr;
+  d_control_->microbatch_degrade_rounds =
+      (stats_enabled_ && enable_world_owner_ && effective_microbatch)
+          ? d_microbatch_degrade_rounds_
+          : nullptr;
+  d_control_->microbatch_parked_warps =
+      (stats_enabled_ && enable_world_owner_ && effective_microbatch)
+          ? d_microbatch_parked_warps_
+          : nullptr;
+  d_control_->microbatch_round_cap_fallbacks =
+      (stats_enabled_ && enable_world_owner_ && effective_microbatch)
+          ? d_microbatch_round_cap_fallbacks_
           : nullptr;
 
   cudaError_t err = cudaDeviceSynchronize();
@@ -3184,6 +3230,32 @@ int FQPTBaselineManager::CollectResults(
         static_cast<double>(last_stats_.microbatch_sel_sum) /
         static_cast<double>(last_stats_.microbatch_rounds);
   }
+  last_stats_.microbatch_aligned_rounds =
+      stats_enabled_ && d_microbatch_aligned_rounds_
+          ? *d_microbatch_aligned_rounds_
+          : 0ULL;
+  last_stats_.microbatch_degrade_rounds =
+      stats_enabled_ && d_microbatch_degrade_rounds_
+          ? *d_microbatch_degrade_rounds_
+          : 0ULL;
+  last_stats_.microbatch_parked_warps =
+      stats_enabled_ && d_microbatch_parked_warps_
+          ? *d_microbatch_parked_warps_
+          : 0ULL;
+  last_stats_.microbatch_round_cap_fallbacks =
+      stats_enabled_ && d_microbatch_round_cap_fallbacks_
+          ? *d_microbatch_round_cap_fallbacks_
+          : 0ULL;
+  const unsigned long long total_mb_exec_rounds =
+      last_stats_.microbatch_aligned_rounds + last_stats_.microbatch_degrade_rounds;
+  if (total_mb_exec_rounds > 0ULL) {
+    last_stats_.microbatch_align_ratio =
+        static_cast<double>(last_stats_.microbatch_aligned_rounds) /
+        static_cast<double>(total_mb_exec_rounds);
+    last_stats_.microbatch_parked_per_round =
+        static_cast<double>(last_stats_.microbatch_parked_warps) /
+        static_cast<double>(total_mb_exec_rounds);
+  }
 
   int failed = 0;
   for (int w = 0; w < num_worlds; ++w) {
@@ -3242,6 +3314,12 @@ int FQPTBaselineManager::Execute(
   if (d_microbatch_rounds_ != nullptr) *d_microbatch_rounds_ = 0ULL;
   if (d_microbatch_sel_ge2_rounds_ != nullptr) *d_microbatch_sel_ge2_rounds_ = 0ULL;
   if (d_microbatch_sel_sum_ != nullptr) *d_microbatch_sel_sum_ = 0ULL;
+  if (d_microbatch_aligned_rounds_ != nullptr) *d_microbatch_aligned_rounds_ = 0ULL;
+  if (d_microbatch_degrade_rounds_ != nullptr) *d_microbatch_degrade_rounds_ = 0ULL;
+  if (d_microbatch_parked_warps_ != nullptr) *d_microbatch_parked_warps_ = 0ULL;
+  if (d_microbatch_round_cap_fallbacks_ != nullptr) {
+    *d_microbatch_round_cap_fallbacks_ = 0ULL;
+  }
   if (d_world_cursor_ != nullptr) *d_world_cursor_ = 0u;
 
   if (!enable_world_owner_) {

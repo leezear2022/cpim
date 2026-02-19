@@ -39,6 +39,14 @@ DEFINE_int32(fqpt_ow1_scatter_mode, 1,
              "OW1 scatter mode (0=fallback, 1=legacy warp, 2=match_any)");
 DEFINE_bool(fqpt_ow1_force_scatter, false,
             "OW1 force scatter regardless of min degree");
+DEFINE_bool(fqpt_enable_cid_microbatch, false,
+            "Enable OW3b cid micro-batch framework path");
+DEFINE_int32(fqpt_microbatch_min_sel, 2,
+             "OW3b minimum sel_count for aligned execution");
+DEFINE_int32(fqpt_microbatch_warps, 8,
+             "OW3b max warps participating in micro-batch (1..8)");
+DEFINE_int32(fqpt_microbatch_max_rounds, 0,
+             "OW3b max per-world micro-batch rounds (0=unlimited)");
 DEFINE_bool(fqpt_enable_cid_microbatch_profile, false,
             "Enable OW3a cid micro-batch profile counters");
 DEFINE_int32(fqpt_microbatch_profile_interval, 64,
@@ -102,6 +110,10 @@ void RunFQPT(
   mgr.SetOW1MinDegree(FLAGS_fqpt_ow1_min_degree);
   mgr.SetOW1ScatterMode(FLAGS_fqpt_ow1_scatter_mode);
   mgr.SetOW1ForceScatter(FLAGS_fqpt_ow1_force_scatter);
+  mgr.SetEnableCidMicrobatch(FLAGS_fqpt_enable_cid_microbatch);
+  mgr.SetMicrobatchMinSel(FLAGS_fqpt_microbatch_min_sel);
+  mgr.SetMicrobatchWarps(FLAGS_fqpt_microbatch_warps);
+  mgr.SetMicrobatchMaxRounds(FLAGS_fqpt_microbatch_max_rounds);
   mgr.SetEnableCidMicrobatchProfile(FLAGS_fqpt_enable_cid_microbatch_profile);
   mgr.SetMicrobatchProfileInterval(FLAGS_fqpt_microbatch_profile_interval);
 

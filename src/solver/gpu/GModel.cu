@@ -3564,6 +3564,10 @@ __global__ void FQPTOwnerFrontierKernel(
   const int ow1_min_degree = max(1, control->ow1_min_degree);
   const int ow1_scatter_mode = max(0, min(2, control->ow1_scatter_mode));
   const bool ow1_force_scatter = (control->ow1_force_scatter != 0);
+  const bool enable_cid_microbatch = (control->enable_cid_microbatch != 0);
+  const int microbatch_min_sel = max(1, control->microbatch_min_sel);
+  const int microbatch_warps = max(1, min(8, control->microbatch_warps));
+  const int microbatch_max_rounds = max(0, control->microbatch_max_rounds);
   const bool enable_microbatch_profile =
       (control->enable_cid_microbatch_profile != 0) &&
       (control->microbatch_rounds != nullptr) &&
@@ -3699,6 +3703,7 @@ __global__ void FQPTOwnerFrontierKernel(
     __syncwarp(full_mask);
 
     int cursor_l1 = (world + 17) % l1_words;
+    int microbatch_round = 0;
     while (true) {
       int cid = -1;
       int scan_steps = 0;
@@ -3717,6 +3722,29 @@ __global__ void FQPTOwnerFrontierKernel(
       if (!has_work) {
         break;
       }
+
+      int use_microbatch_placeholder = 0;
+      if (enable_cid_microbatch) {
+        const int budget_ok =
+            (microbatch_max_rounds == 0 || microbatch_round < microbatch_max_rounds) ? 1 : 0;
+        if (lane_id == 0) {
+          use_microbatch_placeholder = budget_ok;
+          ++microbatch_round;
+        }
+      }
+      use_microbatch_placeholder =
+          __shfl_sync(full_mask, use_microbatch_placeholder, 0);
+      if (use_microbatch_placeholder) {
+        // O3B-A: 仅预留 micro-batch 开关入口；O3B-B 再实现 sel_cid 对齐执行。
+        // 当前阶段保持单 warp check 路径，确保求解语义不变。
+        if (lane_id == 0) {
+          const int reserved_min_sel = microbatch_min_sel;
+          const int reserved_warps = min(block_warps, microbatch_warps);
+          (void)reserved_min_sel;
+          (void)reserved_warps;
+        }
+      }
+
       if (lane_id == 0) {
         ++local_frontier_pops;
       }

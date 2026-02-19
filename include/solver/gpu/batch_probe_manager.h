@@ -1079,6 +1079,10 @@ struct FQPTControl {
   int ow1_min_degree;                    // OW1 触发最小 degree（低于阈值走 OW0）
   int ow1_scatter_mode;                  // 0=OW0 fallback, 1=OW1, 2=OW1_v2(match_any)
   int ow1_force_scatter;                 // 1=忽略 min_degree，强制 scatter
+  int enable_cid_microbatch;             // 1=启用 OW3b micro-batch 框架
+  int microbatch_min_sel;                // OW3b: sel_count 最小阈值
+  int microbatch_warps;                  // OW3b: 参与分组的 warp 数（1..8）
+  int microbatch_max_rounds;             // OW3b: 每 world 轮数上限（0=不限）
   int enable_cid_microbatch_profile;     // 1=启用 OW3a 命中率统计采样
   int microbatch_profile_interval;       // OW3a 采样间隔（轮）
 
@@ -1133,6 +1137,10 @@ struct FQPTControl {
         ow1_min_degree(32),
         ow1_scatter_mode(1),
         ow1_force_scatter(0),
+        enable_cid_microbatch(0),
+        microbatch_min_sel(2),
+        microbatch_warps(8),
+        microbatch_max_rounds(0),
         enable_cid_microbatch_profile(0),
         microbatch_profile_interval(64),
         total_constraint_checks(nullptr),
@@ -1228,6 +1236,18 @@ class FQPTBaselineManager {
   void SetOW1MinDegree(int degree) { ow1_min_degree_ = std::max(1, degree); }
   void SetOW1ScatterMode(int mode) { ow1_scatter_mode_ = std::clamp(mode, 0, 2); }
   void SetOW1ForceScatter(bool enabled) { ow1_force_scatter_ = enabled; }
+  void SetEnableCidMicrobatch(bool enabled) {
+    enable_cid_microbatch_ = enabled;
+  }
+  void SetMicrobatchMinSel(int min_sel) {
+    microbatch_min_sel_ = std::max(1, min_sel);
+  }
+  void SetMicrobatchWarps(int warps) {
+    microbatch_warps_ = std::clamp(warps, 1, 8);
+  }
+  void SetMicrobatchMaxRounds(int rounds) {
+    microbatch_max_rounds_ = std::max(0, rounds);
+  }
   void SetEnableCidMicrobatchProfile(bool enabled) {
     enable_cid_microbatch_profile_ = enabled;
   }
@@ -1276,6 +1296,10 @@ class FQPTBaselineManager {
   int ow1_min_degree_ = 32;
   int ow1_scatter_mode_ = 1;
   bool ow1_force_scatter_ = false;
+  bool enable_cid_microbatch_ = false;
+  int microbatch_min_sel_ = 2;
+  int microbatch_warps_ = 8;
+  int microbatch_max_rounds_ = 0;
   bool enable_cid_microbatch_profile_ = false;
   int microbatch_profile_interval_ = 64;
   bool stats_enabled_ = true;

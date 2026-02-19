@@ -3055,6 +3055,11 @@ void FQPTBaselineManager::LaunchKernel(int num_worlds) {
   d_control_->ow1_min_degree = ow1_min_degree_;
   d_control_->ow1_scatter_mode = ow1_scatter_mode_;
   d_control_->ow1_force_scatter = ow1_force_scatter_ ? 1 : 0;
+  d_control_->enable_cid_microbatch =
+      (enable_world_owner_ && enable_cid_microbatch_) ? 1 : 0;
+  d_control_->microbatch_min_sel = microbatch_min_sel_;
+  d_control_->microbatch_warps = microbatch_warps_;
+  d_control_->microbatch_max_rounds = microbatch_max_rounds_;
   d_control_->enable_cid_microbatch_profile =
       (enable_world_owner_ && enable_cid_microbatch_profile_) ? 1 : 0;
   d_control_->microbatch_profile_interval = microbatch_profile_interval_;

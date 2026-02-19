@@ -2,6 +2,46 @@
 
 ## 2026-02-19
 
+### FQ-PT：OW3b O3B-A 控制开关与框架接线（default-off）
+
+**目标**：完成 OW3b 的控制面与 kernel 占位框架，保持现有求解语义不变，为 O3B-B
+（真实 micro-batch 对齐执行）提供直接落点。
+
+**核心改动**：
+- `include/solver/gpu/batch_probe_manager.h`
+  - `FQPTControl` 新增：
+    - `enable_cid_microbatch`
+    - `microbatch_min_sel`
+    - `microbatch_warps`
+    - `microbatch_max_rounds`
+  - `FQPTBaselineManager` 新增 setter：
+    - `SetEnableCidMicrobatch(bool)`
+    - `SetMicrobatchMinSel(int)`
+    - `SetMicrobatchWarps(int)`
+    - `SetMicrobatchMaxRounds(int)`
+- `src/solver/gpu/batch_probe_manager.cu`
+  - `LaunchKernel()` 新增 OW3b 控制字段下发；
+  - 仅在 `enable_world_owner=1` 时允许 `enable_cid_microbatch` 生效。
+- `apps/sac_benchmark.cpp`
+  - 新增 CLI：
+    - `--fqpt_enable_cid_microbatch`
+    - `--fqpt_microbatch_min_sel`
+    - `--fqpt_microbatch_warps`
+    - `--fqpt_microbatch_max_rounds`
+  - `ConfigureFQPTManager()` 完整接线对应 setter。
+- `tests/cpp/test_fqpt_baseline.cpp`
+  - 新增同名 OW3b flag 并在 `RunFQPT()` 接线。
+- `src/solver/gpu/GModel.cu`
+  - `FQPTOwnerFrontierKernel(...)` 增加 OW3b 占位分支：
+    - 读取并消费 `enable/min_sel/warps/max_rounds`
+    - 当前仅预留框架，不改变现有单 warp check 路径
+    - 不引入 block 级同步
+
+**语义与回退**：
+- `default-off`：不带新 flag 时行为与此前版本一致；
+- `owner=0 && microbatch=1` 自动忽略；
+- `owner=1 && microbatch=1` 当前仅走框架占位，结果语义保持一致。
+
 ### FQ-PT：OW2 O2-A 接口与 `world_stealing` 控制面接线（default-off）
 
 **目标**：仅完成 OW2 前置控制面（接口/flag/Host 下发）落地，不改 `FQPTOwnerFrontierKernel`

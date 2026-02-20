@@ -3256,6 +3256,17 @@ int FQPTBaselineManager::CollectResults(
         static_cast<double>(last_stats_.microbatch_parked_warps) /
         static_cast<double>(total_mb_exec_rounds);
   }
+  if (enable_cid_microbatch_ &&
+      total_mb_exec_rounds > 0ULL &&
+      last_stats_.microbatch_align_ratio < 0.3) {
+    VLOG(1) << "FQ-PT OW3b low align ratio detected: align_ratio="
+            << last_stats_.microbatch_align_ratio
+            << ", aligned=" << last_stats_.microbatch_aligned_rounds
+            << ", degrade=" << last_stats_.microbatch_degrade_rounds
+            << ", parked_per_round=" << last_stats_.microbatch_parked_per_round
+            << ", round_cap_fallbacks="
+            << last_stats_.microbatch_round_cap_fallbacks;
+  }
 
   int failed = 0;
   for (int w = 0; w < num_worlds; ++w) {

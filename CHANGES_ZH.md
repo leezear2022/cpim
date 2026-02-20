@@ -2,6 +2,33 @@
 
 ## 2026-02-19
 
+### FQ-PT：OW3b O3B-C 大例子驱动性能收敛（default-off）
+
+**目标**：在不改接口与默认语义的前提下，降低 O3B-B 在中大样例上的同步/park 额外开销，
+为后续 `OW3b vs OW5` 决策提供更稳定的数据基线。
+
+**核心改动**：
+- `src/solver/gpu/GModel.cu`
+  - `FQPTOwnerFrontierKernel(...)` 的 `enable_cid_microbatch=1` 分支改为
+    “多数对齐 + 混合执行”：
+    - 仍保留 `W<=8` 的 `O(W^2)` 选 `sel_cid/sel_count`；
+    - 对齐条件改为：
+      `sel_cid>=0 && sel_count>=microbatch_min_sel && sel_count*2>=active_selected`；
+    - aligned 轮中未命中 warp 不再 parked，直接执行自身 `candidate_cid`；
+    - `pending_cid` 从热路径移除（不再参与调度）；
+    - `microbatch_max_rounds` 改为 per-warp 本地 fallback，不再触发整轮强制 degrade。
+  - OW3a 采样逻辑保持兼容，不重定义统计口径。
+- `src/solver/gpu/batch_probe_manager.cu`
+  - `CollectResults()` 增加低对齐率诊断日志（`VLOG(1)`）：
+    - 条件：`enable_cid_microbatch=1 && microbatch_align_ratio<0.3`
+    - 输出：`align_ratio`、`aligned/degrade`、`parked_per_round`、
+      `round_cap_fallbacks`。
+
+**语义与回退**：
+- 仍保持 default-off，需显式 `--fqpt_enable_cid_microbatch=1`；
+- `UNKNOWN` 语义不变；
+- Stage2 / OW2 / OW1 路径不变。
+
 ### FQ-PT：OW3b O3B-B 严格 CTA 对齐执行（default-off）
 
 **目标**：在 O3B-A 控制面基础上，落地真实 micro-batch 执行逻辑（`sel_cid` 选桶、

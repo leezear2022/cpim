@@ -3549,7 +3549,6 @@ __global__ void FQPTOwnerFrontierKernel(
   __shared__ volatile int profile_cid[32];
   __shared__ int mb_warp_world[8];
   __shared__ int mb_warp_cursor_l1[8];
-  __shared__ int mb_warp_pending_cid[8];
   __shared__ int mb_warp_active[8];
   __shared__ int mb_warp_rounds[8];
   __shared__ int mb_warp_candidate_cid[8];
@@ -3862,7 +3861,6 @@ __global__ void FQPTOwnerFrontierKernel(
         world = next_world_static;
         next_world_static += world_stride;
         mb_warp_world[warp_id] = world;
-        mb_warp_pending_cid[warp_id] = -1;
         mb_warp_rounds[warp_id] = 0;
         mb_warp_candidate_cid[warp_id] = -1;
         mb_warp_exec_cid[warp_id] = -1;
@@ -3988,30 +3986,22 @@ __global__ void FQPTOwnerFrontierKernel(
             int cid = -1;
             int scan_steps = 0;
             int has_candidate = 0;
-            bool from_pending = false;
 
-            if (mb_warp_pending_cid[warp_id] >= 0) {
-              cid = mb_warp_pending_cid[warp_id];
-              mb_warp_pending_cid[warp_id] = -1;
-              has_candidate = 1;
-              from_pending = true;
-            } else {
-              has_candidate = FQPTPopFrontierCidTwoLevel(
-                  &control->workspaces[mb_warp_world[warp_id]],
-                  bitmap_words,
-                  l1_words,
-                  &mb_warp_cursor_l1[warp_id],
-                  &cid,
-                  &scan_steps) ? 1 : 0;
-              if (has_candidate) {
-                local_frontier_scan_steps += static_cast<unsigned long long>(scan_steps);
-                ++local_frontier_pops;
-              }
+            has_candidate = FQPTPopFrontierCidTwoLevel(
+                &control->workspaces[mb_warp_world[warp_id]],
+                bitmap_words,
+                l1_words,
+                &mb_warp_cursor_l1[warp_id],
+                &cid,
+                &scan_steps) ? 1 : 0;
+            if (has_candidate) {
+              local_frontier_scan_steps += static_cast<unsigned long long>(scan_steps);
+              ++local_frontier_pops;
             }
 
             if (has_candidate) {
               mb_warp_candidate_cid[warp_id] = cid;
-              if (!from_pending && enable_microbatch_profile &&
+              if (enable_microbatch_profile &&
                   (local_frontier_pops %
                    static_cast<unsigned long long>(profile_interval) == 0ULL)) {
                 const unsigned int sample_round = static_cast<unsigned int>(
@@ -4052,12 +4042,13 @@ __global__ void FQPTOwnerFrontierKernel(
           const int selected_warps = min(block_warps, microbatch_warps);
           int sel_cid = -1;
           int sel_count = 0;
+          int active_selected = 0;
           int round_cap_fallbacks = 0;
-          bool force_degrade_round = false;
 
           for (int i = 0; i < selected_warps; ++i) {
             const int cid_i = mb_warp_candidate_cid[i];
             if (cid_i < 0) continue;
+            ++active_selected;
             int count = 0;
             for (int j = 0; j < selected_warps; ++j) {
               if (mb_warp_candidate_cid[j] == cid_i) {
@@ -4073,9 +4064,6 @@ __global__ void FQPTOwnerFrontierKernel(
           for (int w = 0; w < block_warps; ++w) {
             if (mb_warp_candidate_cid[w] >= 0 && mb_warp_force_degrade[w] != 0) {
               ++round_cap_fallbacks;
-              if (w < selected_warps) {
-                force_degrade_round = true;
-              }
             }
             mb_warp_exec_cid[w] = -1;
           }
@@ -4086,32 +4074,29 @@ __global__ void FQPTOwnerFrontierKernel(
               static_cast<unsigned long long>(round_cap_fallbacks);
 
           const bool aligned =
-              !force_degrade_round && (sel_count >= microbatch_min_sel) && (sel_cid >= 0);
+              (sel_cid >= 0) &&
+              (sel_count >= microbatch_min_sel) &&
+              (sel_count * 2 >= active_selected);
           if (aligned) {
             ++local_microbatch_aligned_rounds;
-            unsigned long long parked = 0ULL;
-            for (int w = 0; w < block_warps; ++w) {
-              const int cid_w = mb_warp_candidate_cid[w];
-              if (cid_w < 0) continue;
-              if (w >= selected_warps) {
-                mb_warp_exec_cid[w] = cid_w;
-                continue;
-              }
-              if (cid_w == sel_cid) {
-                mb_warp_exec_cid[w] = cid_w;
-              } else {
-                mb_warp_pending_cid[w] = cid_w;
-                ++parked;
-              }
-            }
-            local_microbatch_parked_warps += parked;
           } else {
             ++local_microbatch_degrade_rounds;
-            for (int w = 0; w < block_warps; ++w) {
-              const int cid_w = mb_warp_candidate_cid[w];
-              if (cid_w >= 0) {
-                mb_warp_exec_cid[w] = cid_w;
-              }
+          }
+
+          for (int w = 0; w < block_warps; ++w) {
+            const int cid_w = mb_warp_candidate_cid[w];
+            if (cid_w < 0) continue;
+
+            // O3B-C: 达到 round cap 的 warp 本轮仅做本地 fallback，不拖累整轮退化。
+            if (w < selected_warps && mb_warp_force_degrade[w] != 0) {
+              mb_warp_exec_cid[w] = cid_w;
+              continue;
+            }
+
+            if (aligned && w < selected_warps && cid_w == sel_cid) {
+              mb_warp_exec_cid[w] = sel_cid;
+            } else {
+              mb_warp_exec_cid[w] = cid_w;
             }
           }
 
@@ -4186,7 +4171,6 @@ __global__ void FQPTOwnerFrontierKernel(
               control->world_results[exec_world] = false;
               control->world_status[exec_world] = static_cast<int>(ProbeStatus::kDWO);
               mb_warp_active[warp_id] = 0;
-              mb_warp_pending_cid[warp_id] = -1;
             } else if (control->world_status[exec_world] == static_cast<int>(ProbeStatus::kOK)) {
               const int2 scope = model.constraint_scopes[exec_cid];
               if (r.x_changed) {
@@ -4245,7 +4229,6 @@ __global__ void FQPTOwnerFrontierKernel(
           if (world_status != static_cast<int>(ProbeStatus::kOK)) {
             if (lane_id == 0) {
               mb_warp_active[warp_id] = 0;
-              mb_warp_pending_cid[warp_id] = -1;
             }
           }
         }

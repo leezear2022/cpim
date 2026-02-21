@@ -2,6 +2,54 @@
 
 ## 2026-02-21
 
+### FQ-PT：OW5 Subwarp Multi-World 主线接入（default-off）
+
+**目标**：在 FQPT Owner-World 路径落地 OW5（subwarp multi-world），
+用于 `bit_dom_int_size==1` 场景的 lane 利用率提升与 OW3 转轨评估。
+
+**核心改动**：
+- `include/solver/gpu/batch_probe_manager.h`
+  - `FQPTControl` 新增：
+    - `enable_subwarp_multiworld`
+    - `subwarp_tile_size`（4/8/16）
+  - `FQPTBaselineManager` 新增 setter：
+    - `SetEnableSubwarpMultiworld(bool)`
+    - `SetSubwarpTileSize(int)`
+- `src/solver/gpu/batch_probe_manager.cu`
+  - `LaunchKernel()` 新增 OW5 优先级：
+    - `effective_subwarp = owner && ow5 && (bit_dom_int_size==1)`
+    - `effective_microbatch = owner && ow3 && !effective_subwarp`
+  - `world_stealing` 与 OW5 可并存（不再因 OW5 被关闭）。
+  - `OW5+OW3`、`OW5+OW1`、`OW5 在非 small-domain` 时增加 warning 诊断。
+- `src/solver/gpu/GModel.cu`
+  - `FQPTOwnerFrontierKernel(...)` 新增分支优先级：
+    - `OW5 -> OW3 -> OW2/OW1`
+  - 新增 `ExecuteConstraintCheck_BpC_Workspace_SubwarpPerWorld(...)`：
+    - subwarp 内局部同步（`__syncwarp(subwarp_mask)`）
+    - 无 `__syncthreads()` 热路径
+    - 保持与现有 check 语义一致（删值、DWO、push 触发）
+  - OW5 分支采用 subwarp world 领取（stealing 或静态 stride），
+    并禁用 OW1 scatter（统一 leader 标量 push）。
+  - Owner kernel launch 的 shared memory 按
+    `block_warps * worlds_per_warp` 扩展 scratch 槽位。
+- `apps/sac_benchmark.cpp` / `tests/cpp/test_fqpt_baseline.cpp`
+  - 新增 CLI：
+    - `--fqpt_enable_subwarp_multiworld`
+    - `--fqpt_subwarp_tile`
+  - benchmark 模式名新增：
+    - `FQ-PT(OWF+OW5t4|t8|t16)`
+
+**统计口径**：
+- 不新增 public 统计字段；
+- OW5 继续复用 `checks/deletions/processed/frontier_*`；
+- microbatch 统计在 OW5 路径保持 0（OW5 优先后 OW3 不生效）。
+
+**语义与回退**：
+- default-off；
+- Stage2 路径不变；
+- `UNKNOWN` 语义不变；
+- 若 OW5 gate 失败，保持实验开关，不改变默认主路径。
+
 ### FQ-PT：OW3-lite 无轮次同步抢救路径（default-off）
 
 **目标**：保留 OW3 同 `cid` 机会复用方向，同时移除 O3B-B/O3B-C 的 CTA 轮次锁步框架，

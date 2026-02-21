@@ -11,6 +11,7 @@
 #include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <sstream>
 
 namespace cpim {
@@ -2542,6 +2543,7 @@ void FQPTBaselineManager::SetQueueCapacity(int capacity_pow2) {
 void FQPTBaselineManager::SetEnableWorldOwner(bool enabled) {
   if (enable_world_owner_ == enabled) return;
   enable_world_owner_ = enabled;
+  ow5_policy_ready_ = false;
   if (memory_allocated_) {
     FreeMemory();
     AllocateMemory();
@@ -2550,6 +2552,7 @@ void FQPTBaselineManager::SetEnableWorldOwner(bool enabled) {
 
 void FQPTBaselineManager::SetEnableWorldStealing(bool enabled) {
   enable_world_stealing_ = enabled;
+  ow5_policy_ready_ = false;
 }
 
 void FQPTBaselineManager::AllocateMemory() {
@@ -3040,6 +3043,169 @@ void FQPTBaselineManager::InitializeGlobalQueueWithSeedTasks(int num_worlds) {
   *d_unknown_count_ = init_unknown;
 }
 
+void FQPTBaselineManager::ResetRuntimeCounters() {
+  if (d_processed_tasks_ != nullptr) *d_processed_tasks_ = 0ULL;
+  if (d_total_constraint_checks_ != nullptr) *d_total_constraint_checks_ = 0ULL;
+  if (d_total_deletions_ != nullptr) *d_total_deletions_ = 0ULL;
+  if (d_overflow_count_ != nullptr) *d_overflow_count_ = 0ULL;
+  if (d_unknown_count_ != nullptr) *d_unknown_count_ = 0ULL;
+  if (d_stale_drop_count_ != nullptr) *d_stale_drop_count_ = 0ULL;
+  if (d_lock_fail_count_ != nullptr) *d_lock_fail_count_ = 0ULL;
+  if (d_lock_retry_count_ != nullptr) *d_lock_retry_count_ = 0ULL;
+  if (d_bucket_count_ != nullptr) *d_bucket_count_ = 0ULL;
+  if (d_bucket_task_sum_ != nullptr) *d_bucket_task_sum_ = 0ULL;
+  if (d_bucket_active_warp_sum_ != nullptr) *d_bucket_active_warp_sum_ = 0ULL;
+  if (d_frontier_pop_count_ != nullptr) *d_frontier_pop_count_ = 0ULL;
+  if (d_frontier_scan_steps_ != nullptr) *d_frontier_scan_steps_ = 0ULL;
+  if (d_ow1_scatter_calls_ != nullptr) *d_ow1_scatter_calls_ = 0ULL;
+  if (d_ow1_fallback_calls_ != nullptr) *d_ow1_fallback_calls_ = 0ULL;
+  if (d_ow1_word_leader_writes_ != nullptr) *d_ow1_word_leader_writes_ = 0ULL;
+  if (d_microbatch_rounds_ != nullptr) *d_microbatch_rounds_ = 0ULL;
+  if (d_microbatch_sel_ge2_rounds_ != nullptr) *d_microbatch_sel_ge2_rounds_ = 0ULL;
+  if (d_microbatch_sel_sum_ != nullptr) *d_microbatch_sel_sum_ = 0ULL;
+  if (d_microbatch_aligned_rounds_ != nullptr) *d_microbatch_aligned_rounds_ = 0ULL;
+  if (d_microbatch_degrade_rounds_ != nullptr) *d_microbatch_degrade_rounds_ = 0ULL;
+  if (d_microbatch_parked_warps_ != nullptr) *d_microbatch_parked_warps_ = 0ULL;
+  if (d_microbatch_round_cap_fallbacks_ != nullptr) {
+    *d_microbatch_round_cap_fallbacks_ = 0ULL;
+  }
+}
+
+void FQPTBaselineManager::ResetOwnerWorldState(int num_worlds) {
+  if (num_worlds <= 0) return;
+  const int bitmap_size_words = (model_->GetNumCons() + 31) / 32;
+  for (int w = 0; w < num_worlds; ++w) {
+    d_world_results_[w] = true;
+    d_world_status_[w] = static_cast<int>(ProbeStatus::kOK);
+    if (d_world_locks_ != nullptr) {
+      d_world_locks_[w] = 0;
+    }
+    WorldWorkspace& ws = d_workspaces_[w];
+    ws.inconsistent_flag = 0;
+    ws.scanner_index = 0;
+    ws.deletions = 0;
+    ws.iterations = 0;
+    ws.frontier_nonempty = 0;
+    for (int i = 0; i < bitmap_size_words; ++i) {
+      ws.frontier_A[i] = 0u;
+      ws.frontier_B[i] = 0u;
+    }
+  }
+  if (d_world_cursor_ != nullptr) {
+    *d_world_cursor_ = 0u;
+  }
+}
+
+void FQPTBaselineManager::DetermineOw5RuntimePolicy(int num_worlds) {
+  ow5_effective_tile_ = 8;
+  ow5_effective_stealing_ = false;
+  ow5_policy_ready_ = true;
+
+  if (!enable_world_owner_ || !enable_subwarp_multiworld_ ||
+      model_->GetBitDomIntSize() != 1 || num_worlds <= 0) {
+    return;
+  }
+
+  if (num_worlds < 8) {
+    return;
+  }
+
+  struct Candidate {
+    int tile;
+    bool stealing;
+    const char* name;
+  };
+  const Candidate candidates[] = {
+      {8, false, "A(tile=8,steal=0)"},
+      {16, false, "B(tile=16,steal=0)"},
+      {8, true, "C(tile=8,steal=1)"},
+  };
+
+  const int calib_worlds = std::min(num_worlds, 16);
+  float best_ms = std::numeric_limits<float>::max();
+  const Candidate* best = &candidates[0];
+
+  ow5_policy_calibrating_ = true;
+  ow5_policy_override_active_ = true;
+
+  for (const Candidate& c : candidates) {
+    ow5_effective_tile_ = c.tile;
+    ow5_effective_stealing_ = c.stealing;
+    ResetRuntimeCounters();
+    ResetOwnerWorldState(calib_worlds);
+
+    cudaEvent_t ev_start = nullptr;
+    cudaEvent_t ev_stop = nullptr;
+    cudaError_t err = cudaEventCreate(&ev_start);
+    if (err != cudaSuccess) {
+      LOG(WARNING) << "FQ-PT OW5 policy calibration fallback: create start event failed: "
+                   << cudaGetErrorString(err);
+      break;
+    }
+    err = cudaEventCreate(&ev_stop);
+    if (err != cudaSuccess) {
+      LOG(WARNING) << "FQ-PT OW5 policy calibration fallback: create stop event failed: "
+                   << cudaGetErrorString(err);
+      cudaEventDestroy(ev_start);
+      break;
+    }
+
+    err = cudaEventRecord(ev_start);
+    if (err != cudaSuccess) {
+      LOG(WARNING) << "FQ-PT OW5 policy calibration fallback: record start failed: "
+                   << cudaGetErrorString(err);
+      cudaEventDestroy(ev_start);
+      cudaEventDestroy(ev_stop);
+      break;
+    }
+
+    LaunchKernel(calib_worlds);
+
+    err = cudaEventRecord(ev_stop);
+    if (err != cudaSuccess) {
+      LOG(WARNING) << "FQ-PT OW5 policy calibration fallback: record stop failed: "
+                   << cudaGetErrorString(err);
+      cudaEventDestroy(ev_start);
+      cudaEventDestroy(ev_stop);
+      break;
+    }
+    err = cudaEventSynchronize(ev_stop);
+    if (err != cudaSuccess) {
+      LOG(WARNING) << "FQ-PT OW5 policy calibration fallback: sync stop failed: "
+                   << cudaGetErrorString(err);
+      cudaEventDestroy(ev_start);
+      cudaEventDestroy(ev_stop);
+      break;
+    }
+
+    float elapsed_ms = 0.0f;
+    err = cudaEventElapsedTime(&elapsed_ms, ev_start, ev_stop);
+    cudaEventDestroy(ev_start);
+    cudaEventDestroy(ev_stop);
+    if (err != cudaSuccess) {
+      LOG(WARNING) << "FQ-PT OW5 policy calibration fallback: elapsed failed: "
+                   << cudaGetErrorString(err);
+      break;
+    }
+
+    VLOG(1) << "FQ-PT OW5 policy calibration " << c.name << " elapsed_ms="
+            << elapsed_ms;
+    if (elapsed_ms < best_ms) {
+      best_ms = elapsed_ms;
+      best = &c;
+    }
+  }
+
+  ow5_effective_tile_ = best->tile;
+  ow5_effective_stealing_ = best->stealing;
+  ow5_policy_calibrating_ = false;
+
+  VLOG(1) << "FQ-PT OW5 policy selected: tile=" << ow5_effective_tile_
+          << ", stealing=" << (ow5_effective_stealing_ ? 1 : 0)
+          << ", calib_worlds=" << calib_worlds
+          << ", best_ms=" << best_ms;
+}
+
 void FQPTBaselineManager::LaunchKernel(int num_worlds) {
   d_control_->num_worlds = num_worlds;
   d_control_->world_probes = d_tasks_;
@@ -3075,17 +3241,37 @@ void FQPTBaselineManager::LaunchKernel(int num_worlds) {
   const bool effective_subwarp = requested_subwarp && ow5_supported;
   const bool effective_microbatch =
       enable_world_owner_ && enable_cid_microbatch_ && !effective_subwarp;
-  const bool effective_world_stealing =
+  bool effective_world_stealing =
       enable_world_owner_ && enable_world_stealing_;
+  int effective_subwarp_tile = SanitizeSubwarpSize(subwarp_tile_size_);
+  if (effective_subwarp && ow5_policy_override_active_) {
+    effective_subwarp_tile = SanitizeSubwarpSize(ow5_effective_tile_);
+    effective_world_stealing = enable_world_owner_ && ow5_effective_stealing_;
+  }
   if (requested_subwarp && !ow5_supported) {
     LOG(WARNING) << "FQ-PT OW5 fallback: bit_dom_int_size="
                  << model_->GetModelData().bit_dom_int_size
                  << " (OW5 only supports bit_dom_int_size==1)";
   }
-  if (effective_subwarp && enable_cid_microbatch_) {
+  if (effective_subwarp && !ow5_policy_calibrating_ &&
+      !ow5_policy_warned_this_execute_) {
+    const int requested_tile = SanitizeSubwarpSize(subwarp_tile_size_);
+    const bool requested_stealing = enable_world_owner_ && enable_world_stealing_;
+    if (requested_tile != effective_subwarp_tile ||
+        requested_stealing != effective_world_stealing) {
+      LOG(WARNING) << "FQ-PT OW5 policy override: requested(tile="
+                   << requested_tile
+                   << ", stealing=" << (requested_stealing ? 1 : 0)
+                   << ") -> effective(tile=" << effective_subwarp_tile
+                   << ", stealing=" << (effective_world_stealing ? 1 : 0)
+                   << ")";
+      ow5_policy_warned_this_execute_ = true;
+    }
+  }
+  if (effective_subwarp && enable_cid_microbatch_ && !ow5_policy_calibrating_) {
     LOG(WARNING) << "FQ-PT OW5 priority: cid micro-batch is ignored when OW5 is enabled";
   }
-  if (effective_subwarp && enable_ow1_frontier_scatter_) {
+  if (effective_subwarp && enable_ow1_frontier_scatter_ && !ow5_policy_calibrating_) {
     LOG(WARNING) << "FQ-PT OW5 path disables OW1 frontier scatter "
                  << "(32-lane OW1 scatter is incompatible with subwarp tiles)";
   }
@@ -3094,7 +3280,7 @@ void FQPTBaselineManager::LaunchKernel(int num_worlds) {
   d_control_->world_cursor =
       effective_world_stealing ? d_world_cursor_ : nullptr;
   d_control_->enable_subwarp_multiworld = effective_subwarp ? 1 : 0;
-  d_control_->subwarp_tile_size = SanitizeSubwarpSize(subwarp_tile_size_);
+  d_control_->subwarp_tile_size = effective_subwarp_tile;
   d_control_->enable_ow1_frontier_scatter =
       (enable_world_owner_ && enable_ow1_frontier_scatter_ && !effective_subwarp) ? 1 : 0;
   d_control_->ow1_min_degree = ow1_min_degree_;
@@ -3320,34 +3506,12 @@ int FQPTBaselineManager::Execute(
 
   EnsureTaskCapacity(num_tasks);
   SaveSnapshot();
-  if (d_processed_tasks_ != nullptr) *d_processed_tasks_ = 0ULL;
-  if (d_total_constraint_checks_ != nullptr) *d_total_constraint_checks_ = 0ULL;
-  if (d_total_deletions_ != nullptr) *d_total_deletions_ = 0ULL;
-  if (d_overflow_count_ != nullptr) *d_overflow_count_ = 0ULL;
-  if (d_unknown_count_ != nullptr) *d_unknown_count_ = 0ULL;
-  if (d_stale_drop_count_ != nullptr) *d_stale_drop_count_ = 0ULL;
-  if (d_lock_fail_count_ != nullptr) *d_lock_fail_count_ = 0ULL;
-  if (d_lock_retry_count_ != nullptr) *d_lock_retry_count_ = 0ULL;
-  if (d_bucket_count_ != nullptr) *d_bucket_count_ = 0ULL;
-  if (d_bucket_task_sum_ != nullptr) *d_bucket_task_sum_ = 0ULL;
-  if (d_bucket_active_warp_sum_ != nullptr) *d_bucket_active_warp_sum_ = 0ULL;
-  if (d_frontier_pop_count_ != nullptr) *d_frontier_pop_count_ = 0ULL;
-  if (d_frontier_scan_steps_ != nullptr) *d_frontier_scan_steps_ = 0ULL;
-  if (d_ow1_scatter_calls_ != nullptr) *d_ow1_scatter_calls_ = 0ULL;
-  if (d_ow1_fallback_calls_ != nullptr) *d_ow1_fallback_calls_ = 0ULL;
-  if (d_ow1_word_leader_writes_ != nullptr) *d_ow1_word_leader_writes_ = 0ULL;
-  if (d_microbatch_rounds_ != nullptr) *d_microbatch_rounds_ = 0ULL;
-  if (d_microbatch_sel_ge2_rounds_ != nullptr) *d_microbatch_sel_ge2_rounds_ = 0ULL;
-  if (d_microbatch_sel_sum_ != nullptr) *d_microbatch_sel_sum_ = 0ULL;
-  if (d_microbatch_aligned_rounds_ != nullptr) *d_microbatch_aligned_rounds_ = 0ULL;
-  if (d_microbatch_degrade_rounds_ != nullptr) *d_microbatch_degrade_rounds_ = 0ULL;
-  if (d_microbatch_parked_warps_ != nullptr) *d_microbatch_parked_warps_ = 0ULL;
-  if (d_microbatch_round_cap_fallbacks_ != nullptr) {
-    *d_microbatch_round_cap_fallbacks_ = 0ULL;
-  }
+  ow5_policy_warned_this_execute_ = false;
+  ResetRuntimeCounters();
   if (d_world_cursor_ != nullptr) *d_world_cursor_ = 0u;
 
   if (!enable_world_owner_) {
+    ow5_policy_override_active_ = false;
     InitializeWorldsFromSnapshot(num_tasks);
     InitializeGlobalQueueWithSeedTasks(num_tasks);
   } else {
@@ -3358,6 +3522,17 @@ int FQPTBaselineManager::Execute(
         cudaMemcpyHostToDevice);
     CHECK(err == cudaSuccess) << "Failed to copy probe tasks: "
                               << cudaGetErrorString(err);
+
+    const bool ow5_supported = (model_->GetBitDomIntSize() == 1);
+    const bool ow5_enabled = enable_subwarp_multiworld_ && ow5_supported;
+    ow5_policy_override_active_ = ow5_enabled;
+    if (ow5_enabled) {
+      if (!ow5_policy_ready_) {
+        DetermineOw5RuntimePolicy(num_tasks);
+      }
+      ResetRuntimeCounters();
+      ResetOwnerWorldState(num_tasks);
+    }
   }
   LaunchKernel(num_tasks);
   const int failed = CollectResults(

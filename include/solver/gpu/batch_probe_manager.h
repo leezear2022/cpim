@@ -1268,9 +1268,11 @@ class FQPTBaselineManager {
   }
   void SetEnableSubwarpMultiworld(bool enabled) {
     enable_subwarp_multiworld_ = enabled;
+    ow5_policy_ready_ = false;
   }
   void SetSubwarpTileSize(int tile) {
     subwarp_tile_size_ = (tile == 4 || tile == 8 || tile == 16) ? tile : 8;
+    ow5_policy_ready_ = false;
   }
   void SetEnableCidMicrobatchProfile(bool enabled) {
     enable_cid_microbatch_profile_ = enabled;
@@ -1298,6 +1300,9 @@ class FQPTBaselineManager {
                      std::vector<int>& failed_values,
                      std::vector<int>* unknown_vars,
                      std::vector<int>* unknown_values);
+  void ResetRuntimeCounters();
+  void ResetOwnerWorldState(int num_worlds);
+  void DetermineOw5RuntimePolicy(int num_worlds);
 
   GModel* model_ = nullptr;
   int num_blocks_ = 0;
@@ -1326,6 +1331,12 @@ class FQPTBaselineManager {
   int microbatch_max_rounds_ = 0;
   bool enable_subwarp_multiworld_ = false;
   int subwarp_tile_size_ = 8;
+  bool ow5_policy_ready_ = false;
+  int ow5_effective_tile_ = 8;
+  bool ow5_effective_stealing_ = false;
+  bool ow5_policy_override_active_ = false;
+  bool ow5_policy_warned_this_execute_ = false;
+  bool ow5_policy_calibrating_ = false;
   bool enable_cid_microbatch_profile_ = false;
   int microbatch_profile_interval_ = 64;
   bool stats_enabled_ = true;

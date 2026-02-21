@@ -2,6 +2,42 @@
 
 ## 2026-02-21
 
+### FQ-PT：OW5 O5-C 收敛优化（auto policy + 两层 gate）
+
+**目标**：在不改 public 接口的前提下，降低 OW5 热路径固定开销，并通过
+运行时策略覆盖（tile/stealing）提升大样例 gate 表现。
+
+**核心改动**：
+- `src/solver/gpu/GModel.cu`
+  - 新增 `bit_dom_int_size==1` 专用快路径：
+    - `ExecuteConstraintCheck_BpC_Workspace_SubwarpPerWorld_BitDom1Fast(...)`
+    - 仅 subwarp leader 执行删值与 dom_size 更新，其它 lane 不参与计算。
+  - OW5 world stealing 新增 warp 本地批量领取缓存：
+    - 通过 shared chunk (`base/next/lock`) 降低 `world_cursor` 全局原子频率。
+  - OW5 主循环移除冗余局部同步（仅保留必要同步），保持语义不变。
+- `src/solver/gpu/batch_probe_manager.cu`
+  - 新增 OW5 运行时策略缓存（manager 私有）：
+    - `ow5_policy_ready/effective_tile/effective_stealing`。
+  - 首次 OW5 执行增加轻量校准（A/B/C 三候选）：
+    - A: `(tile=8, stealing=0)`
+    - B: `(tile=16, stealing=0)`
+    - C: `(tile=8, stealing=1)`
+    - 使用 CUDA event 计时，选择最快配置并在后续复用。
+  - OW5 开启时允许覆盖用户 `tile/stealing` 设置，并在每次 `Execute()` 最多打印一次：
+    - `OW5 policy override: requested -> effective`
+- `tests/python/ow5_gate_eval.py`
+  - 增加“两层门控”：
+    - quick gate（3例，阈值 `median<=1.03`）
+    - quick 通过后才跑 full gate（9+3）
+  - `main.csv` 增加 `stage=quick/full` 字段。
+  - `summary.md` 区分 quick/full 结果与是否跳过 full。
+
+**兼容性与语义**：
+- 不新增/删除 `FQPTControl` / `FQPTStatistics` / CLI 字段；
+- OW5 仍 `default-off`；
+- Stage2 / OW3 / OW4 路径不变；
+- `UNKNOWN` 语义不变。
+
 ### FQ-PT：OW5 Subwarp Multi-World 主线接入（default-off）
 
 **目标**：在 FQPT Owner-World 路径落地 OW5（subwarp multi-world），

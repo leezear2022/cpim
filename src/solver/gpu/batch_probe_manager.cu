@@ -3072,11 +3072,7 @@ void FQPTBaselineManager::LaunchKernel(int num_worlds) {
   d_control_->enable_world_owner = enable_world_owner_ ? 1 : 0;
   const bool effective_microbatch = enable_world_owner_ && enable_cid_microbatch_;
   const bool effective_world_stealing =
-      enable_world_owner_ && enable_world_stealing_ && !effective_microbatch;
-  if (enable_world_owner_ && enable_world_stealing_ && effective_microbatch) {
-    LOG_FIRST_N(WARNING, 1)
-        << "FQ-PT OW3b: cid micro-batch enabled, world_stealing is disabled.";
-  }
+      enable_world_owner_ && enable_world_stealing_;
   d_control_->enable_world_stealing =
       effective_world_stealing ? 1 : 0;
   d_control_->world_cursor =
@@ -3259,7 +3255,7 @@ int FQPTBaselineManager::CollectResults(
   if (enable_cid_microbatch_ &&
       total_mb_exec_rounds > 0ULL &&
       last_stats_.microbatch_align_ratio < 0.3) {
-    VLOG(1) << "FQ-PT OW3b low align ratio detected: align_ratio="
+    VLOG(1) << "FQ-PT OW3-lite low align ratio detected: align_ratio="
             << last_stats_.microbatch_align_ratio
             << ", aligned=" << last_stats_.microbatch_aligned_rounds
             << ", degrade=" << last_stats_.microbatch_degrade_rounds

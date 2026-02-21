@@ -1,5 +1,37 @@
 # 修改清单（中文）
 
+## 2026-02-21
+
+### FQ-PT：OW3-lite 无轮次同步抢救路径（default-off）
+
+**目标**：保留 OW3 同 `cid` 机会复用方向，同时移除 O3B-B/O3B-C 的 CTA 轮次锁步框架，
+把高频 block 同步成本降到热路径之外。
+
+**核心改动**：
+- `src/solver/gpu/GModel.cu`
+  - `FQPTOwnerFrontierKernel(...)` 的 `enable_cid_microbatch=1` 分支重构为
+    warp 独立推进 + 机会主义分组（OW3-lite）：
+    - 删除旧的 CTA round 驱动子循环与 `mb_cta_active_count` 锁步调度；
+    - 使用 `mb_live_seq/mb_live_round/mb_live_cid` 的 seqlock 快照做无 barrier 观察；
+    - 每个 warp 对自身 `candidate cid` 独立执行，不再 parked，不再等待同轮对齐；
+    - `microbatch_max_rounds` 改为按 world 的 aligned 事件上限，触发本地 degrade 计数；
+    - OW3-lite 热路径不新增 `__syncthreads()`。
+- `src/solver/gpu/batch_probe_manager.cu`
+  - `LaunchKernel()` 允许 `world_stealing` 与 `cid_microbatch` 共存下发（不再互斥）。
+  - 低对齐率诊断文案更新为 `OW3-lite`。
+
+**统计口径说明**：
+- `microbatch_aligned_rounds` / `microbatch_degrade_rounds`：
+  由“CTA round”口径调整为“warp 执行事件”口径。
+- `microbatch_parked_warps`：
+  为兼容保留字段；OW3-lite 路径固定累计 0。
+
+**语义与回退**：
+- 继续 default-off（需显式 `--fqpt_enable_cid_microbatch=1`）；
+- `UNKNOWN` 语义不变；
+- Stage2/OW2/OW1 主路径不变；
+- 若 OW3-lite gate 不达标，按计划转 OW5 主线。
+
 ## 2026-02-19
 
 ### FQ-PT：OW3b O3B-C 大例子驱动性能收敛（default-off）

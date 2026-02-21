@@ -3547,16 +3547,9 @@ __global__ void FQPTOwnerFrontierKernel(
   __shared__ volatile unsigned int profile_seq[32];
   __shared__ volatile unsigned int profile_round[32];
   __shared__ volatile int profile_cid[32];
-  __shared__ int mb_warp_world[8];
-  __shared__ int mb_warp_cursor_l1[8];
-  __shared__ int mb_warp_active[8];
-  __shared__ int mb_warp_rounds[8];
-  __shared__ int mb_warp_candidate_cid[8];
-  __shared__ int mb_warp_exec_cid[8];
-  __shared__ int mb_warp_force_degrade[8];
-  __shared__ int mb_sel_cid;
-  __shared__ int mb_sel_count;
-  __shared__ int mb_cta_active_count;
+  __shared__ volatile unsigned int mb_live_seq[8];
+  __shared__ volatile unsigned int mb_live_round[8];
+  __shared__ volatile int mb_live_cid[8];
 
   const int lane_id = threadIdx.x & 31;
   const int warp_id = threadIdx.x >> 5;
@@ -3592,6 +3585,14 @@ __global__ void FQPTOwnerFrontierKernel(
         profile_round[w] = 0xFFFFFFFFu;
         profile_cid[w] = -1;
       }
+    }
+    __syncthreads();
+  }
+  if (enable_cid_microbatch) {
+    if (threadIdx.x < 8) {
+      mb_live_seq[threadIdx.x] = 0u;
+      mb_live_round[threadIdx.x] = 0u;
+      mb_live_cid[threadIdx.x] = -1;
     }
     __syncthreads();
   }
@@ -3858,92 +3859,276 @@ __global__ void FQPTOwnerFrontierKernel(
     while (true) {
       int world = -1;
       if (lane_id == 0) {
-        world = next_world_static;
-        next_world_static += world_stride;
-        mb_warp_world[warp_id] = world;
-        mb_warp_rounds[warp_id] = 0;
-        mb_warp_candidate_cid[warp_id] = -1;
-        mb_warp_exec_cid[warp_id] = -1;
-        mb_warp_force_degrade[warp_id] = 0;
+        if (enable_world_stealing) {
+          world = static_cast<int>(atomicAdd(control->world_cursor, 1u));
+        } else {
+          world = next_world_static;
+          next_world_static += world_stride;
+        }
       }
       world = __shfl_sync(full_mask, world, 0);
-
-      int world_active = (world >= 0 && world < control->num_worlds) ? 1 : 0;
-      if (world_active) {
-        WorldWorkspace* ws = &control->workspaces[world];
-        const ProbeTask probe = control->world_probes[world];
-
+      if (world < 0 || world >= control->num_worlds) {
         if (lane_id == 0) {
-          ws->inconsistent_flag = 0;
-          ws->scanner_index = 0;
-          ws->deletions = 0;
-          ws->iterations = 0;
-          ws->frontier_nonempty = 0;
-          control->world_results[world] = true;
-          control->world_status[world] = static_cast<int>(ProbeStatus::kOK);
+          const unsigned int seq0 = mb_live_seq[warp_id];
+          mb_live_seq[warp_id] = seq0 + 1u;
+          __threadfence_block();
+          mb_live_round[warp_id] = 0u;
+          mb_live_cid[warp_id] = -1;
+          __threadfence_block();
+          mb_live_seq[warp_id] = seq0 + 2u;
         }
+        break;
+      }
 
-        for (int idx = lane_id; idx < total_dom_words; idx += 32) {
-          ws->bitDom[idx] = control->domain_snapshot[idx];
-        }
-        for (int v = lane_id; v < model.num_vars; v += 32) {
-          ws->d_cur_dom_size[v] = control->dom_size_snapshot[v];
-        }
-        for (int w = lane_id; w < bitmap_words; w += 32) {
-          ws->frontier_A[w] = 0u;
-        }
-        for (int w = lane_id; w < l1_words; w += 32) {
-          ws->frontier_B[w] = 0u;
-        }
-        __syncwarp(full_mask);
+      WorldWorkspace* ws = &control->workspaces[world];
+      const ProbeTask probe = control->world_probes[world];
 
-        int world_ok = 1;
-        int seed_var = -1;
-        if (lane_id == 0) {
-          const int var = probe.var_id;
-          const int value = probe.value;
-          if (var < 0 || var >= model.num_vars ||
-              value < 0 || value >= model.max_dom_size) {
+      if (lane_id == 0) {
+        ws->inconsistent_flag = 0;
+        ws->scanner_index = 0;
+        ws->deletions = 0;
+        ws->iterations = 0;
+        ws->frontier_nonempty = 0;
+        control->world_results[world] = true;
+        control->world_status[world] = static_cast<int>(ProbeStatus::kOK);
+      }
+
+      for (int idx = lane_id; idx < total_dom_words; idx += 32) {
+        ws->bitDom[idx] = control->domain_snapshot[idx];
+      }
+      for (int v = lane_id; v < model.num_vars; v += 32) {
+        ws->d_cur_dom_size[v] = control->dom_size_snapshot[v];
+      }
+      for (int w = lane_id; w < bitmap_words; w += 32) {
+        ws->frontier_A[w] = 0u;
+      }
+      for (int w = lane_id; w < l1_words; w += 32) {
+        ws->frontier_B[w] = 0u;
+      }
+      __syncwarp(full_mask);
+
+      int world_ok = 1;
+      int seed_var = -1;
+      if (lane_id == 0) {
+        const int var = probe.var_id;
+        const int value = probe.value;
+        if (var < 0 || var >= model.num_vars ||
+            value < 0 || value >= model.max_dom_size) {
+          ws->inconsistent_flag = 1;
+          control->world_results[world] = false;
+          control->world_status[world] = static_cast<int>(ProbeStatus::kDWO);
+          world_ok = 0;
+        } else {
+          const int word_idx = value / 32;
+          const int bit_idx = value % 32;
+          if (word_idx < 0 || word_idx >= model.bit_dom_int_size) {
             ws->inconsistent_flag = 1;
             control->world_results[world] = false;
             control->world_status[world] = static_cast<int>(ProbeStatus::kDWO);
             world_ok = 0;
           } else {
-            const int word_idx = value / 32;
-            const int bit_idx = value % 32;
-            if (word_idx < 0 || word_idx >= model.bit_dom_int_size) {
+            const int dom_base = var * model.bit_dom_int_size;
+            const u32 old_word = ws->bitDom[dom_base + word_idx];
+            if ((old_word & (1u << bit_idx)) == 0u) {
               ws->inconsistent_flag = 1;
               control->world_results[world] = false;
               control->world_status[world] = static_cast<int>(ProbeStatus::kDWO);
               world_ok = 0;
             } else {
-              const int dom_base = var * model.bit_dom_int_size;
-              const u32 old_word = ws->bitDom[dom_base + word_idx];
-              if ((old_word & (1u << bit_idx)) == 0u) {
-                ws->inconsistent_flag = 1;
-                control->world_results[world] = false;
-                control->world_status[world] = static_cast<int>(ProbeStatus::kDWO);
-                world_ok = 0;
-              } else {
-                for (int w = 0; w < model.bit_dom_int_size; ++w) {
-                  ws->bitDom[dom_base + w] = 0u;
-                }
-                ws->bitDom[dom_base + word_idx] = (1u << bit_idx);
-                ws->d_cur_dom_size[var] = 1;
-                seed_var = var;
+              for (int w = 0; w < model.bit_dom_int_size; ++w) {
+                ws->bitDom[dom_base + w] = 0u;
               }
+              ws->bitDom[dom_base + word_idx] = (1u << bit_idx);
+              ws->d_cur_dom_size[var] = 1;
+              seed_var = var;
             }
           }
         }
-        world_ok = __shfl_sync(full_mask, world_ok, 0);
-        seed_var = __shfl_sync(full_mask, seed_var, 0);
-        if (!world_ok) {
-          world_active = 0;
-        } else if (seed_var >= 0) {
-          const int writes = FQPTPushVarNeighborsToFrontierTwoLevelDispatch(
+      }
+      world_ok = __shfl_sync(full_mask, world_ok, 0);
+      seed_var = __shfl_sync(full_mask, seed_var, 0);
+      if (!world_ok) {
+        if (lane_id == 0) {
+          const unsigned int seq0 = mb_live_seq[warp_id];
+          mb_live_seq[warp_id] = seq0 + 1u;
+          __threadfence_block();
+          mb_live_round[warp_id] = 0u;
+          mb_live_cid[warp_id] = -1;
+          __threadfence_block();
+          mb_live_seq[warp_id] = seq0 + 2u;
+        }
+        continue;
+      }
+      if (seed_var >= 0) {
+        const int writes = FQPTPushVarNeighborsToFrontierTwoLevelDispatch(
+            model,
+            ws,
+            seed_var,
+            bitmap_words,
+            l1_words,
+            lane_id,
+            full_mask,
+            enable_ow1_frontier_scatter,
+            ow1_scatter_mode,
+            ow1_force_scatter,
+            ow1_min_degree,
+            &local_ow1_scatter_calls,
+            &local_ow1_fallback_calls);
+        if (lane_id == 0) {
+          local_ow1_word_leader_writes += static_cast<unsigned long long>(writes);
+        }
+      }
+      __syncwarp(full_mask);
+
+      if (lane_id == 0) {
+        const unsigned int seq0 = mb_live_seq[warp_id];
+        mb_live_seq[warp_id] = seq0 + 1u;
+        __threadfence_block();
+        mb_live_round[warp_id] = 0u;
+        mb_live_cid[warp_id] = -1;
+        __threadfence_block();
+        mb_live_seq[warp_id] = seq0 + 2u;
+      }
+
+      int cursor_l1 = (world + 17) % l1_words;
+      int world_aligned_events = 0;
+      while (true) {
+        int cid = -1;
+        int scan_steps = 0;
+        int has_work = 0;
+        if (lane_id == 0) {
+          has_work = FQPTPopFrontierCidTwoLevel(
+              ws, bitmap_words, l1_words, &cursor_l1, &cid, &scan_steps) ? 1 : 0;
+        }
+        has_work = __shfl_sync(full_mask, has_work, 0);
+        cid = __shfl_sync(full_mask, cid, 0);
+        scan_steps = __shfl_sync(full_mask, scan_steps, 0);
+
+        if (lane_id == 0) {
+          local_frontier_scan_steps += static_cast<unsigned long long>(scan_steps);
+        }
+        if (!has_work) {
+          break;
+        }
+
+        int aligned_event = 0;
+        if (lane_id == 0) {
+          ++local_frontier_pops;
+          const unsigned int this_round =
+              static_cast<unsigned int>(local_frontier_pops);
+
+          const unsigned int seq0 = mb_live_seq[warp_id];
+          mb_live_seq[warp_id] = seq0 + 1u;
+          __threadfence_block();
+          mb_live_round[warp_id] = this_round;
+          mb_live_cid[warp_id] = cid;
+          __threadfence_block();
+          mb_live_seq[warp_id] = seq0 + 2u;
+
+          const int selected_warps = min(block_warps, microbatch_warps);
+          int sel_count = 0;
+          for (int w = 0; w < selected_warps; ++w) {
+            const unsigned int v0 = mb_live_seq[w];
+            if (v0 == 0u || ((v0 & 1u) != 0u)) continue;
+            const int other_cid = mb_live_cid[w];
+            __threadfence_block();
+            const unsigned int v1 = mb_live_seq[w];
+            if (v0 != v1 || ((v1 & 1u) != 0u)) continue;
+            if (other_cid == cid) {
+              ++sel_count;
+            }
+          }
+
+          aligned_event = (sel_count >= microbatch_min_sel) ? 1 : 0;
+          if (aligned_event != 0 &&
+              microbatch_max_rounds > 0 &&
+              world_aligned_events >= microbatch_max_rounds) {
+            aligned_event = 0;
+            ++local_microbatch_round_cap_fallbacks;
+          }
+          if (aligned_event != 0) {
+            ++world_aligned_events;
+            ++local_microbatch_aligned_rounds;
+          } else {
+            ++local_microbatch_degrade_rounds;
+          }
+        }
+        aligned_event = __shfl_sync(full_mask, aligned_event, 0);
+        (void)aligned_event;
+
+        if (enable_microbatch_profile && lane_id == 0 &&
+            (local_frontier_pops %
+             static_cast<unsigned long long>(profile_interval) == 0ULL)) {
+          const unsigned int sample_round = static_cast<unsigned int>(
+              local_frontier_pops / static_cast<unsigned long long>(profile_interval));
+          const unsigned int seq0 = profile_seq[warp_id];
+          profile_seq[warp_id] = seq0 + 1u;
+          __threadfence_block();
+          profile_round[warp_id] = sample_round;
+          profile_cid[warp_id] = cid;
+          __threadfence_block();
+          profile_seq[warp_id] = seq0 + 2u;
+
+          unsigned int sel_count = 0u;
+          for (int w = 0; w < block_warps; ++w) {
+            const unsigned int v0 = profile_seq[w];
+            if (v0 == 0u || ((v0 & 1u) != 0u)) continue;
+
+            const unsigned int other_round = profile_round[w];
+            const int other_cid = profile_cid[w];
+            __threadfence_block();
+            const unsigned int v1 = profile_seq[w];
+            if (v0 != v1 || ((v1 & 1u) != 0u)) continue;
+
+            if (other_round == sample_round && other_cid == cid) {
+              ++sel_count;
+            }
+          }
+
+          atomicAdd(control->microbatch_rounds, 1ULL);
+          atomicAdd(
+              control->microbatch_sel_sum,
+              static_cast<unsigned long long>(sel_count));
+          if (sel_count >= 2u) {
+            atomicAdd(control->microbatch_sel_ge2_rounds, 1ULL);
+          }
+        }
+
+        u32* warp_scratch = check_shared + warp_id * check_words_per_warp;
+        const PropagateResult r =
+            ExecuteConstraintCheck_BpC_Workspace_WarpPerWorld(
+                cid, model, ws, warp_scratch);
+
+        int push_var_x = -1;
+        int push_var_y = -1;
+        if (lane_id == 0) {
+          ++local_checks;
+          ++local_processed;
+          if (r.deletions > 0) {
+            local_deletions += static_cast<unsigned long long>(r.deletions);
+          }
+          if (r.inconsistent) {
+            ws->inconsistent_flag = 1;
+            control->world_results[world] = false;
+            control->world_status[world] = static_cast<int>(ProbeStatus::kDWO);
+          } else if (control->world_status[world] == static_cast<int>(ProbeStatus::kOK)) {
+            const int2 scope = model.constraint_scopes[cid];
+            if (r.x_changed) {
+              push_var_x = scope.x;
+            }
+            if (r.y_changed) {
+              push_var_y = scope.y;
+            }
+          }
+        }
+        push_var_x = __shfl_sync(full_mask, push_var_x, 0);
+        push_var_y = __shfl_sync(full_mask, push_var_y, 0);
+
+        if (push_var_x >= 0) {
+          const int writes_x = FQPTPushVarNeighborsToFrontierTwoLevelDispatch(
               model,
               ws,
-              seed_var,
+              push_var_x,
               bitmap_words,
               l1_words,
               lane_id,
@@ -3955,284 +4140,44 @@ __global__ void FQPTOwnerFrontierKernel(
               &local_ow1_scatter_calls,
               &local_ow1_fallback_calls);
           if (lane_id == 0) {
-            local_ow1_word_leader_writes += static_cast<unsigned long long>(writes);
+            local_ow1_word_leader_writes += static_cast<unsigned long long>(writes_x);
           }
         }
-      }
-      if (lane_id == 0) {
-        mb_warp_active[warp_id] = world_active;
-        mb_warp_cursor_l1[warp_id] = world_active ? ((world + 17) % l1_words) : 0;
-      }
-      __syncthreads();
-
-      if (threadIdx.x == 0) {
-        int active_count = 0;
-        for (int w = 0; w < block_warps; ++w) {
-          if (mb_warp_active[w] != 0) ++active_count;
-        }
-        mb_cta_active_count = active_count;
-      }
-      __syncthreads();
-      if (mb_cta_active_count == 0) {
-        break;
-      }
-
-      while (true) {
-        if (lane_id == 0) {
-          mb_warp_exec_cid[warp_id] = -1;
-          mb_warp_candidate_cid[warp_id] = -1;
-          mb_warp_force_degrade[warp_id] = 0;
-          if (mb_warp_active[warp_id] != 0) {
-            int cid = -1;
-            int scan_steps = 0;
-            int has_candidate = 0;
-
-            has_candidate = FQPTPopFrontierCidTwoLevel(
-                &control->workspaces[mb_warp_world[warp_id]],
-                bitmap_words,
-                l1_words,
-                &mb_warp_cursor_l1[warp_id],
-                &cid,
-                &scan_steps) ? 1 : 0;
-            if (has_candidate) {
-              local_frontier_scan_steps += static_cast<unsigned long long>(scan_steps);
-              ++local_frontier_pops;
-            }
-
-            if (has_candidate) {
-              mb_warp_candidate_cid[warp_id] = cid;
-              if (enable_microbatch_profile &&
-                  (local_frontier_pops %
-                   static_cast<unsigned long long>(profile_interval) == 0ULL)) {
-                const unsigned int sample_round = static_cast<unsigned int>(
-                    local_frontier_pops / static_cast<unsigned long long>(profile_interval));
-                const unsigned int seq0 = profile_seq[warp_id];
-                profile_seq[warp_id] = seq0 + 1u;
-                __threadfence_block();
-                profile_round[warp_id] = sample_round;
-                profile_cid[warp_id] = cid;
-                __threadfence_block();
-                profile_seq[warp_id] = seq0 + 2u;
-              }
-              if (microbatch_max_rounds > 0 &&
-                  mb_warp_rounds[warp_id] >= microbatch_max_rounds) {
-                mb_warp_force_degrade[warp_id] = 1;
-              }
-              ++mb_warp_rounds[warp_id];
-            } else {
-              mb_warp_active[warp_id] = 0;
-            }
+        if (push_var_y >= 0) {
+          const int writes_y = FQPTPushVarNeighborsToFrontierTwoLevelDispatch(
+              model,
+              ws,
+              push_var_y,
+              bitmap_words,
+              l1_words,
+              lane_id,
+              full_mask,
+              enable_ow1_frontier_scatter,
+              ow1_scatter_mode,
+              ow1_force_scatter,
+              ow1_min_degree,
+              &local_ow1_scatter_calls,
+              &local_ow1_fallback_calls);
+          if (lane_id == 0) {
+            local_ow1_word_leader_writes += static_cast<unsigned long long>(writes_y);
           }
         }
-        __syncthreads();
+        __syncwarp(full_mask);
 
-        if (threadIdx.x == 0) {
-          int active_count = 0;
-          for (int w = 0; w < block_warps; ++w) {
-            if (mb_warp_active[w] != 0) ++active_count;
-          }
-          mb_cta_active_count = active_count;
-        }
-        __syncthreads();
-        if (mb_cta_active_count == 0) {
+        const int world_status = __shfl_sync(full_mask, control->world_status[world], 0);
+        if (world_status != static_cast<int>(ProbeStatus::kOK)) {
           break;
         }
+      }
 
-        if (threadIdx.x == 0) {
-          const int selected_warps = min(block_warps, microbatch_warps);
-          int sel_cid = -1;
-          int sel_count = 0;
-          int active_selected = 0;
-          int round_cap_fallbacks = 0;
-
-          for (int i = 0; i < selected_warps; ++i) {
-            const int cid_i = mb_warp_candidate_cid[i];
-            if (cid_i < 0) continue;
-            ++active_selected;
-            int count = 0;
-            for (int j = 0; j < selected_warps; ++j) {
-              if (mb_warp_candidate_cid[j] == cid_i) {
-                ++count;
-              }
-            }
-            if (count > sel_count || (count == sel_count && (sel_cid < 0 || cid_i < sel_cid))) {
-              sel_cid = cid_i;
-              sel_count = count;
-            }
-          }
-
-          for (int w = 0; w < block_warps; ++w) {
-            if (mb_warp_candidate_cid[w] >= 0 && mb_warp_force_degrade[w] != 0) {
-              ++round_cap_fallbacks;
-            }
-            mb_warp_exec_cid[w] = -1;
-          }
-
-          mb_sel_cid = sel_cid;
-          mb_sel_count = sel_count;
-          local_microbatch_round_cap_fallbacks +=
-              static_cast<unsigned long long>(round_cap_fallbacks);
-
-          const bool aligned =
-              (sel_cid >= 0) &&
-              (sel_count >= microbatch_min_sel) &&
-              (sel_count * 2 >= active_selected);
-          if (aligned) {
-            ++local_microbatch_aligned_rounds;
-          } else {
-            ++local_microbatch_degrade_rounds;
-          }
-
-          for (int w = 0; w < block_warps; ++w) {
-            const int cid_w = mb_warp_candidate_cid[w];
-            if (cid_w < 0) continue;
-
-            // O3B-C: 达到 round cap 的 warp 本轮仅做本地 fallback，不拖累整轮退化。
-            if (w < selected_warps && mb_warp_force_degrade[w] != 0) {
-              mb_warp_exec_cid[w] = cid_w;
-              continue;
-            }
-
-            if (aligned && w < selected_warps && cid_w == sel_cid) {
-              mb_warp_exec_cid[w] = sel_cid;
-            } else {
-              mb_warp_exec_cid[w] = cid_w;
-            }
-          }
-
-          if (enable_microbatch_profile) {
-            for (int w = 0; w < block_warps; ++w) {
-              const int cid_w = mb_warp_candidate_cid[w];
-              if (cid_w < 0) continue;
-
-              const unsigned int seq0 = profile_seq[w];
-              if (seq0 == 0u || ((seq0 & 1u) != 0u)) continue;
-              const unsigned int sample_round = profile_round[w];
-              __threadfence_block();
-              const unsigned int seq1 = profile_seq[w];
-              if (seq0 != seq1 || ((seq1 & 1u) != 0u)) continue;
-
-              unsigned int local_sel = 0u;
-              for (int i = 0; i < block_warps; ++i) {
-                const unsigned int v0 = profile_seq[i];
-                if (v0 == 0u || ((v0 & 1u) != 0u)) continue;
-                const unsigned int other_round = profile_round[i];
-                const int other_cid = profile_cid[i];
-                __threadfence_block();
-                const unsigned int v1 = profile_seq[i];
-                if (v0 != v1 || ((v1 & 1u) != 0u)) continue;
-                if (other_round == sample_round && other_cid == cid_w) {
-                  ++local_sel;
-                }
-              }
-
-              atomicAdd(control->microbatch_rounds, 1ULL);
-              atomicAdd(
-                  control->microbatch_sel_sum,
-                  static_cast<unsigned long long>(local_sel));
-              if (local_sel >= 2u) {
-                atomicAdd(control->microbatch_sel_ge2_rounds, 1ULL);
-              }
-            }
-          }
-        }
-        __syncthreads();
-        const int sel_cid_snapshot = mb_sel_cid;
-        const int sel_count_snapshot = mb_sel_count;
-        (void)sel_cid_snapshot;
-        (void)sel_count_snapshot;
-
-        int exec_cid = -1;
-        int exec_world = -1;
-        if (lane_id == 0) {
-          exec_cid = mb_warp_exec_cid[warp_id];
-          exec_world = mb_warp_world[warp_id];
-        }
-        exec_cid = __shfl_sync(full_mask, exec_cid, 0);
-        exec_world = __shfl_sync(full_mask, exec_world, 0);
-
-        if (exec_cid >= 0 && exec_world >= 0 && exec_world < control->num_worlds) {
-          WorldWorkspace* ws = &control->workspaces[exec_world];
-          u32* warp_scratch = check_shared + warp_id * check_words_per_warp;
-          const PropagateResult r =
-              ExecuteConstraintCheck_BpC_Workspace_WarpPerWorld(
-                  exec_cid, model, ws, warp_scratch);
-
-          int push_var_x = -1;
-          int push_var_y = -1;
-          if (lane_id == 0) {
-            ++local_checks;
-            ++local_processed;
-            if (r.deletions > 0) {
-              local_deletions += static_cast<unsigned long long>(r.deletions);
-            }
-            if (r.inconsistent) {
-              ws->inconsistent_flag = 1;
-              control->world_results[exec_world] = false;
-              control->world_status[exec_world] = static_cast<int>(ProbeStatus::kDWO);
-              mb_warp_active[warp_id] = 0;
-            } else if (control->world_status[exec_world] == static_cast<int>(ProbeStatus::kOK)) {
-              const int2 scope = model.constraint_scopes[exec_cid];
-              if (r.x_changed) {
-                push_var_x = scope.x;
-              }
-              if (r.y_changed) {
-                push_var_y = scope.y;
-              }
-            }
-          }
-          push_var_x = __shfl_sync(full_mask, push_var_x, 0);
-          push_var_y = __shfl_sync(full_mask, push_var_y, 0);
-
-          if (push_var_x >= 0) {
-            const int writes_x = FQPTPushVarNeighborsToFrontierTwoLevelDispatch(
-                model,
-                ws,
-                push_var_x,
-                bitmap_words,
-                l1_words,
-                lane_id,
-                full_mask,
-                enable_ow1_frontier_scatter,
-                ow1_scatter_mode,
-                ow1_force_scatter,
-                ow1_min_degree,
-                &local_ow1_scatter_calls,
-                &local_ow1_fallback_calls);
-            if (lane_id == 0) {
-              local_ow1_word_leader_writes += static_cast<unsigned long long>(writes_x);
-            }
-          }
-          if (push_var_y >= 0) {
-            const int writes_y = FQPTPushVarNeighborsToFrontierTwoLevelDispatch(
-                model,
-                ws,
-                push_var_y,
-                bitmap_words,
-                l1_words,
-                lane_id,
-                full_mask,
-                enable_ow1_frontier_scatter,
-                ow1_scatter_mode,
-                ow1_force_scatter,
-                ow1_min_degree,
-                &local_ow1_scatter_calls,
-                &local_ow1_fallback_calls);
-            if (lane_id == 0) {
-              local_ow1_word_leader_writes += static_cast<unsigned long long>(writes_y);
-            }
-          }
-          __syncwarp(full_mask);
-
-          const int world_status =
-              __shfl_sync(full_mask, control->world_status[exec_world], 0);
-          if (world_status != static_cast<int>(ProbeStatus::kOK)) {
-            if (lane_id == 0) {
-              mb_warp_active[warp_id] = 0;
-            }
-          }
-        }
-        __syncthreads();
+      if (lane_id == 0) {
+        const unsigned int seq0 = mb_live_seq[warp_id];
+        mb_live_seq[warp_id] = seq0 + 1u;
+        __threadfence_block();
+        mb_live_round[warp_id] = static_cast<unsigned int>(local_frontier_pops);
+        mb_live_cid[warp_id] = -1;
+        __threadfence_block();
+        mb_live_seq[warp_id] = seq0 + 2u;
       }
     }
   }

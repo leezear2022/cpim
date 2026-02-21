@@ -2309,6 +2309,92 @@ PropagateResult ExecuteConstraintCheck_BpC_Workspace_SubwarpPerWorld(
   return r;
 }
 
+// bit_dom_int_size==1 的 OW5 快路径：
+// 仅 subwarp leader 执行删值与 dom_size 更新，其他 lane 不参与计算。
+__device__
+PropagateResult ExecuteConstraintCheck_BpC_Workspace_SubwarpPerWorld_BitDom1Fast(
+    int cid,
+    const GModelData& model,
+    WorldWorkspace* ws,
+    int lane_in_subwarp) {
+  PropagateResult r{};
+  r.x_changed = r.y_changed = r.inconsistent = false;
+  r.deletions = 0;
+
+  if (lane_in_subwarp != 0) {
+    return r;
+  }
+
+  const int2 scope = model.constraint_scopes[cid];
+  const int x = scope.x;
+  const int y = scope.y;
+  if (x < 0 || y < 0) {
+    return r;
+  }
+
+  u32* dom_x = ws->bitDom + x * model.bit_dom_int_size;
+  u32* dom_y = ws->bitDom + y * model.bit_dom_int_size;
+
+  const u32 valid_mask =
+      (model.max_dom_size >= 32) ? 0xFFFFFFFFu : ((1u << model.max_dom_size) - 1u);
+  const u32 old_x = dom_x[0];
+  const u32 old_y = dom_y[0];
+  const u32 old_x_valid = old_x & valid_mask;
+  const u32 old_y_valid = old_y & valid_mask;
+
+  const int sup_base = cid * model.bitsup_per_constraint;
+  u32 new_x = 0u;
+  u32 x_bits = old_x_valid;
+  while (x_bits != 0u) {
+    const int bit = __ffs(static_cast<int>(x_bits)) - 1;
+    x_bits &= (x_bits - 1u);
+    const uint2 sup = model.bitSupData[sup_base + bit];
+    if ((sup.x & old_y_valid) != 0u) {
+      new_x |= (1u << bit);
+    }
+  }
+
+  u32 new_y = 0u;
+  u32 y_bits = old_y_valid;
+  while (y_bits != 0u) {
+    const int bit = __ffs(static_cast<int>(y_bits)) - 1;
+    y_bits &= (y_bits - 1u);
+    const uint2 sup = model.bitSupData[sup_base + model.max_dom_size + bit];
+    if ((sup.y & old_x_valid) != 0u) {
+      new_y |= (1u << bit);
+    }
+  }
+
+  const int del_x = __popc(old_x) - __popc(new_x);
+  const int del_y = __popc(old_y) - __popc(new_y);
+
+  int size_x = ws->d_cur_dom_size[x];
+  int size_y = ws->d_cur_dom_size[y];
+  if (new_x != old_x) {
+    dom_x[0] = new_x;
+    r.x_changed = true;
+  }
+  if (new_y != old_y) {
+    dom_y[0] = new_y;
+    r.y_changed = true;
+  }
+
+  if (del_x > 0) {
+    size_x -= del_x;
+    ws->d_cur_dom_size[x] = size_x;
+    r.deletions += del_x;
+  }
+  if (del_y > 0) {
+    size_y -= del_y;
+    ws->d_cur_dom_size[y] = size_y;
+    r.deletions += del_y;
+  }
+  if (size_x == 0 || size_y == 0) {
+    r.inconsistent = true;
+  }
+  return r;
+}
+
 // CheckValueSupportBitSup_BlockSync - Cheap Precheck（安全"早失败"）
 // 返回：true=需要完整 GAC；false=已确定 DWO（可短路）
 __device__
@@ -3689,6 +3775,9 @@ __global__ void FQPTOwnerFrontierKernel(
   __shared__ volatile unsigned int mb_live_seq[8];
   __shared__ volatile unsigned int mb_live_round[8];
   __shared__ volatile int mb_live_cid[8];
+  __shared__ int ow5_chunk_base[8];
+  __shared__ int ow5_chunk_next[8];
+  __shared__ int ow5_chunk_lock[8];
 
   const int lane_id = threadIdx.x & 31;
   const int warp_id = threadIdx.x >> 5;
@@ -3706,6 +3795,7 @@ __global__ void FQPTOwnerFrontierKernel(
           ? control->subwarp_tile_size
           : 8;
   const int worlds_per_warp = 32 / subwarp_size;
+  const int ow5_claim_chunk = max(8, worlds_per_warp * 4);
   const int subwarp_id = lane_id / subwarp_size;
   const int lane_in_subwarp = lane_id % subwarp_size;
   const int subwarp_leader_lane = subwarp_id * subwarp_size;
@@ -3749,6 +3839,14 @@ __global__ void FQPTOwnerFrontierKernel(
     }
     __syncthreads();
   }
+  if (enable_subwarp_multiworld) {
+    if (threadIdx.x < 8) {
+      ow5_chunk_base[threadIdx.x] = -1;
+      ow5_chunk_next[threadIdx.x] = ow5_claim_chunk;
+      ow5_chunk_lock[threadIdx.x] = 0;
+    }
+    __syncthreads();
+  }
 
   unsigned long long local_checks = 0ULL;
   unsigned long long local_deletions = 0ULL;
@@ -3772,7 +3870,24 @@ __global__ void FQPTOwnerFrontierKernel(
       int world = -1;
       if (lane_in_subwarp == 0) {
         if (enable_world_stealing) {
-          world = static_cast<int>(atomicAdd(control->world_cursor, 1u));
+          while (true) {
+            const int idx = atomicAdd(&ow5_chunk_next[warp_id], 1);
+            const int base = ow5_chunk_base[warp_id];
+            if (base >= 0 && idx < ow5_claim_chunk) {
+              world = base + idx;
+              break;
+            }
+            if (atomicCAS(&ow5_chunk_lock[warp_id], 0, 1) == 0) {
+              const unsigned int new_base =
+                  atomicAdd(control->world_cursor,
+                            static_cast<unsigned int>(ow5_claim_chunk));
+              ow5_chunk_base[warp_id] = static_cast<int>(new_base);
+              __threadfence_block();
+              ow5_chunk_next[warp_id] = 0;
+              __threadfence_block();
+              atomicExch(&ow5_chunk_lock[warp_id], 0);
+            }
+          }
         } else {
           world = next_world_subwarp_static;
           next_world_subwarp_static += world_subwarp_stride;
@@ -3857,7 +3972,6 @@ __global__ void FQPTOwnerFrontierKernel(
         FQPTPushVarNeighborsToFrontierTwoLevel(
             model, ws, seed_var, bitmap_words, l1_words);
       }
-      __syncwarp(subwarp_mask);
 
       int cursor_l1 = (world + 17) % l1_words;
       while (true) {
@@ -3883,18 +3997,23 @@ __global__ void FQPTOwnerFrontierKernel(
           ++local_frontier_pops;
         }
 
-        u32* subwarp_scratch = check_shared +
-            (warp_id * worlds_per_warp + subwarp_id) * check_words_per_warp;
-        const PropagateResult r =
-            ExecuteConstraintCheck_BpC_Workspace_SubwarpPerWorld(
-                cid,
-                model,
-                ws,
-                lane_id,
-                subwarp_size,
-                lane_in_subwarp,
-                subwarp_mask,
-                subwarp_scratch);
+        PropagateResult r{};
+        if (model.bit_dom_int_size == 1) {
+          r = ExecuteConstraintCheck_BpC_Workspace_SubwarpPerWorld_BitDom1Fast(
+              cid, model, ws, lane_in_subwarp);
+        } else {
+          u32* subwarp_scratch = check_shared +
+              (warp_id * worlds_per_warp + subwarp_id) * check_words_per_warp;
+          r = ExecuteConstraintCheck_BpC_Workspace_SubwarpPerWorld(
+              cid,
+              model,
+              ws,
+              lane_id,
+              subwarp_size,
+              lane_in_subwarp,
+              subwarp_mask,
+              subwarp_scratch);
+        }
 
         int push_var_x = -1;
         int push_var_y = -1;
@@ -3929,7 +4048,6 @@ __global__ void FQPTOwnerFrontierKernel(
           FQPTPushVarNeighborsToFrontierTwoLevel(
               model, ws, push_var_y, bitmap_words, l1_words);
         }
-        __syncwarp(subwarp_mask);
 
         const int world_status =
             __shfl_sync(subwarp_mask, control->world_status[world], subwarp_leader_lane);

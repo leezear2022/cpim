@@ -3070,15 +3070,33 @@ void FQPTBaselineManager::LaunchKernel(int num_worlds) {
   d_control_->group_warps_per_cta = group_warps_per_cta_;
   d_control_->group_degrade_threshold = group_degrade_threshold_;
   d_control_->enable_world_owner = enable_world_owner_ ? 1 : 0;
-  const bool effective_microbatch = enable_world_owner_ && enable_cid_microbatch_;
+  const bool ow5_supported = (model_->GetModelData().bit_dom_int_size == 1);
+  const bool requested_subwarp = enable_world_owner_ && enable_subwarp_multiworld_;
+  const bool effective_subwarp = requested_subwarp && ow5_supported;
+  const bool effective_microbatch =
+      enable_world_owner_ && enable_cid_microbatch_ && !effective_subwarp;
   const bool effective_world_stealing =
       enable_world_owner_ && enable_world_stealing_;
+  if (requested_subwarp && !ow5_supported) {
+    LOG(WARNING) << "FQ-PT OW5 fallback: bit_dom_int_size="
+                 << model_->GetModelData().bit_dom_int_size
+                 << " (OW5 only supports bit_dom_int_size==1)";
+  }
+  if (effective_subwarp && enable_cid_microbatch_) {
+    LOG(WARNING) << "FQ-PT OW5 priority: cid micro-batch is ignored when OW5 is enabled";
+  }
+  if (effective_subwarp && enable_ow1_frontier_scatter_) {
+    LOG(WARNING) << "FQ-PT OW5 path disables OW1 frontier scatter "
+                 << "(32-lane OW1 scatter is incompatible with subwarp tiles)";
+  }
   d_control_->enable_world_stealing =
       effective_world_stealing ? 1 : 0;
   d_control_->world_cursor =
       effective_world_stealing ? d_world_cursor_ : nullptr;
+  d_control_->enable_subwarp_multiworld = effective_subwarp ? 1 : 0;
+  d_control_->subwarp_tile_size = SanitizeSubwarpSize(subwarp_tile_size_);
   d_control_->enable_ow1_frontier_scatter =
-      (enable_world_owner_ && enable_ow1_frontier_scatter_) ? 1 : 0;
+      (enable_world_owner_ && enable_ow1_frontier_scatter_ && !effective_subwarp) ? 1 : 0;
   d_control_->ow1_min_degree = ow1_min_degree_;
   d_control_->ow1_scatter_mode = ow1_scatter_mode_;
   d_control_->ow1_force_scatter = ow1_force_scatter_ ? 1 : 0;

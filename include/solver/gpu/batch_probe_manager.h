@@ -1083,6 +1083,8 @@ struct FQPTControl {
   int microbatch_min_sel;                // OW3b: sel_count 最小阈值
   int microbatch_warps;                  // OW3b: 参与分组的 warp 数（1..8）
   int microbatch_max_rounds;             // OW3b: 每 world 轮数上限（0=不限）
+  int enable_subwarp_multiworld;         // 1=启用 OW5 subwarp multi-world
+  int subwarp_tile_size;                 // OW5: subwarp 大小（4/8/16）
   int enable_cid_microbatch_profile;     // 1=启用 OW3a 命中率统计采样
   int microbatch_profile_interval;       // OW3a 采样间隔（轮）
 
@@ -1145,6 +1147,8 @@ struct FQPTControl {
         microbatch_min_sel(2),
         microbatch_warps(8),
         microbatch_max_rounds(0),
+        enable_subwarp_multiworld(0),
+        subwarp_tile_size(8),
         enable_cid_microbatch_profile(0),
         microbatch_profile_interval(64),
         total_constraint_checks(nullptr),
@@ -1262,6 +1266,12 @@ class FQPTBaselineManager {
   void SetMicrobatchMaxRounds(int rounds) {
     microbatch_max_rounds_ = std::max(0, rounds);
   }
+  void SetEnableSubwarpMultiworld(bool enabled) {
+    enable_subwarp_multiworld_ = enabled;
+  }
+  void SetSubwarpTileSize(int tile) {
+    subwarp_tile_size_ = (tile == 4 || tile == 8 || tile == 16) ? tile : 8;
+  }
   void SetEnableCidMicrobatchProfile(bool enabled) {
     enable_cid_microbatch_profile_ = enabled;
   }
@@ -1314,6 +1324,8 @@ class FQPTBaselineManager {
   int microbatch_min_sel_ = 2;
   int microbatch_warps_ = 8;
   int microbatch_max_rounds_ = 0;
+  bool enable_subwarp_multiworld_ = false;
+  int subwarp_tile_size_ = 8;
   bool enable_cid_microbatch_profile_ = false;
   int microbatch_profile_interval_ = 64;
   bool stats_enabled_ = true;

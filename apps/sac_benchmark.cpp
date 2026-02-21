@@ -118,6 +118,10 @@ DEFINE_int32(fqpt_microbatch_warps, 8,
              "FQ-PT OW3b: max warps participating in micro-batch (1..8)");
 DEFINE_int32(fqpt_microbatch_max_rounds, 0,
              "FQ-PT OW3b: max per-world micro-batch rounds (0=unlimited)");
+DEFINE_bool(fqpt_enable_subwarp_multiworld, false,
+            "FQ-PT OW5: enable subwarp multi-world path");
+DEFINE_int32(fqpt_subwarp_tile, 8,
+             "FQ-PT OW5: subwarp tile size (4/8/16)");
 DEFINE_bool(fqpt_enable_cid_microbatch_profile, false,
             "FQ-PT OW3a: enable cid micro-batch profile counters");
 DEFINE_int32(fqpt_microbatch_profile_interval, 64,
@@ -166,6 +170,8 @@ void ConfigureFQPTManager(FQPTBaselineManager& manager) {
     manager.SetOW1MinDegree(FLAGS_fqpt_ow1_min_degree);
     manager.SetOW1ScatterMode(FLAGS_fqpt_ow1_scatter_mode);
     manager.SetOW1ForceScatter(FLAGS_fqpt_ow1_force_scatter);
+    manager.SetEnableSubwarpMultiworld(FLAGS_fqpt_enable_subwarp_multiworld);
+    manager.SetSubwarpTileSize(FLAGS_fqpt_subwarp_tile);
     manager.SetEnableCidMicrobatch(FLAGS_fqpt_enable_cid_microbatch);
     manager.SetMicrobatchMinSel(FLAGS_fqpt_microbatch_min_sel);
     manager.SetMicrobatchWarps(FLAGS_fqpt_microbatch_warps);
@@ -695,7 +701,15 @@ BenchmarkResult RunFQPTBenchmark(GModel* gmodel,
                                  int warmup, int iterations) {
     BenchmarkResult result;
     if (FLAGS_fqpt_enable_world_owner) {
-        if (FLAGS_fqpt_enable_cid_microbatch) {
+        if (FLAGS_fqpt_enable_subwarp_multiworld) {
+            if (FLAGS_fqpt_subwarp_tile == 4 ||
+                FLAGS_fqpt_subwarp_tile == 8 ||
+                FLAGS_fqpt_subwarp_tile == 16) {
+                result.mode_name = "FQ-PT(OWF+OW5t" + std::to_string(FLAGS_fqpt_subwarp_tile) + ")";
+            } else {
+                result.mode_name = "FQ-PT(OWF+OW5t8)";
+            }
+        } else if (FLAGS_fqpt_enable_cid_microbatch) {
             if (FLAGS_fqpt_enable_ow1_frontier_scatter) {
                 result.mode_name = FLAGS_fqpt_ow1_scatter_mode == 2
                                        ? "FQ-PT(OWF+OW1m2+OW3b)"

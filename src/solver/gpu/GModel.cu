@@ -2170,6 +2170,145 @@ PropagateResult ExecuteConstraintCheck_BpC_Workspace_WarpPerWorld(
   return r;
 }
 
+// ExecuteConstraintCheck_BpC_Workspace_SubwarpPerWorld
+// OW5 路径使用：一个 warp 内多个 subwarp 并行处理多个 world。
+// 仅使用 subwarp 局部同步，避免 block 级 barrier。
+__device__
+PropagateResult ExecuteConstraintCheck_BpC_Workspace_SubwarpPerWorld(
+    int cid,
+    const GModelData& model,
+    WorldWorkspace* ws,
+    int lane_id,
+    int subwarp_size,
+    int lane_in_subwarp,
+    u32 subwarp_mask,
+    u32* shared_mem) {
+  PropagateResult r{};
+  r.x_changed = r.y_changed = r.inconsistent = false;
+  r.deletions = 0;
+
+  const int2 scope = model.constraint_scopes[cid];
+  const int x = scope.x;
+  const int y = scope.y;
+  if (x < 0 || y < 0) {
+    return r;
+  }
+
+  u32* dom_x = ws->bitDom + x * model.bit_dom_int_size;
+  u32* dom_y = ws->bitDom + y * model.bit_dom_int_size;
+  u32* del_x_words = shared_mem;
+  u32* del_y_words = shared_mem + model.bit_dom_int_size;
+
+  for (int word = lane_in_subwarp; word < model.bit_dom_int_size; word += subwarp_size) {
+    const u32 old_x = dom_x[word];
+    const u32 old_y = dom_y[word];
+
+    u32 del_x = 0u;
+    u32 del_y = 0u;
+
+    u32 x_bits = old_x;
+    while (x_bits != 0u) {
+      const int bit = __ffs(static_cast<int>(x_bits)) - 1;
+      x_bits &= (x_bits - 1u);
+      const int value = word * 32 + bit;
+      if (value < 0 || value >= model.max_dom_size) {
+        del_x |= (1u << bit);
+        continue;
+      }
+      const int sup_idx_base =
+          cid * model.bitsup_per_constraint +
+          (0 * model.max_dom_size + value) * model.bit_dom_int_size;
+      bool has_sup = false;
+      for (int w = 0; w < model.bit_dom_int_size; ++w) {
+        has_sup |= (model.bitSupData[sup_idx_base + w].x & dom_y[w]) != 0u;
+      }
+      if (!has_sup) {
+        del_x |= (1u << bit);
+      }
+    }
+
+    u32 y_bits = old_y;
+    while (y_bits != 0u) {
+      const int bit = __ffs(static_cast<int>(y_bits)) - 1;
+      y_bits &= (y_bits - 1u);
+      const int value = word * 32 + bit;
+      if (value < 0 || value >= model.max_dom_size) {
+        del_y |= (1u << bit);
+        continue;
+      }
+      const int sup_idx_base =
+          cid * model.bitsup_per_constraint +
+          (1 * model.max_dom_size + value) * model.bit_dom_int_size;
+      bool has_sup = false;
+      for (int w = 0; w < model.bit_dom_int_size; ++w) {
+        has_sup |= (model.bitSupData[sup_idx_base + w].y & dom_x[w]) != 0u;
+      }
+      if (!has_sup) {
+        del_y |= (1u << bit);
+      }
+    }
+
+    del_x_words[word] = del_x;
+    del_y_words[word] = del_y;
+  }
+
+  __syncwarp(subwarp_mask);
+
+  int x_changed_i = 0;
+  int y_changed_i = 0;
+  int inconsistent_i = 0;
+  int deletions_i = 0;
+  const int subwarp_id = lane_id / subwarp_size;
+  const int leader_lane = subwarp_id * subwarp_size;
+  if (lane_in_subwarp == 0) {
+    int size_x = ws->d_cur_dom_size[x];
+    int size_y = ws->d_cur_dom_size[y];
+    int local_del_x = 0;
+    int local_del_y = 0;
+
+    for (int w = 0; w < model.bit_dom_int_size; ++w) {
+      const u32 old_x = dom_x[w];
+      const u32 old_y = dom_y[w];
+      const u32 new_x = old_x & ~del_x_words[w];
+      const u32 new_y = old_y & ~del_y_words[w];
+      if (new_x != old_x) {
+        dom_x[w] = new_x;
+        x_changed_i = 1;
+        local_del_x += __popc(old_x) - __popc(new_x);
+      }
+      if (new_y != old_y) {
+        dom_y[w] = new_y;
+        y_changed_i = 1;
+        local_del_y += __popc(old_y) - __popc(new_y);
+      }
+    }
+
+    if (local_del_x > 0) {
+      size_x -= local_del_x;
+      ws->d_cur_dom_size[x] = size_x;
+      deletions_i += local_del_x;
+    }
+    if (local_del_y > 0) {
+      size_y -= local_del_y;
+      ws->d_cur_dom_size[y] = size_y;
+      deletions_i += local_del_y;
+    }
+    if (size_x == 0 || size_y == 0) {
+      inconsistent_i = 1;
+    }
+  }
+
+  x_changed_i = __shfl_sync(subwarp_mask, x_changed_i, leader_lane);
+  y_changed_i = __shfl_sync(subwarp_mask, y_changed_i, leader_lane);
+  inconsistent_i = __shfl_sync(subwarp_mask, inconsistent_i, leader_lane);
+  deletions_i = __shfl_sync(subwarp_mask, deletions_i, leader_lane);
+  r.x_changed = (x_changed_i != 0);
+  r.y_changed = (y_changed_i != 0);
+  r.inconsistent = (inconsistent_i != 0);
+  r.deletions = deletions_i;
+  return r;
+}
+
 // CheckValueSupportBitSup_BlockSync - Cheap Precheck（安全"早失败"）
 // 返回：true=需要完整 GAC；false=已确定 DWO（可短路）
 __device__
@@ -3560,8 +3699,22 @@ __global__ void FQPTOwnerFrontierKernel(
   const int world_stride = block_warps * gridDim.x;
   const int check_words_per_warp = 2 * model.bit_dom_int_size + 16;
   const u32 full_mask = 0xFFFFFFFFu;
+  const int subwarp_size =
+      (control->subwarp_tile_size == 4 ||
+       control->subwarp_tile_size == 8 ||
+       control->subwarp_tile_size == 16)
+          ? control->subwarp_tile_size
+          : 8;
+  const int worlds_per_warp = 32 / subwarp_size;
+  const int subwarp_id = lane_id / subwarp_size;
+  const int lane_in_subwarp = lane_id % subwarp_size;
+  const int subwarp_leader_lane = subwarp_id * subwarp_size;
+  const u32 subwarp_mask =
+      ((1u << subwarp_size) - 1u) << (subwarp_id * subwarp_size);
   const bool enable_world_stealing =
       (control->enable_world_stealing != 0) && (control->world_cursor != nullptr);
+  const bool enable_subwarp_multiworld =
+      (control->enable_subwarp_multiworld != 0) && (model.bit_dom_int_size == 1);
   const bool enable_ow1_frontier_scatter =
       (control->enable_ow1_frontier_scatter != 0);
   const int ow1_min_degree = max(1, control->ow1_min_degree);
@@ -3611,7 +3764,181 @@ __global__ void FQPTOwnerFrontierKernel(
   unsigned long long local_microbatch_round_cap_fallbacks = 0ULL;
 
   int next_world_static = blockIdx.x + warp_id * gridDim.x;
-  if (!enable_cid_microbatch) {
+  if (enable_subwarp_multiworld) {
+    int next_world_subwarp_static =
+        ((blockIdx.x * block_warps + warp_id) * worlds_per_warp) + subwarp_id;
+    const int world_subwarp_stride = gridDim.x * block_warps * worlds_per_warp;
+    while (true) {
+      int world = -1;
+      if (lane_in_subwarp == 0) {
+        if (enable_world_stealing) {
+          world = static_cast<int>(atomicAdd(control->world_cursor, 1u));
+        } else {
+          world = next_world_subwarp_static;
+          next_world_subwarp_static += world_subwarp_stride;
+        }
+      }
+      world = __shfl_sync(subwarp_mask, world, subwarp_leader_lane);
+      if (world < 0 || world >= control->num_worlds) {
+        break;
+      }
+
+      WorldWorkspace* ws = &control->workspaces[world];
+      const ProbeTask probe = control->world_probes[world];
+
+      if (lane_in_subwarp == 0) {
+        ws->inconsistent_flag = 0;
+        ws->scanner_index = 0;
+        ws->deletions = 0;
+        ws->iterations = 0;
+        ws->frontier_nonempty = 0;
+        control->world_results[world] = true;
+        control->world_status[world] = static_cast<int>(ProbeStatus::kOK);
+      }
+
+      for (int idx = lane_in_subwarp; idx < total_dom_words; idx += subwarp_size) {
+        ws->bitDom[idx] = control->domain_snapshot[idx];
+      }
+      for (int v = lane_in_subwarp; v < model.num_vars; v += subwarp_size) {
+        ws->d_cur_dom_size[v] = control->dom_size_snapshot[v];
+      }
+      for (int w = lane_in_subwarp; w < bitmap_words; w += subwarp_size) {
+        ws->frontier_A[w] = 0u;
+      }
+      for (int w = lane_in_subwarp; w < l1_words; w += subwarp_size) {
+        ws->frontier_B[w] = 0u;
+      }
+      __syncwarp(subwarp_mask);
+
+      int world_ok = 1;
+      int seed_var = -1;
+      if (lane_in_subwarp == 0) {
+        const int var = probe.var_id;
+        const int value = probe.value;
+        if (var < 0 || var >= model.num_vars ||
+            value < 0 || value >= model.max_dom_size) {
+          ws->inconsistent_flag = 1;
+          control->world_results[world] = false;
+          control->world_status[world] = static_cast<int>(ProbeStatus::kDWO);
+          world_ok = 0;
+        } else {
+          const int word_idx = value / 32;
+          const int bit_idx = value % 32;
+          if (word_idx < 0 || word_idx >= model.bit_dom_int_size) {
+            ws->inconsistent_flag = 1;
+            control->world_results[world] = false;
+            control->world_status[world] = static_cast<int>(ProbeStatus::kDWO);
+            world_ok = 0;
+          } else {
+            const int dom_base = var * model.bit_dom_int_size;
+            const u32 old_word = ws->bitDom[dom_base + word_idx];
+            if ((old_word & (1u << bit_idx)) == 0u) {
+              ws->inconsistent_flag = 1;
+              control->world_results[world] = false;
+              control->world_status[world] = static_cast<int>(ProbeStatus::kDWO);
+              world_ok = 0;
+            } else {
+              for (int w = 0; w < model.bit_dom_int_size; ++w) {
+                ws->bitDom[dom_base + w] = 0u;
+              }
+              ws->bitDom[dom_base + word_idx] = (1u << bit_idx);
+              ws->d_cur_dom_size[var] = 1;
+              seed_var = var;
+            }
+          }
+        }
+      }
+      world_ok = __shfl_sync(subwarp_mask, world_ok, subwarp_leader_lane);
+      seed_var = __shfl_sync(subwarp_mask, seed_var, subwarp_leader_lane);
+      if (!world_ok) {
+        continue;
+      }
+      if (seed_var >= 0 && lane_in_subwarp == 0) {
+        FQPTPushVarNeighborsToFrontierTwoLevel(
+            model, ws, seed_var, bitmap_words, l1_words);
+      }
+      __syncwarp(subwarp_mask);
+
+      int cursor_l1 = (world + 17) % l1_words;
+      while (true) {
+        int cid = -1;
+        int scan_steps = 0;
+        int has_work = 0;
+        if (lane_in_subwarp == 0) {
+          has_work = FQPTPopFrontierCidTwoLevel(
+              ws, bitmap_words, l1_words, &cursor_l1, &cid, &scan_steps) ? 1 : 0;
+        }
+        has_work = __shfl_sync(subwarp_mask, has_work, subwarp_leader_lane);
+        cid = __shfl_sync(subwarp_mask, cid, subwarp_leader_lane);
+        scan_steps = __shfl_sync(subwarp_mask, scan_steps, subwarp_leader_lane);
+
+        if (lane_in_subwarp == 0) {
+          local_frontier_scan_steps += static_cast<unsigned long long>(scan_steps);
+        }
+        if (!has_work) {
+          break;
+        }
+
+        if (lane_in_subwarp == 0) {
+          ++local_frontier_pops;
+        }
+
+        u32* subwarp_scratch = check_shared +
+            (warp_id * worlds_per_warp + subwarp_id) * check_words_per_warp;
+        const PropagateResult r =
+            ExecuteConstraintCheck_BpC_Workspace_SubwarpPerWorld(
+                cid,
+                model,
+                ws,
+                lane_id,
+                subwarp_size,
+                lane_in_subwarp,
+                subwarp_mask,
+                subwarp_scratch);
+
+        int push_var_x = -1;
+        int push_var_y = -1;
+        if (lane_in_subwarp == 0) {
+          ++local_checks;
+          ++local_processed;
+          if (r.deletions > 0) {
+            local_deletions += static_cast<unsigned long long>(r.deletions);
+          }
+          if (r.inconsistent) {
+            ws->inconsistent_flag = 1;
+            control->world_results[world] = false;
+            control->world_status[world] = static_cast<int>(ProbeStatus::kDWO);
+          } else if (control->world_status[world] == static_cast<int>(ProbeStatus::kOK)) {
+            const int2 scope = model.constraint_scopes[cid];
+            if (r.x_changed) {
+              push_var_x = scope.x;
+            }
+            if (r.y_changed) {
+              push_var_y = scope.y;
+            }
+          }
+        }
+        push_var_x = __shfl_sync(subwarp_mask, push_var_x, subwarp_leader_lane);
+        push_var_y = __shfl_sync(subwarp_mask, push_var_y, subwarp_leader_lane);
+
+        if (push_var_x >= 0 && lane_in_subwarp == 0) {
+          FQPTPushVarNeighborsToFrontierTwoLevel(
+              model, ws, push_var_x, bitmap_words, l1_words);
+        }
+        if (push_var_y >= 0 && lane_in_subwarp == 0) {
+          FQPTPushVarNeighborsToFrontierTwoLevel(
+              model, ws, push_var_y, bitmap_words, l1_words);
+        }
+        __syncwarp(subwarp_mask);
+
+        const int world_status =
+            __shfl_sync(subwarp_mask, control->world_status[world], subwarp_leader_lane);
+        if (world_status != static_cast<int>(ProbeStatus::kOK)) {
+          break;
+        }
+      }
+    }
+  } else if (!enable_cid_microbatch) {
     while (true) {
       int world = -1;
       if (lane_id == 0) {
@@ -4182,7 +4509,9 @@ __global__ void FQPTOwnerFrontierKernel(
     }
   }
 
-  if (lane_id == 0) {
+  const bool stats_writer =
+      enable_subwarp_multiworld ? (lane_in_subwarp == 0) : (lane_id == 0);
+  if (stats_writer) {
     if (control->processed_tasks != nullptr) {
       atomicAdd(control->processed_tasks, local_processed);
     }
@@ -4647,8 +4976,17 @@ void LaunchFQPTOwnerFrontierKernelWrapper(
       std::max(1, (control->num_worlds + block_warps - 1) / block_warps);
   const int effective_blocks = std::max(1, std::min(num_blocks, max_useful_blocks));
   const int check_words_per_warp = 2 * model_data.bit_dom_int_size + 16;
+  int check_warp_slots = block_warps;
+  if (control->enable_subwarp_multiworld != 0) {
+    const int subwarp_size = (control->subwarp_tile_size == 4 ||
+                              control->subwarp_tile_size == 8 ||
+                              control->subwarp_tile_size == 16)
+                                 ? control->subwarp_tile_size
+                                 : 8;
+    check_warp_slots *= (32 / subwarp_size);
+  }
   const int shared_mem_bytes =
-      check_words_per_warp * block_warps * static_cast<int>(sizeof(u32));
+      check_words_per_warp * check_warp_slots * static_cast<int>(sizeof(u32));
 
   FQPTOwnerFrontierKernel<<<dim3(effective_blocks), dim3(block_size), shared_mem_bytes>>>(
       model_data, control);

@@ -47,6 +47,10 @@ DEFINE_int32(fqpt_microbatch_warps, 8,
              "OW3b max warps participating in micro-batch (1..8)");
 DEFINE_int32(fqpt_microbatch_max_rounds, 0,
              "OW3b max per-world micro-batch rounds (0=unlimited)");
+DEFINE_bool(fqpt_enable_subwarp_multiworld, false,
+            "Enable OW5 subwarp multi-world path");
+DEFINE_int32(fqpt_subwarp_tile, 8,
+             "OW5 subwarp tile size (4/8/16)");
 DEFINE_bool(fqpt_enable_cid_microbatch_profile, false,
             "Enable OW3a cid micro-batch profile counters");
 DEFINE_int32(fqpt_microbatch_profile_interval, 64,
@@ -110,6 +114,8 @@ void RunFQPT(
   mgr.SetOW1MinDegree(FLAGS_fqpt_ow1_min_degree);
   mgr.SetOW1ScatterMode(FLAGS_fqpt_ow1_scatter_mode);
   mgr.SetOW1ForceScatter(FLAGS_fqpt_ow1_force_scatter);
+  mgr.SetEnableSubwarpMultiworld(FLAGS_fqpt_enable_subwarp_multiworld);
+  mgr.SetSubwarpTileSize(FLAGS_fqpt_subwarp_tile);
   mgr.SetEnableCidMicrobatch(FLAGS_fqpt_enable_cid_microbatch);
   mgr.SetMicrobatchMinSel(FLAGS_fqpt_microbatch_min_sel);
   mgr.SetMicrobatchWarps(FLAGS_fqpt_microbatch_warps);

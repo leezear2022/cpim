@@ -27,7 +27,8 @@ enum ACAlgorithm {
   A_FC_bit,
   A_NSAC,
   CA_LMRPC_BIT,
-  CA_RPC3
+  CA_RPC3,
+  A_MSAC3bit  // Phase 1: MSAC with AC3bit kernel
 };
 enum Consistency {
   C_AC3,
@@ -322,12 +323,110 @@ class AC {
   // virtual bool revise(const arc& c_x, int level) = 0;
   // virtual bool seek_support(const IntConVal& c_val, int level) = 0;
 
+  // Phase 0.1: Weight 更新控制（用于 SAC probe）
+  void SetAllowWeightUpdates(bool allow) { allow_weight_updates_ = allow; }
+  bool AllowWeightUpdates() const { return allow_weight_updates_; }
+
  protected:
   // vector<IntVar*> q_;
   vector<int> tmp_tuple_;
   Network* m_;
   int delete_ = 0;
   int level_ = 0;
+
+  // Phase 0.1: Weight 更新标志（默认允许，SAC probe 时禁止）
+  bool allow_weight_updates_ = true;
+
+  // Phase 0.1: 安全的权重递增（受 allow_weight_updates_ 控制）
+  void IncrementWeight(Tabular* c) {
+    if (allow_weight_updates_) {
+      ++c->weight;
+    }
+  }
+};
+
+// Phase 0.1: RAII guard for weight updates (used in SAC probe)
+class ScopedWeightUpdates {
+ public:
+  ScopedWeightUpdates(AC* ac, bool allow)
+      : ac_(ac), old_allow_(ac->AllowWeightUpdates()) {
+    ac_->SetAllowWeightUpdates(allow);
+  }
+
+  ~ScopedWeightUpdates() {
+    ac_->SetAllowWeightUpdates(old_allow_);
+  }
+
+  // 禁止拷贝和赋值
+  ScopedWeightUpdates(const ScopedWeightUpdates&) = delete;
+  ScopedWeightUpdates& operator=(const ScopedWeightUpdates&) = delete;
+
+ private:
+  AC* ac_;
+  bool old_allow_;
+};
+
+// Phase 0.3: MSAC 预算配置
+struct MSACConfig {
+  enum Mode { SAC1, SAC3, SAC_SDS };   // SAC1=全扫描, SAC3=增量队列, SAC_SDS=支持驱动
+
+  int max_probes = -1;        // -1 表示无限制
+  int max_time_ms = -1;       // -1 表示无限制
+  int depth_limit = -1;       // -1 表示所有层都做 SAC
+  Mode mode = SAC3;           // 默认 SAC3（更高效）
+
+  MSACConfig() = default;
+  MSACConfig(int probes, int time_ms, int depth, Mode m = SAC3)
+      : max_probes(probes), max_time_ms(time_ms), depth_limit(depth), mode(m) {}
+};
+
+// Phase 0.2: MSAC 统计结构（与搜索统计分离）
+struct MSACStats {
+  // 局部统计（每次 enforce 重置，用于预算控制）
+  int num_probes = 0;          // 当前 enforce 的 probe 次数
+  int num_probe_fail = 0;      // 当前 enforce 的 probe 失败次数
+  int num_removed = 0;         // 当前 enforce 删除的值数量
+  double probe_time_ms = 0.0;  // 当前 enforce 的 probe 耗时
+  bool exited_by_budget = false;  // 是否因预算限制提前退出
+
+  // 全局统计（累计，用于最终报告）
+  int64_t total_probes = 0;         // 总 probe 次数
+  int64_t total_probe_fail = 0;     // 总 probe 失败次数
+  int64_t total_removed = 0;        // 总删除值数量
+  double total_probe_time_ms = 0.0; // 总 probe 耗时
+  int total_enforce_calls = 0;      // enforce 调用次数
+
+  // 缓存统计（Phase 2.1: 避免重复 Probe）
+  int64_t total_cache_hits = 0;     // 缓存命中次数（跳过 probe）
+  int64_t total_cache_misses = 0;   // 缓存未命中次数（执行 probe）
+
+  // 快速检查统计（Phase 2.2: 快速支持检测）
+  int64_t total_quick_reject = 0;   // 快速检查拒绝次数（无支持直接删除）
+  int64_t total_quick_pass = 0;     // 快速检查通过次数（需要完整 probe）
+
+  // SAC-SDS 统计（Phase 3: 支持驱动 SAC）
+  int64_t total_support_updates = 0;  // 支持计数更新次数
+  int64_t total_zero_detections = 0;  // 检测到的零支持值数
+
+  // 重置局部统计（每次 enforce 开始时调用）
+  void Reset() {
+    num_probes = 0;
+    num_probe_fail = 0;
+    num_removed = 0;
+    probe_time_ms = 0.0;
+    exited_by_budget = false;
+  }
+
+  // 累加到全局统计（每次 enforce 结束时调用）
+  void AccumulateToGlobal() {
+    total_probes += num_probes;
+    total_probe_fail += num_probe_fail;
+    total_removed += num_removed;
+    total_probe_time_ms += probe_time_ms;
+    ++total_enforce_calls;
+  }
+
+  void Print() const;  // 实现在 MSAC3bit.cpp
 };
 
 class AC3 : public AC {
@@ -375,6 +474,9 @@ class AC3bit : public AC3 {
   virtual ~AC3bit(){};
 
   virtual bool seek_support(const IntConVal& c_val, int p) override;
+
+  // Phase 3: SAC-SDS 访问接口（允许 MSAC3bit 访问 bitSup_）
+  const vector<vector<bitset<BITSIZE>>>& GetBitSup() const { return bitSup_; }
 
  protected:
   int max_bitDom_size_;
@@ -572,6 +674,72 @@ class RPC3 : public AC {
   vector<vector<IntVar*>> neighborhood;
 };
 
+// Phase 1: MSAC3bit = SAC3(AC3bit-kernel)
+// 实现 Singleton Arc Consistency，使用 AC3bit 作为内部传播 kernel
+// 支持 SAC1（全扫描）和 SAC3（增量队列）两种模式
+class MSAC3bit : public AC {
+ public:
+  MSAC3bit(Network* m, MSACConfig config = MSACConfig());
+  virtual ~MSAC3bit();
+
+  ConsistencyState enforce(vector<IntVar*>& x_evt, int level) override;
+
+  const MSACStats& stats() const { return stats_; }
+
+ private:
+  AC3bit* kernel_;  // 内嵌 AC3bit 作为 probe 的传播 kernel
+  MSACConfig config_;
+  MSACStats stats_;
+
+  // SAC3 队列相关数据结构
+  // 优化：使用 vector 替代 set，O(log k) 插入变为 O(1)
+  std::vector<std::pair<IntVar*, int>> pending_queue_;  // 待检查队列
+  std::vector<std::vector<bool>> in_queue_;             // 防重复标记
+
+  // Probe 单个值 (x=a)，返回是否一致
+  bool ProbeValue(IntVar* x, int a, int level);
+
+  // 选取候选值（SAC1 全扫描或 SAC3 队列模式）
+  void SelectCandidates(vector<pair<IntVar*, int>>& candidates, int level);
+
+  // 检查是否应该继续 probe（预算控制）
+  bool ShouldContinueProbe(int current_level) const;
+
+  // SAC3 队列操作
+  void InitializeQueue();                              // 初始化队列（全扫）
+  void InitializeQueueIncremental();                   // 增量初始化（仅 AC 修改的邻域）
+  void EnqueueNeighborhood(IntVar* x, int deleted_val);  // 删值后入队邻域
+  void EnqueueValue(IntVar* x, int a);                 // 单值入队
+
+  // 增量初始化辅助
+  int ac_start_trail_pos_ = 0;  // AC 阶段开始时的 Trail 位置
+
+  // Phase 2.1: Probe 缓存（避免重复 Probe）
+  struct ProbeCache {
+    int trail_pos = -1;  // 成功 probe 时的 Trail 位置，-1 表示未缓存
+  };
+  std::vector<std::vector<ProbeCache>> probe_cache_;  // [var_id][value]
+
+  // 缓存检查方法
+  bool IsCacheValid(IntVar* x, int a);  // 检查缓存是否有效
+  void UpdateCache(IntVar* x, int a);   // 更新缓存（probe 成功后调用）
+  void ResetCache();                    // 重置缓存（enforce 开始时调用）
+  bool IsNeighbor(IntVar* x, IntVar* y);  // 检查两变量是否是邻居
+
+  // Phase 2.2: 快速支持检测
+  bool QuickCheckSupport(IntVar* x, int a);  // 检查值在所有约束中是否有支持
+
+  // Phase 3: SAC-SDS（支持驱动的 SAC）
+  std::vector<int> support_count_;  // [IntConValIndex] -> 支持数
+
+  // SAC-SDS 方法
+  void InitializeSupportCountsOptimized();             // 初始化支持计数器
+  void InitializeZeroSupportQueue();                   // 初始化零支持队列
+  void UpdateSupportsAfterRemoval(IntVar* x, int a);   // 删值后更新支持计数
+  int CountSupportsFromBitSup(const IntConVal& cv);    // 从 bitSup_ 计算支持数
+  std::pair<int, int> GetBitIdx(int value) const;      // 获取值的位索引
+};
+
 class MAC {
  public:
   MAC(Network* n, ACAlgorithm ac_algzm, const Heuristic::Var varh,
@@ -587,6 +755,12 @@ class MAC {
   vector<int> solution;
   string sol_str;
   bool one_pass_sac() const;
+
+  // Phase 1: 配置 MSAC 参数（如果使用了 MSAC 算法）
+  void ConfigureMSAC(const MSACConfig& config);
+
+  // Phase 1: 获取 MSAC 统计信息（如果使用了 MSAC 算法）
+  const MSACStats* GetMSACStats() const;
 
  private:
   int sol_count_ = 0;

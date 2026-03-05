@@ -56,6 +56,10 @@ class GModelAdapter {
   // 注意：bitSup 使用纹理内存，不需要预取
   static void PrefetchBitDomToGPU(u32* bitDom, size_t bitdom_size,
                                   int device_id);
+
+  // [Phase 4.3] 只读数据优化：对只读数据设置 cudaMemAdviseSetReadMostly
+  // 优化目标：bitSupData, d_subscription, d_subscription_offset, constraint_scopes
+  static void OptimizeReadOnlyMemoryAdvice(GModel* model, int device_id);
 };
 
 }  // namespace cpim::model

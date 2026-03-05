@@ -1,23 +1,62 @@
+# ========== 构建产物（通用）==========
 /build/
-/build_orin/
-/benchmarks/
-/cmake-build-debug/
-/cmake-build-release/
-/xcsp3parser/lib/
-/xcsp3parser/cmake-build-debug/
-/xcsp3parser/cmake-build-release/
-/xcsp3parser/samples/samplesXcsp3
-/xcsp3parser/lib/libxcsp3parser.a
-xcsp3parser/lib/libxcsp3parser_dynamic.so
-xcsp3parser/lib/libxcsp3parser.a
-xcsp3parser/samples/samplesXcsp3
+/build_*/
+/cmake-build-*/
 
-# Python
+# ========== 大型测试集 ==========
+/benchmarks/
+
+# ========== src/ 目录保护 ==========
+# CMake 生成文件
+src/CMakeFiles/
+src/_deps/
+src/CMakeCache.txt
+src/Makefile
+src/*.cmake
+src/options-pinned.h
+
+# 编译产物
+src/*.a
+src/*.o
+src/*.so
+src/*.dylib
+src/lib/
+
+# 可执行文件（防止误提交）
+src/cpim_*
+src/dump_*
+src/gmodel_*
+src/test_*
+src/compare_*
+src/verify_*
+
+# ========== 第三方库构建 ==========
+third_party/xcsp3parser/lib/
+third_party/xcsp3parser/cmake-build-*/
+third_party/xcsp3parser/samples/samplesXcsp3
+
+# ========== Python ==========
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
+.pytest_cache/
 *.egg-info/
 
-# Test results
+# ========== 测试结果 ==========
 *.csv
 nightly_*.log
+test_results/
+
+# ========== IDE ==========
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ========== 临时文件 ==========
+*copy.cu
+*copy.cpp
+*.bak
+*.tmp

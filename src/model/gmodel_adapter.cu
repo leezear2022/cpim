@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "GModel.cuh"
+#include "base/unified_trail.h"  // Phase 1.2: Trail 回溯系统
 #include "model/intermediate_model.h"
 #include "model/types.h"
 
@@ -58,7 +59,7 @@ GModel GModelAdapter::Build(const IntermediateModel& im_model,
 
   const int bit_dom_int_size = IntSize(max_dom_size);
   const int bit_doms_int_size = num_vars * bit_dom_int_size;
-  const int max_depth = num_vars + 1;  // 最大搜索深度
+  // Phase 1.2: 移除 max_depth，使用 UnifiedTrail 管理层级
 
   std::cout << "[GModelAdapter] Model dimensions:" << std::endl;
   std::cout << "  num_vars=" << num_vars << std::endl;
@@ -66,24 +67,23 @@ GModel GModelAdapter::Build(const IntermediateModel& im_model,
   std::cout << "  max_dom_size=" << max_dom_size << std::endl;
   std::cout << "  bit_dom_int_size=" << bit_dom_int_size << std::endl;
   std::cout << "  bit_doms_int_size=" << bit_doms_int_size << std::endl;
-  std::cout << "  max_depth=" << max_depth << std::endl;
 
   // ========================================================================
-  // 1. 分配多层级 bitDom (使用统一内存)
+  // 1. Phase 1.2: 分配单层 bitDom (使用统一内存)
   // ========================================================================
-  const size_t bitdom_size = max_depth * bit_doms_int_size * sizeof(u32);
-  std::cout << "[GModelAdapter] Allocating multi-level bitDom: " << bitdom_size
-            << " bytes (" << max_depth << " levels)" << std::endl;
+  const size_t bitdom_size = bit_doms_int_size * sizeof(u32);
+  std::cout << "[GModelAdapter] Allocating single-layer bitDom: " << bitdom_size
+            << " bytes (single level)" << std::endl;
 
   u32* bitDom = nullptr;
   CUDA_CHECK(cudaMallocManaged(&bitDom, bitdom_size));
 
-  // 初始化所有层级为 0
-  std::fill(bitDom, bitDom + max_depth * bit_doms_int_size, 0u);
+  // 初始化为 0
+  std::fill(bitDom, bitDom + bit_doms_int_size, 0u);
 
-  // 只初始化第 0 层
+  // 初始化域
   BuildBitDom(im_model, bitDom, num_vars, bit_dom_int_size);
-  std::cout << "[GModelAdapter] bitDom level 0 initialized" << std::endl;
+  std::cout << "[GModelAdapter] bitDom initialized" << std::endl;
 
   // ========================================================================
   // 2. 检查纹理内存限制
@@ -180,6 +180,9 @@ GModel GModelAdapter::Build(const IntermediateModel& im_model,
   std::vector<std::vector<int>> var_to_constraints(num_vars);
   std::vector<int> initial_dom_sizes(num_vars, 0);
 
+  // Phase 1.5: CPU 友好的约束作用域（用于 DOM/DDEG 启发式）
+  std::vector<std::vector<int>> constraint_scopes_cpu(num_constraints);
+
   for (const auto& var : im_model.variables()) {
     initial_dom_sizes[var.id.value] = im_model.GetDomain(var.domain).Size();
   }
@@ -195,6 +198,9 @@ GModel GModelAdapter::Build(const IntermediateModel& im_model,
     constraint_scopes[idx] = make_int2(x, y);
     var_to_constraints[x].push_back(idx);
     var_to_constraints[y].push_back(idx);
+
+    // Phase 1.5: 填充 CPU 友好格式
+    constraint_scopes_cpu[idx] = {x, y};
   }
 
   int2* scopes_managed = nullptr;
@@ -203,32 +209,30 @@ GModel GModelAdapter::Build(const IntermediateModel& im_model,
               num_constraints * sizeof(int2));
 
   // ========================================================================
-  // 7. 分配多层级辅助数据（统一内存）
+  // 7. Phase 1.2: 分配单层辅助数据（统一内存）
   // ========================================================================
-  std::cout << "[GModelAdapter] Allocating multi-level auxiliary data..." << std::endl;
+  std::cout << "[GModelAdapter] Allocating single-layer auxiliary data..." << std::endl;
 
-  // 7.1 域大小追踪（每个层级，每个变量）
-  const size_t dom_size_array_size = max_depth * num_vars * sizeof(int);
+  // 7.1 域大小追踪（单层）
+  const size_t dom_size_array_size = num_vars * sizeof(int);
   int* d_cur_dom_size = nullptr;
   CUDA_CHECK(cudaMallocManaged(&d_cur_dom_size, dom_size_array_size));
   std::cout << "[GModelAdapter]   d_cur_dom_size: " << dom_size_array_size
-            << " bytes (" << max_depth << " × " << num_vars << ")" << std::endl;
+            << " bytes (" << num_vars << " vars)" << std::endl;
 
-  // 初始化第 0 层的域大小
+  // 初始化域大小
   for (int var = 0; var < num_vars; ++var) {
     d_cur_dom_size[var] = initial_dom_sizes[var];
   }
-  // 其余层级初始化为 0
-  std::fill(d_cur_dom_size + num_vars,
-            d_cur_dom_size + max_depth * num_vars, 0);
 
-  // 7.2 赋值栈
-  const size_t assigned_size = max_depth * sizeof(int2);
+  // 7.2 赋值栈（保留，用于记录赋值历史）
+  const int max_assignments = num_vars;  // 最多 num_vars 个赋值
+  const size_t assigned_size = max_assignments * sizeof(int2);
   int2* d_assigned = nullptr;
   CUDA_CHECK(cudaMallocManaged(&d_assigned, assigned_size));
-  std::fill_n(reinterpret_cast<int*>(d_assigned), max_depth * 2, -1);
+  std::fill_n(reinterpret_cast<int*>(d_assigned), max_assignments * 2, -1);
   std::cout << "[GModelAdapter]   d_assigned: " << assigned_size
-            << " bytes (" << max_depth << " levels)" << std::endl;
+            << " bytes (" << max_assignments << " max assignments)" << std::endl;
 
   // 7.3 Device 端订阅表（CSR 格式）
   std::cout << "[GModelAdapter] Building device-side subscription table (CSR format)..."
@@ -297,15 +301,34 @@ GModel GModelAdapter::Build(const IntermediateModel& im_model,
             << " bytes" << std::endl;
 
   // ========================================================================
-  // 8. 构造 GModel（转移所有权）
+  // 7.4 Phase 1.2: 创建 UnifiedTrail（统一回溯系统）
+  // ========================================================================
+  // Trail 容量估算：
+  // - 最大搜索深度：num_vars（每个变量一次赋值）
+  // - 每次传播可能删除多个值：num_vars * max_dom_size
+  // - 保守估计：num_vars * max_dom_size * 20（足够大的缓冲）
+  const int trail_capacity = num_vars * max_dom_size * 20;
+  std::cout << "[GModelAdapter] Creating UnifiedTrail: capacity=" << trail_capacity
+            << std::endl;
+
+  // 注意：UnifiedTrail 使用 new 分配，所有权转移给 GModel
+  UnifiedTrail* trail = new UnifiedTrail(trail_capacity, true /* enable_gpu */);
+  std::cout << "[GModelAdapter]   Trail created successfully" << std::endl;
+
+  // ========================================================================
+  // 8. Phase 1.2: 构造 GModel（转移所有权）
   // ========================================================================
   std::cout << "[GModelAdapter] Building GModel object..." << std::endl;
   GModel gmodel(num_vars, num_constraints, max_dom_size, bit_dom_int_size,
-                bit_doms_int_size, max_depth, bitsup_per_constraint, bitDom,
+                bit_doms_int_size, bitsup_per_constraint, bitDom,
                 d_cur_dom_size, d_assigned, d_subscription, d_subscription_offset,
                 subscription_size, texObj_BitSup, cuArray3D, bitSup_managed,
                 scopes_managed, std::move(var_to_constraints),
-                std::move(initial_dom_sizes));
+                std::move(initial_dom_sizes), std::move(degrees),
+                std::move(constraint_scopes_cpu), trail);
+
+  // [Phase 4.3] 只读数据优化
+  OptimizeReadOnlyMemoryAdvice(&gmodel, options.device_id);
 
   std::cout << "[GModelAdapter] GModel built successfully!" << std::endl;
   return gmodel;
@@ -441,6 +464,79 @@ void GModelAdapter::PrefetchBitDomToGPU(u32* bitDom, size_t bitdom_size,
   cudaDeviceSynchronize();
   std::cout << "[GModelAdapter] bitDom successfully prefetched to GPU"
             << std::endl;
+}
+
+// ============================================================================
+// [Phase 4.3] 只读数据优化：cudaMemAdviseSetReadMostly
+// ============================================================================
+void GModelAdapter::OptimizeReadOnlyMemoryAdvice(GModel* model, int device_id) {
+  if (model == nullptr) {
+    std::cout << "[GModelAdapter] Warning: model is nullptr, skip read-only advice"
+              << std::endl;
+    return;
+  }
+
+  cudaError_t status = cudaSetDevice(device_id);
+  if (status != cudaSuccess) {
+    std::cout << "[GModelAdapter] Warning: cudaSetDevice failed, skip read-only advice"
+              << std::endl;
+    return;
+  }
+
+  std::cout << "[GModelAdapter] Applying cudaMemAdviseSetReadMostly for read-only data..."
+            << std::endl;
+
+  int success_count = 0;
+  int skip_count = 0;
+  int fail_count = 0;
+
+  // 辅助 lambda：安全地调用 cudaMemAdvise
+  auto apply_advice = [&](void* ptr, size_t size, const char* name) {
+    if (ptr == nullptr || size == 0) {
+      std::cout << "[GModelAdapter]   " << name << ": skipped (nullptr or size=0)" << std::endl;
+      skip_count++;
+      return;
+    }
+    cudaError_t err = cudaMemAdvise(ptr, size, cudaMemAdviseSetReadMostly, device_id);
+    if (err != cudaSuccess) {
+      std::cout << "[GModelAdapter]   " << name << ": failed ("
+                << cudaGetErrorString(err) << ")" << std::endl;
+      fail_count++;
+    } else {
+      std::cout << "[GModelAdapter]   " << name << ": " << size << " bytes" << std::endl;
+      success_count++;
+    }
+  };
+
+  // 1. bitSupData（最大的只读数据）
+  const size_t bitsup_size = static_cast<size_t>(model->num_constraints) *
+                             model->bitsup_per_constraint * sizeof(uint2);
+  apply_advice(model->bitSupData, bitsup_size, "bitSupData");
+
+  // 2. d_subscription（变量订阅表）
+  const size_t sub_size = static_cast<size_t>(model->subscription_size) * sizeof(uint3);
+  apply_advice(model->d_subscription, sub_size, "d_subscription");
+
+  // 3. d_subscription_offset（CSR 偏移索引）
+  const size_t offset_size = static_cast<size_t>(model->num_vars + 1) * sizeof(int);
+  apply_advice(model->d_subscription_offset, offset_size, "d_subscription_offset");
+
+  // 4. constraint_scopes（约束作用域）
+  const size_t scopes_size = static_cast<size_t>(model->num_constraints) * sizeof(int2);
+  apply_advice(model->constraint_scopes, scopes_size, "constraint_scopes");
+
+  // 输出统计结果
+  if (fail_count == 0 && skip_count == 0) {
+    std::cout << "[GModelAdapter] Read-only memory advice applied successfully ("
+              << success_count << "/4)" << std::endl;
+  } else if (fail_count == 0) {
+    std::cout << "[GModelAdapter] Read-only memory advice applied with skips ("
+              << success_count << " success, " << skip_count << " skipped)" << std::endl;
+  } else {
+    std::cout << "[GModelAdapter] Read-only memory advice applied with warnings ("
+              << success_count << " success, " << fail_count << " failed, "
+              << skip_count << " skipped)" << std::endl;
+  }
 }
 
 }  // namespace cpim::model

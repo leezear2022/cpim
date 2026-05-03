@@ -1,0 +1,3 @@
+[submodule "codex-docops-logic"]
+	path = codex-docops-logic
+	url = git@github.com:leezear2022/codex-docops-logic.git

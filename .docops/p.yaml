@@ -1,0 +1,12 @@
+u:
+  lang: zh
+  tok: low
+  style: direct
+  prefer:
+    - tree
+    - table
+    - cp_ready
+  avoid:
+    - generic
+    - long_readme
+    - duplicate_docs

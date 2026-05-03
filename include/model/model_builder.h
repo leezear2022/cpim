@@ -124,6 +124,7 @@ class ModelBuilder {
                          std::vector<std::vector<int>> tuples);
 
   const Relation& GetRelation(RelationId id) const;
+  bool HasRelation(RelationId id) const;
 
   // ==========================================================================
   // 查询接口

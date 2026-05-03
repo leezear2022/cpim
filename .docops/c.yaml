@@ -1,0 +1,37 @@
+v: 1
+
+rule:
+  - id: R001
+    if: claim.fix
+    req: va.pass|va.def
+    sev: b
+
+  - id: R002
+    if: claim.perf
+    req: va.bench.runs>=3
+    sev: b
+
+  - id: R003
+    if: rm.bump
+    req: rm.hist
+    sev: b
+
+  - id: R004
+    if: st.close
+    req: va.final&ls
+    sev: b
+
+  - id: R005
+    if: pause.days>1
+    req: hf
+    sev: w
+
+  - id: R006
+    if: fail.same>=2
+    make: L.cand
+    sev: s
+
+  - id: R007
+    if: cmd.same>=3
+    make: S.cand
+    sev: s

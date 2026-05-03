@@ -29,6 +29,12 @@ class GacCpuRunner {
   // 打印简要统计与若干变量域
   void Print(int max_vars = 8) const;
 
+  const std::vector<u32>& bit_dom() const { return bit_dom_; }
+  const std::vector<int>& domain_sizes() const { return dom_size_; }
+  int bit_words() const { return bit_words_; }
+  int num_vars() const { return num_vars_; }
+  int max_dom_size() const { return max_dom_size_; }
+
  private:
   // 维度
   int num_vars_ = 0;

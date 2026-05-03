@@ -1,5 +1,576 @@
 # 修改清单（中文）
 
+## 2026-05-03
+
+### Metal GAC 文档落账：每个小计划/小 changelog 独立成文
+
+**目标**：把 Metal GAC v2.x 的封版结论、下一步计划和细粒度 changelog
+全部落到独立文档，避免只停留在对话、一次性执行结果或聚合页里。
+
+**核心改动**：
+- 新增 `docs/planning/METAL_GAC_CHANGELOG.md` 作为 Metal GAC 小计划/小
+  changelog 索引页。
+- 新增独立小 changelog 文档：
+  - `docs/planning/metal_gac/METAL_GAC_V1_BASELINE_CHANGELOG_2026_05_02.md`
+  - `docs/planning/metal_gac/METAL_GAC_V20_V21_CHANGELOG_2026_05_03.md`
+  - `docs/planning/metal_gac/METAL_GAC_V22_V24_CHANGELOG_2026_05_03.md`
+  - `docs/planning/metal_gac/METAL_GAC_V25_V29_CHANGELOG_2026_05_03.md`
+- 新增独立小计划文档：
+  - `docs/planning/metal_gac/METAL_GAC_V2_GUARD_V3_ENTRY_PLAN_2026_05_03.md`
+- DocOps Logic 插件新增通用 microdoc 能力：
+  - `dol doc new --kind plan|changelog`
+  - `templates/small-plan.md`
+  - `templates/small-changelog.md`
+  - `skills/doc/SKILL.md`
+  - 本仓库 `codex-docops-logic/` 与已安装 local plugin cache 同步更新。
+- 新增 DocOps Logic microdocs 功能自己的独立小计划/小 changelog：
+  - `docs/planning/metal_gac/CPIM_METAL_DOCOPS_MICRODOCS_PLAN_2026_05_03.md`
+  - `docs/planning/metal_gac/CPIM_METAL_DOCOPS_MICRODOCS_CHANGELOG_2026_05_03.md`
+- 更新 `docs/planning/METAL_GAC_LONG_TERM_OPTIMIZATION.md`：
+  - 增加 changelog 落账入口；
+  - 将“下一步：v2 Guard 与 v3 入口”收敛为独立小计划链接。
+- 更新 `docs/planning/METAL_MIGRATION_PLAN.md`，补充 Metal GAC 小 changelog
+  的文档位置。
+- 更新 `docs/README.md`，把 `METAL_GAC_CHANGELOG.md` 纳入关键规划文档导航。
+
+**文档规则**：
+- 大 changelog：`CHANGES_ZH.md`，记录跨模块和可发布摘要。
+- 小 changelog：每个版本段一个新文档，放在 `docs/planning/metal_gac/`。
+- 小计划：每个执行计划一个新文档，放在 `docs/planning/metal_gac/`。
+- `docs/planning/METAL_GAC_CHANGELOG.md` 只做索引，不承载多个小计划/小
+  changelog 的正文。
+- 路线/迁移文档必须同步更新状态或链接，不允许只有 changelog。
+
+### Metal v2.5-v2.9：auto、epoch worklist、blit reset 与 v2 封版
+
+**目标**：把 Metal GAC v2 从已有可消融路径收敛为可自动选择、可解释、
+可回退、可封版的性能后端。
+
+**核心改动**：
+- `MetalGacOptions` / `benchmark_metal_gac` 新增
+  `reset_mode=cpu|blit|auto`；默认仍为 `cpu`。
+- `MetalGacStats` / CSV 新增：
+  - `reset_dispatch_ms`
+  - `effective_frontier_mode`
+  - `effective_kernel_variant`
+  - `effective_bitsup_layout`
+  - `worklist_push_count`
+  - `worklist_rounds`
+  - `worklist_epoch_resets`
+- `frontier_mode=auto` / `kernel_variant=auto` 改为封版保守策略：TIER2 收尾数据
+  发现较宽的 worklist auto 会让 p95 超过 baseline 5%，word_parallel auto 会让
+  p50 超过 baseline 5%，因此 v2 auto 降级到 `flags + scalar`；`simdgroup`
+  继续 fallback 到 word_parallel，并通过 effective 字段记录。
+- scalar flags/compact 实际仍读 pair bitSup；当 requested directional 但执行路径
+  未使用 directional 时，effective bitsup 明确记录为 `pair`。
+- worklist 路径新增 epoch/stamp 去重：每轮递增 epoch，不再 memset 全量
+  next frontier；溢出时安全清零并计入 `worklist_epoch_resets`。
+- `MetalPreparedGacRunner` 增加初始 mutable snapshot buffer；blit reset 使用
+  command buffer copy 初始 `bit_dom/domain_sizes/frontier/active_list` 并 clear
+  stats/next buffers。
+- `metal_gac_ablation.py` 新增 `--mode-preset=auto` 与 `--reset-mode`，TIER2 中
+  已知 unsupported non-binary extension 不再作为性能扫描失败。
+- `metal_gac_analyze.py` 新增 recommended policy summary，按 family、
+  `num_constraints`、`max_dom_size`、`bit_words`、`frontier_density_avg` 分桶，
+  并报告 auto 命中、胜出和劣化超过 5% 的实例。
+- 更新 Metal GAC 长期优化路线与迁移计划；v2 封版结论为不在 v2 强行实现
+  simdgroup reduction，进入 v3 需先由 word_parallel 数据证明瓶颈。
+
+**验证**：
+- `python3 -m py_compile tests/python/metal_gac_ablation.py tests/python/metal_gac_analyze.py`
+- `cmake --build build_metal --target benchmark_metal_gac compare_cpu_metal -j`
+- `./build_metal/benchmark_metal_gac --input=tests/data/metal/gac_bitwords2.xml --runs=1 --warmup=0 --verify=true --runner_mode=prepared --frontier_mode=worklist --kernel_variant=word_parallel --bitsup_layout=directional --reset_mode=blit --csv=out/metal_gac_v2x_worklist_word_blit_smoke.csv`
+- `ctest --test-dir build_metal -R compare_cpu_metal --output-on-failure`
+- `ctest --test-dir build_metal -R benchmark_metal_gac --output-on-failure`
+- `python3 tests/python/metal_gac_ablation.py --suite=metal-smoke --mode-preset=all --runs=2 --warmup=1 --runner-mode=prepared --kernel-variant=word_parallel --bitsup-layout=directional --timeout=60 --csv=out/metal_gac_v2x_smoke_all.csv`
+- `python3 tests/python/metal_gac_ablation.py --suite=metal-smoke --mode-preset=auto --runs=3 --warmup=1 --runner-mode=prepared --timeout=60 --csv=out/metal_gac_v2x_smoke_auto.csv --quiet`
+- `python3 tests/python/metal_gac_ablation.py --tier=2 --mode-preset=all --runs=5 --warmup=2 --runner-mode=prepared --timeout=300 --csv=out/metal_gac_v2x_tier2_all.csv --quiet`
+- `python3 tests/python/metal_gac_ablation.py --tier=2 --mode-preset=auto --runs=5 --warmup=2 --runner-mode=prepared --timeout=300 --csv=out/metal_gac_v2x_tier2_auto.csv --quiet`
+- `python3 tests/python/metal_gac_analyze.py out/metal_gac_v2x_tier2_all.csv out/metal_gac_v2x_tier2_auto.csv --top=10`
+- `git diff --check`
+
+**结果摘要**：
+- worklist + word_parallel + directional + blit reset smoke 通过 CPU verify；
+  CSV 已包含 effective path、reset 与 worklist 统计字段。
+- `metal-smoke` all-mode 60/60 OK；auto 15/15 OK。
+- TIER2 all-mode：2280/2298 rows OK，18 个 ERROR 均为
+  `unsupported_non_binary_extension`，脚本返回码为 0。
+- TIER2 auto：380/383 rows OK，3 个 ERROR 均为
+  `unsupported_non_binary_extension`，脚本返回码为 0。
+- TIER2 baseline `shared+flags+scalar+pair`：`solve_ms p50=0.261 p95=5.132`；
+  auto 封版路径 `flags+scalar+pair`：`solve_ms p50=0.259 p95=5.079`，满足
+  auto p50/p95 不比 baseline 慢 5% 的门槛。
+- 默认 stable fallback 仍为 `cold + shared + flags + scalar + pair + cpu reset`。
+
+### Metal v2.2-v2.4：worklist、word-parallel 与 directional bitSup
+
+**目标**：把 `worklist/word_parallel/auto` 从 fallback 开关推进为可消融的真实
+Metal GAC 性能路径，并保留默认 stable fallback。
+
+**核心改动**：
+- `DeviceModelLayout` 新增 `bit_sup_words`，按
+  `bit_sup_words[cid][dir][value][word]` 存储 directional bitSup。
+- `MetalGacOptions` / `benchmark_metal_gac` 新增 `bitsup_layout=pair|directional|auto`。
+- `MetalGacSolver` 新增：
+  - worklist active constraint 双缓冲；
+  - directional bitSup buffer；
+  - worklist revise pipeline；
+  - word-parallel flags / active-list / worklist pipelines。
+- `.metal` 新增：
+  - `gac_revise_worklist_kernel`
+  - `gac_revise_word_flags_kernel`
+  - `gac_revise_word_active_kernel`
+  - `gac_revise_word_worklist_kernel`
+- `frontier_mode=worklist` 每轮只 dispatch revise kernel，并用 `next_flags` 去重；
+  `frontier_mode=auto` 在 `num_constraints >= 128` 且 directional bitSup 可用时走
+  worklist，否则走 flags。
+- `kernel_variant=word_parallel` 启用 word-level revise；
+  `kernel_variant=auto` 和 `simdgroup` 当前落到 word_parallel，并通过
+  `variant_name` 记录。
+- `metal_gac_ablation.py` / `metal_gac_analyze.py` 新增 `bitsup_layout` 维度。
+- `metal_gac_ablation.py --mode-preset=all` 扩展为
+  `shared/private × flags/compact/worklist`，确保 worklist 进入批量扫描矩阵。
+- 更新 Metal v2 长期优化路线与迁移计划。
+
+**验证**：
+- `python3 -m py_compile tests/python/metal_gac_ablation.py tests/python/metal_gac_analyze.py`
+- `cmake --build build_metal --target benchmark_metal_gac compare_cpu_metal -j`
+- `./build_metal/benchmark_metal_gac --input=tests/data/metal/gac_bitwords2.xml --runs=3 --warmup=1 --verify=true --runner_mode=prepared --frontier_mode=worklist --kernel_variant=word_parallel --bitsup_layout=directional --csv=out/metal_gac_v24_worklist_word_directional_smoke.csv`
+- `./build_metal/benchmark_metal_gac --input=tests/data/metal/gac_bitwords2.xml --runs=1 --warmup=0 --verify=true --runner_mode=prepared --frontier_mode=auto --kernel_variant=simdgroup --bitsup_layout=auto --csv=out/metal_gac_v24_auto_simdgroup_smoke.csv`
+- `python3 tests/python/metal_gac_ablation.py --suite=metal-smoke --mode-preset=all --runs=2 --warmup=1 --runner-mode=prepared --kernel-variant=word_parallel --bitsup-layout=directional --timeout=60 --csv=out/metal_gac_v24_smoke.csv`
+- `python3 tests/python/metal_gac_ablation.py --tier=2 --mode-preset=all --runs=5 --warmup=2 --runner-mode=prepared --kernel-variant=word_parallel --bitsup-layout=directional --timeout=300 --csv=out/metal_gac_v24_tier2.csv --quiet`
+- `python3 tests/python/metal_gac_analyze.py out/metal_gac_v24_smoke.csv out/metal_gac_v24_tier2.csv --top=10`
+- `ctest --test-dir build_metal -R compare_cpu_metal --output-on-failure`
+- `ctest --test-dir build_metal -R benchmark_metal_gac --output-on-failure`
+- `python3 codex-docops-logic/scripts/dol.py lint --soft`
+- `git diff --check`
+
+**结果摘要**：
+- worklist + word_parallel + directional smoke 通过 CPU verify。
+- `auto+simdgroup+auto` 明确记录为
+  `auto+simdgroup+auto->flags+word_parallel+directional`。
+- `metal-smoke` all-mode：60/60 OK。
+- TIER2 all-mode：2280/2298 rows OK，18 个 ERROR 均为
+  `unsupported_non_binary_extension`，与历史支持面边界一致。
+- TIER2 shared+flags word_parallel+directional：`solve_ms avg=0.819 p50=0.340 p95=5.362 p99=5.891`。
+- TIER2 shared+worklist word_parallel+directional：
+  `solve_ms avg=0.826 p50=0.356 p95=5.274 p99=5.917`。
+
+**兼容性与语义**：
+- 默认仍为 `cold + shared + flags + scalar + pair`。
+- pair bitSup、scalar flags/compact 旧路径保留。
+- 本轮不实现真正 simdgroup reduction，不引入 Metal texture。
+- CUDA/Jetson 路径不受影响。
+
+### Metal v2.0-v2.1：GAC 长期优化路线与 prepared runner
+
+**目标**：按 GAC 性能优先路线开启 Metal v2，先冻结 benchmark/CSV 观测口径，
+再用 prepared runner 拆出初始化与 mutable reset 成本，为后续 worklist、simdgroup
+与布局优化铺消融入口。
+
+**核心改动**：
+- 新增 `docs/planning/METAL_GAC_LONG_TERM_OPTIMIZATION.md`，记录 v2.0-v2.4
+  长期路线、CUDA 经验映射、验收命令和回退原则。
+- `MetalGacOptions` 新增：
+  - `runner_mode = cold|prepared`
+  - `kernel_variant = scalar|word_parallel|simdgroup|auto`
+  - `frontier_mode` 预留 `worklist|auto`，当前回退到 stable `flags + scalar`。
+- 新增 `MetalPreparedGacRunner`，支持一次 `Prepare()` 后多次 `Run()`，每次仅重置
+  mutable state。
+- `MetalGacStats` / `benchmark_metal_gac` CSV 新增：
+  - `runner_mode`
+  - `kernel_variant`
+  - `variant_name`
+  - `solve_ms`
+  - `prepare_ms`
+  - `reset_ms`
+  - `active_constraints_total`
+  - `frontier_density_avg`
+- `metal_gac_ablation.py` 透传 `--runner-mode` 与 `--kernel-variant`，批量 CSV
+  保留新增字段。
+- `metal_gac_analyze.py` 将主分析指标切换为 `solve_ms`；旧 CSV 没有该字段时
+  自动回退到 `elapsed_ms`。
+- 更新 Metal 迁移计划和 docs 导航，记录 v2.0/v2.1 状态。
+
+**验证**：
+- `python3 -m py_compile tests/python/metal_gac_ablation.py tests/python/metal_gac_analyze.py`
+- `cmake --build build_metal --target benchmark_metal_gac compare_cpu_metal -j`
+- `./build_metal/benchmark_metal_gac --input=tests/data/metal/gac_bitwords2.xml --runs=2 --warmup=1 --verify=true --runner_mode=prepared --csv=out/metal_gac_v21_prepared_smoke.csv`
+- `./build_metal/benchmark_metal_gac --input=tests/data/metal/gac_bitwords2.xml --runs=1 --warmup=0 --verify=true --runner_mode=prepared --frontier_mode=worklist --kernel_variant=simdgroup --csv=out/metal_gac_v21_fallback_smoke.csv`
+- `python3 tests/python/metal_gac_ablation.py --suite=metal-smoke --mode-preset=baseline --runs=1 --warmup=0 --runner-mode=prepared --kernel-variant=scalar --timeout=60 --csv=out/metal_gac_v21_ablation_prepared_smoke.csv --quiet`
+- `python3 tests/python/metal_gac_analyze.py out/metal_gac_v21_prepared_smoke.csv out/metal_gac_v21_ablation_prepared_smoke.csv --top=3`
+- `ctest --test-dir build_metal -R compare_cpu_metal --output-on-failure`
+- `ctest --test-dir build_metal -R benchmark_metal_gac --output-on-failure`
+- `python3 codex-docops-logic/scripts/dol.py lint --soft`
+- `git diff --check`
+
+**结果摘要**：
+- prepared smoke 通过 CPU verify，`variant_name=flags+scalar`；
+- fallback smoke 通过 CPU verify，`variant_name=worklist+simdgroup->flags+scalar`；
+- `metal-smoke` baseline prepared 扫描 5/5 OK；
+- Metal compare CTest 5/5 通过，benchmark smoke 1/1 通过。
+- 求解主指标改为 `solve_ms = reset_ms + dispatch_ms`；`setup_ms/prepare_ms`
+  只记录初始化成本。
+
+**兼容性与语义**：
+- 默认仍为 `cold + shared + flags + scalar`；
+- `worklist`、`word_parallel`、`simdgroup`、`auto` 目前只作为可观测消融开关，
+  未实现专用 kernel 前通过 `variant_name` 记录回退路径；
+- 不修改 CUDA/Jetson 路径。
+
+### Metal v2.1：求解时间统计口径修正
+
+**目标**：把 Metal GAC 性能主指标从 wall-clock `elapsed_ms` 调整为只统计求解阶段
+的 `solve_ms`，避免初始化成本混入 GAC 算子对比。
+
+**核心改动**：
+- `MetalGacStats` 新增 `solve_ms`。
+- `benchmark_metal_gac` CSV 新增 `solve_ms`，stdout 优先输出
+  `solve_ms p50/p95/p99`；`elapsed_ms` 继续保留为兼容观测。
+- `solve_ms = reset_ms + dispatch_ms`：
+  - `reset_ms` 表示单次求解前恢复 mutable state；
+  - `dispatch_ms` 表示实际提交 Metal command buffer 并等待完成的成本；
+  - `setup_ms/prepare_ms` 只记录初始化成本，不进入求解主指标。
+- `metal_gac_ablation.py` 汇总切换为 `avg_solve_ms`。
+- `metal_gac_analyze.py` 主分析指标切换为 `solve_ms`，旧 CSV 缺该字段时回退
+  `elapsed_ms`。
+- 更新 Metal v2 长期优化文档与迁移计划中的指标口径说明。
+
+**验证**：
+- `python3 -m py_compile tests/python/metal_gac_ablation.py tests/python/metal_gac_analyze.py`
+- `cmake --build build_metal --target benchmark_metal_gac -j`
+- `./build_metal/benchmark_metal_gac --input=tests/data/metal/gac_bitwords2.xml --runs=3 --warmup=1 --verify=true --runner_mode=prepared --csv=out/metal_gac_v21_solve_ms_smoke.csv`
+- `python3 tests/python/metal_gac_analyze.py out/metal_gac_v21_solve_ms_smoke.csv --top=3`
+- `python3 tests/python/metal_gac_ablation.py --suite=metal-smoke --mode-preset=baseline --runs=1 --warmup=0 --runner-mode=prepared --kernel-variant=scalar --timeout=60 --csv=out/metal_gac_v21_solve_ms_ablation.csv --quiet`
+- `ctest --test-dir build_metal -R benchmark_metal_gac --output-on-failure`
+- `git diff --check`
+
+**结果摘要**：
+- `benchmark_metal_gac` stdout 已输出 `solve_ms p50/p95/p99`；
+- `out/metal_gac_v21_solve_ms_smoke.csv` 已包含 `solve_ms` 字段；
+- `metal_gac_analyze.py` 以 `solve_ms` 汇总，prepared smoke 3/3 OK；
+- `metal_gac_ablation.py` 以 `avg_solve_ms` 汇总，metal-smoke baseline 5/5 OK。
+
+### Metal v1.8：parser 支持面与 unsupported 分类修正
+
+**目标**：修复 TIER3 支持面中的 parser 问题，同时避免把 pairwise 分解误记为
+global constraint GAC 支持。
+
+**核心改动**：
+- `LibXml2Parser::ParseDomainValues()` 支持混合离散域 range token：
+  - 例如 `0..2 6..7 12` 会展开为枚举域；
+  - 原有连续 range 和枚举值语义保持不变。
+- `LibXml2Parser::ParseConstraints()` 对 `reference="global:allDifferent"` 明确返回
+  `UNIMPLEMENTED`。
+- predicate/intension `P*` reference 明确返回 `UNIMPLEMENTED`，不再误报为
+  invalid relation。
+- 不再把 `AllDifferent` 展开成 pairwise binary `!=` supports，因为这不是 global
+  AllDifferent GAC。
+- `metal_gac_ablation.py` / `metal_gac_analyze.py` 新增
+  `unsupported_predicate_intension` 分类。
+- 更新 Metal 迁移计划和 docs 导航，记录 v1.8 支持面边界。
+
+**验证**：
+- `python3 -m py_compile tests/python/metal_gac_ablation.py tests/python/metal_gac_analyze.py`
+- `cmake --build build_metal --target benchmark_metal_gac compare_cpu_metal -j`
+- `./build_metal/benchmark_metal_gac --input=benchmarks/queenAttacking/queenAttacking-5.xml --runs=1 --warmup=0 --verify=true --csv=out/metal_gac_v18_queen_attacking5.csv`
+- `./build_metal/benchmark_metal_gac --input=benchmarks/fapp26-30/fapp26-30/fapp26/fapp26-2300-0.xml --runs=1 --warmup=0 --verify=true --csv=out/metal_gac_v18_fapp_check.csv`
+- `python3 tests/python/metal_gac_ablation.py --suite=metal-smoke --mode-preset=all --runs=2 --warmup=1 --timeout=60 --csv=out/metal_gac_v18_smoke.csv`
+- `python3 tests/python/metal_gac_ablation.py --tier=2 --mode-preset=all --runs=3 --warmup=1 --timeout=300 --csv=out/metal_gac_v18_tier2_all.csv --quiet`
+- `python3 tests/python/metal_gac_ablation.py --tier=3 --mode-preset=baseline --runs=1 --warmup=0 --timeout=180 --csv=out/metal_gac_v18_tier3_baseline.csv --quiet`
+- `ctest --test-dir build_metal -R compare_cpu_metal --output-on-failure`
+- `cmake --build build_metal --target cpim_gac_cpu -j`
+
+**结果摘要**：
+- TIER2 all-mode 保持 76/79 实例 OK，剩余 3 个仍为非二元 extension unsupported。
+- TIER3 baseline 保持 818/1065 实例 OK。
+- TIER3 剩余失败分类为：
+  - `unsupported_predicate_intension`: 197
+  - `unsupported_non_binary_extension`: 40
+  - `unsupported_global_alldifferent`: 10
+
+**兼容性与语义**：
+- 不修改 Metal kernel；
+- `AllDifferent` 保持 unsupported，不新增 global constraint API；
+- predicate/intension 与非二元 extension 仍保持 fail-fast。
+
+### Metal v1.7：扫描分析闭环与错误分类
+
+**目标**：把补齐 benchmark 数据后的 TIER 扫描从“临时分析”推进为可复用流程，
+并让 TIER3 的失败原因稳定分类，便于判断下一步支持面优化。
+
+**核心改动**：
+- `benchmark_metal_gac` CSV 新增 `dispatch_count` 字段，与 stdout 的
+  `dispatch_count=...` 保持一致。
+- `tests/python/metal_gac_ablation.py`：
+  - CSV 新增 `error_category`；
+  - 透传 benchmark CSV 的 `dispatch_count`；
+  - 将 missing、unsupported、parse、timeout、verification mismatch 等失败归类。
+- 新增 `tests/python/metal_gac_analyze.py`：
+  - 汇总 OK/ERROR/TIMEOUT/MISSING；
+  - 按 mode 输出 avg/p50/p95/p99、setup/dispatch/kernel、dispatch_count；
+  - 按 family 和 error category 汇总失败；
+  - 输出 `private/compact` 相对 `shared+flags` 的倍率和胜出个数；
+  - 输出最慢实例列表，辅助定位后续优化目标。
+- `LibXml2Parser` 遇到 constraint 引用无效 relation ID 时返回
+  `INVALID_ARGUMENT`，不再触发 `CHECK` 让 benchmark 子进程 fatal。
+- 更新 Metal 迁移计划和 docs 导航，记录 v1.7 的分析入口与验证结果。
+
+**验证**：
+- `python3 -m py_compile tests/python/metal_gac_ablation.py tests/python/metal_gac_analyze.py`
+- `cmake --build build_metal --target benchmark_metal_gac -j`
+- `python3 tests/python/metal_gac_ablation.py --suite=metal-smoke --mode-preset=all --runs=2 --warmup=1 --timeout=60 --csv=out/metal_gac_v17_smoke.csv`
+- `./build_metal/benchmark_metal_gac --input=benchmarks/fapp26-30/fapp26-30/fapp26/fapp26-2300-0.xml --runs=1 --warmup=0 --verify=true --csv=out/metal_gac_v17_invalid_relation_check.csv`
+- `python3 tests/python/metal_gac_ablation.py --tier=2 --mode-preset=all --runs=3 --warmup=1 --timeout=300 --csv=out/metal_gac_v17_tier2_all.csv --quiet`
+- `python3 tests/python/metal_gac_analyze.py out/metal_gac_v17_tier2_all.csv --top=8`
+- `python3 tests/python/metal_gac_ablation.py --tier=3 --mode-preset=baseline --runs=1 --warmup=0 --timeout=120 --csv=out/metal_gac_v17_tier3_baseline.csv --quiet`
+- `python3 tests/python/metal_gac_analyze.py out/metal_gac_v17_tier3_baseline.csv --top=12`
+
+**结果摘要**：
+- TIER2 all-mode：76/79 实例 OK，912 rows verified；3 个 `rand-8-20-5`
+  归类为 `unsupported_non_binary_extension`。
+- TIER3 baseline：818/1065 实例 OK，247 个 ERROR，0 timeout；失败分类为
+  `parse_invalid_relation_id`、`unsupported_non_binary_extension`、
+  `parse_discontiguous_domain`、`unsupported_global_alldifferent`。
+- TIER2 上 `shared+flags` 仍是默认最优：`shared+compact` 平均约 1.20x，
+  `private+flags` 平均约 1.30x，`private+compact` 平均约 1.48x。
+
+**兼容性与语义**：
+- 不修改 Metal GAC kernel correctness 语义；
+- CSV schema 向后扩展，旧 CSV 仍可由 `metal_gac_analyze.py` 读取；
+- CUDA/Jetson 回归仍需在 CUDA 机器上单独执行。
+
+### Metal v1.6：tier-aware ablation 扫描脚本
+
+**目标**：借用现有 TIER0~TIER3 测试用例分级，把 Metal GAC 的 shared/private
+storage 与 flags/compact frontier 消融从单点 smoke 扩展到批量 correctness 扫描。
+
+**核心改动**：
+- 新增 `tests/python/metal_gac_ablation.py`：
+  - 复用 `tests/python/tier_definitions.py` 的 TIER0~TIER3 实例列表；
+  - 提供 `--suite=tier|metal-smoke`，其中 `metal-smoke` 覆盖本地签入的小型 Metal
+    correctness fixtures 与 bench smoke；
+  - 提供 `--mode-preset=baseline|storage|frontier|all`，批量运行
+    `benchmark_metal_gac` 的 storage/frontier 组合；
+  - 支持 `--record-missing`，将未签入的外部 `benchmarks/...` 用例记录为
+    `MISSING`，不中断整批扫描；
+  - 自动尝试把 `benchmarks/...` 同名路径映射到 `tests/data/bench/...` 的本地样例。
+- 输出 CSV 增加批量扫描上下文：
+  - `tier`
+  - `instance_index`
+  - `status = OK|MISSING|TIMEOUT|ERROR`
+  - `process_ms`
+  - benchmark 原有 device、规模、迭代、删值、timing 与 verify 字段。
+- 更新 Metal 迁移计划和 docs 导航，记录 v1.6 的测试边界与命令。
+
+**验证**：
+- `python3 -m py_compile tests/python/metal_gac_ablation.py`
+- `python3 tests/python/metal_gac_ablation.py --suite=metal-smoke --mode-preset=all --runs=2 --warmup=1 --timeout=60 --csv=out/metal_gac_v16_smoke.csv`
+- `python3 tests/python/metal_gac_ablation.py --tier=0 --mode-preset=baseline --runs=1 --warmup=0 --timeout=60 --csv=out/metal_gac_v16_tier0_baseline_smoke.csv --record-missing`
+
+**兼容性与语义**：
+- v1.6 不修改 Metal kernel、CPU/CUDA CLI 或 CMake target；
+- correctness 仍由 `benchmark_metal_gac --verify=true` 调用 CPU oracle 校验；
+- 当前仓库未签入的外部 benchmark 会记录为 `MISSING`，补齐数据后可用同一脚本扩大到
+  TIER1~TIER3。
+
+### Metal v1.4-v1.5：readonly storage 与 compact frontier 消融
+
+**目标**：在不进入 SAC/Batch 的前提下，为 Metal GAC 增加两条可回退的性能消融路径：
+readonly metadata 的 shared/private storage，以及 active constraints compact frontier。
+
+**核心改动**：
+- `MetalRuntime` 新增 private buffer 上传能力：
+  - 使用 shared staging buffer + blit command buffer 初始化 `MTLStorageModePrivate`；
+  - 仍保持 mutable state 固定 shared，避免 CPU 结果读取与 GPU 写回路径复杂化。
+- `MetalGacOptions` 新增：
+  - `readonly_storage = shared|private`
+  - `frontier_mode = flags|compact`
+- `MetalGacStats` 新增输出：
+  - `readonly_storage`
+  - `frontier_mode`
+- `.metal` kernel 新增：
+  - `gac_compact_frontier_kernel`
+  - `gac_revise_compact_kernel`
+- `benchmark_metal_gac` 新增 flags：
+  - `--readonly_storage=shared|private`
+  - `--frontier_mode=flags|compact`
+  - CSV 新增 `readonly_storage` 与 `frontier_mode` 字段。
+- `benchmark_metal_gac_smoke` 改为覆盖 `private + compact`，保持 CPU verify。
+- 更新 Metal 迁移计划与 docs 导航，记录 v1.4/v1.5 的默认值、消融命令与回退边界。
+
+**验证**：
+- `cmake -S . -B build_metal -DCPIM_ENABLE_CUDA=OFF -DCPIM_ENABLE_METAL=ON -DCMAKE_BUILD_TYPE=Release`
+- `cmake --build build_metal --target compare_cpu_metal benchmark_metal_gac -j`
+- `ctest --test-dir build_metal -R compare_cpu_metal --output-on-failure`
+- `./build_metal/benchmark_metal_gac --input=tests/data/metal/gac_bitwords2.xml --runs=5 --warmup=2 --verify=true --readonly_storage=shared --frontier_mode=flags --csv=out/metal_gac_v14_shared_flags.csv`
+- `./build_metal/benchmark_metal_gac --input=tests/data/metal/gac_bitwords2.xml --runs=5 --warmup=2 --verify=true --readonly_storage=private --frontier_mode=compact --csv=out/metal_gac_v15_private_compact.csv`
+- `./build_metal/benchmark_metal_gac --input=tests/data/bench/queens-4_ext.xml --runs=5 --warmup=2 --verify=true --readonly_storage=private --frontier_mode=compact`
+- `ctest --test-dir build_metal -R benchmark_metal_gac --output-on-failure`
+- `cmake -S . -B build_cpu -DCPIM_ENABLE_CUDA=OFF -DCPIM_ENABLE_METAL=OFF -DCMAKE_BUILD_TYPE=Release`
+- `cmake --build build_cpu --target cpim_gac_cpu -j`
+
+**兼容性与语义**：
+- 默认仍为 `readonly_storage=shared` 与 `frontier_mode=flags`；
+- private/compact 均通过 benchmark flag 消融，不改变 `compare_cpu_metal` 默认路径；
+- correctness 继续以 CPU verify 为准，不声明性能收益；
+- CUDA/Jetson 回归仍需在 CUDA 机器上单独执行。
+
+### Metal v1.2-v1.3：运行时抽象与性能观测
+
+**目标**：把 Metal GAC 从单一 solver 内部实现推进为可复用 runtime，并建立
+GAC-only 性能观测入口；仍不进入 MAC/SAC/Batch。
+
+**核心改动**：
+- 新增 Metal runtime 封装：
+  - `MetalRuntime` 负责创建默认 Metal device、加载 `.metallib`、创建 pipeline 与提交
+    1D dispatch；
+  - `MetalBuffer` / `MetalPipeline` 以 C++ move-only RAII 对象隐藏 Objective-C
+    `id<MTL...>` 类型。
+- `MetalGacSolver` 改用 runtime 分配 shared buffer、绑定 kernel 参数和提交每轮 dispatch，
+  correctness 对比语义保持 v1.1 不变。
+- `MetalGacStats` 新增：
+  - `dispatch_count`
+  - `setup_ms`
+  - `dispatch_ms`
+  - `kernel_ms`
+  - `gpu_timing_available`
+- 新增 `benchmark_metal_gac`：
+  - 支持 `--input`、`--metallib`、`--runs`、`--warmup`、`--max_iterations`、`--csv`、
+    `--verify`、`--verbose`；
+  - 输出 `elapsed_ms`、`dispatch_ms`、`kernel_ms` 的 p50/p95/p99；
+  - CSV 每个 measured run 一行，并记录 device、输入规模、迭代/删值和 verify 状态。
+- `CMakeLists.txt` 在 `CPIM_METAL_ENABLED` 下构建 `benchmark_metal_gac`，并注册
+  `benchmark_metal_gac_smoke`。
+- 更新 Metal 迁移计划和 docs 导航，记录 v1.2/v1.3 边界、接口与验证命令。
+
+**验证**：
+- `cmake -S . -B build_metal -DCPIM_ENABLE_CUDA=OFF -DCPIM_ENABLE_METAL=ON -DCMAKE_BUILD_TYPE=Release`
+- `cmake --build build_metal --target cpim_test_parser cpim_gac_cpu compare_cpu_metal benchmark_metal_gac -j`
+- `ctest --test-dir build_metal -R compare_cpu_metal --output-on-failure`
+- `./build_metal/benchmark_metal_gac --input=tests/data/metal/gac_bitwords2.xml --runs=5 --warmup=2 --verify=true --csv=out/metal_gac_v13_smoke.csv`
+- `./build_metal/benchmark_metal_gac --input=tests/data/bench/queens-4_ext.xml --runs=5 --warmup=2 --verify=true`
+- `ctest --test-dir build_metal -R benchmark_metal_gac --output-on-failure`
+- `cmake -S . -B build_cpu -DCPIM_ENABLE_CUDA=OFF -DCPIM_ENABLE_METAL=OFF -DCMAKE_BUILD_TYPE=Release`
+- `cmake --build build_cpu --target cpim_gac_cpu -j`
+- `python3 codex-docops-logic/scripts/dol.py lint --soft`
+- `python3 codex-docops-logic/scripts/dol.py solve --stub --mode check`
+- `git diff --check`
+
+**兼容性与语义**：
+- 不新增统一 `--backend`，不改变 CPU/CUDA CLI；
+- 不实现 `MTLStorageModePrivate`、simdgroup/texture 优化或 SAC 数据流；
+- CUDA/Jetson 回归仍需在 CUDA 机器上单独执行。
+
+### Metal v1.1：正确性加固与自动回归
+
+**目标**：把 Metal GAC 从可运行 MVP 加固为可自动回归的 correctness backend，
+仍只覆盖 GAC，不进入 MAC/SAC/Batch。
+
+**核心改动**：
+- `MetalGacStats` 新增 `device_name`，`compare_cpu_metal` 输出
+  `[Metal] device=<name> ...`，便于确认使用的是 macOS Metal device。
+- 调整 CPU/Metal 对比语义：
+  - 先比较 inconsistent 判定；
+  - 两边都 inconsistent 时只检查结果形状，不强制逐 word 对齐最终 `bit_dom`；
+  - 两边都 consistent 时继续严格比较 `domain_sizes` 与 `bit_dom`；
+  - `budget_exceeded` 仍视为失败。
+- 新增 Metal correctness fixtures：
+  - `tests/data/metal/gac_inconsistent.xml`：二元 supports 链触发空域；
+  - `tests/data/metal/gac_bitwords2.xml`：域大小 40，覆盖 `bit_words=2`。
+- `CMakeLists.txt` 在 `CPIM_METAL_ENABLED` 下注册 Metal CTest：
+  `compare_cpu_metal_queens4`、`compare_cpu_metal_deletion`、
+  `compare_cpu_metal_inconsistent`、`compare_cpu_metal_bitwords2`、
+  `compare_cpu_metal_manifest`。
+- 更新 `docs/planning/METAL_MIGRATION_PLAN.md` 与 `docs/README.md`，记录 v1.1
+  状态、fixtures、CTest 策略与 inconsistent 对比语义。
+
+**验证**：
+- `cmake -S . -B build_metal -DCPIM_ENABLE_CUDA=OFF -DCPIM_ENABLE_METAL=ON -DCMAKE_BUILD_TYPE=Release`
+- `cmake --build build_metal --target cpim_test_parser cpim_gac_cpu compare_cpu_metal -j`
+- `./build_metal/compare_cpu_metal --input=tests/data/bench/queens-4_ext.xml`
+- `./build_metal/compare_cpu_metal --input=tests/data/bench/test.xml`
+- `./build_metal/compare_cpu_metal --input=tests/data/metal/gac_inconsistent.xml`
+- `./build_metal/compare_cpu_metal --input=tests/data/metal/gac_bitwords2.xml`
+- `./build_metal/compare_cpu_metal --input=tests/data/bench/BMPath.xml`
+- `ctest --test-dir build_metal -R compare_cpu_metal --output-on-failure`
+- `cmake -S . -B build_cpu -DCPIM_ENABLE_CUDA=OFF -DCPIM_ENABLE_METAL=OFF -DCMAKE_BUILD_TYPE=Release`
+- `cmake --build build_cpu --target cpim_gac_cpu -j`
+- `python3 codex-docops-logic/scripts/dol.py lint --soft`
+- `python3 codex-docops-logic/scripts/dol.py solve --stub --mode check`
+- `git diff --check`
+
+**兼容性与语义**：
+- 不新增统一 `--backend`，不改变 CPU/CUDA CLI；
+- 不抽 `MetalRuntime`，runtime 抽象推迟到 Metal v1.2；
+- CUDA/Jetson 回归仍需在 CUDA 机器上单独执行。
+
+## 2026-05-01
+
+### Metal v1：独立运行时 + DeviceLayout 的 GAC MVP
+
+**目标**：在 Apple Silicon macOS 上落地一条可运行的 Metal GAC correctness
+路径，同时保持 Jetson/CUDA 主线可选启用、不改造 `GModel/GModelSolver`。
+
+**核心改动**：
+- `CMakeLists.txt`
+  - 将 CUDA 从全局必选改为 `CPIM_ENABLE_CUDA=AUTO|ON|OFF`；
+  - 新增 `CPIM_ENABLE_METAL=AUTO|ON|OFF`，在 Apple + Metal 工具链可用时构建
+    `compare_cpu_metal`；
+  - `libunwind` 改为 optional，`glog` 找不到系统包时通过 FetchContent 拉取。
+- 新增后端无关 `DeviceModelLayout`：
+  - 使用纯 C++ `DeviceInt2`、`DeviceUInt2`、`DeviceUInt3`；
+  - 从归一化 `IntermediateModel` 构建 `bit_dom`、`domain_sizes`、`bit_sup`、
+    constraint scope 与 subscription CSR。
+- 新增 Metal GAC 后端：
+  - `MetalGacSolver` 使用 `MTLStorageModeShared` buffer 和 host 多轮 dispatch；
+  - `.metal` kernel 采用标量 atomic 路径处理 `(constraint, direction, value)`；
+  - 不使用 CUDA texture、warp ballot 或 cooperative grid sync 的直接替代。
+- 新增 `compare_cpu_metal`：
+  - 支持直接 XML 和 bench manifest 首个实例；
+  - 对比 CPU/Metal 的 `domain_sizes` 与 `bit_dom`，不一致时返回非 0。
+- `GacCpuRunner` 增加只读结果访问器，并按 bitset 容量扫描域值，避免删除低位后跳过高位。
+- `include/Timer.h` 在无 CUDA runtime 时只暴露 CPU timer，解除 Mac CPU 构建对 CUDA SDK
+  的头文件依赖。
+- 修正 `tests/data/bench/BMPath.xml` 的示例路径，使其指向当前存在的
+  `tests/data/bench/queens-12_ext.xml`。
+
+**验证**：
+- `cmake -S . -B build_metal -DCPIM_ENABLE_CUDA=OFF -DCPIM_ENABLE_METAL=ON -DCMAKE_BUILD_TYPE=Release`
+- `cmake --build build_metal --target cpim_test_parser cpim_gac_cpu compare_cpu_metal -j`
+- `./build_metal/compare_cpu_metal --input=tests/data/bench/queens-4_ext.xml`
+- `./build_metal/compare_cpu_metal --input=tests/data/bench/test.xml`
+- `./build_metal/compare_cpu_metal --input=tests/data/bench/BMPath.xml`
+- `./build_metal/cpim_test_parser --bench_path=tests/data/bench/queens-4_ext.xml`
+- `./build_metal/cpim_gac_cpu --input=tests/data/bench/queens-4_ext.xml --max_print=2`
+
+**兼容性与语义**：
+- Metal v1 只支持归一化后的二元 extension supports 约束；
+- CUDA target 仍保留，但本机未执行 Jetson/CUDA 验证；
+- 不新增统一 `--backend` CLI，不实现 MAC/SAC/Batch Metal 路径。
+
+### 文档：新增 macOS Metal 统一内存迁移计划
+
+**目标**：明确从 Jetson/CUDA UMA 路径迁移到 Apple Silicon Metal 后端的工程路线，
+并把迁移边界限定为“先文档计划、后代码落地”，避免直接替换 CUDA 造成主线风险。
+
+**核心改动**：
+- 新增 `docs/planning/METAL_MIGRATION_PLAN.md`：
+  - 梳理当前 CUDA/Jetson UMA 依赖点，包括 CMake、`GModel.cuh`、`gmodel_adapter.cu`、
+    `GModel.cu` 与 Batch/SAC manager。
+  - 给出 Metal 目标架构：`MTLBuffer` shared/private 策略、Metal backend 目录草案、
+    `.metal` kernel 与 Objective-C++/metal-cpp 调用层取舍。
+  - 定义分阶段路线：Mac CPU 可构建、后端类型隔离、Metal GAC MVP、SAC/Batch 迁移、
+    性能对照。
+  - 明确 `cudaMallocManaged`、CUDA texture、warp ballot、cooperative grid sync 等机制
+    不能机械替换，需要按 Metal 语义重新设计。
+- 更新 `docs/README.md`：在关键规划文档中注册 Metal 迁移计划入口。
+
+**兼容性与语义**：
+- 本次仅新增/更新文档；
+- 不修改 CMake、C++、CUDA、public API、CLI flag 或测试代码；
+- Metal 相关接口名仅作为后续设计草案。
+
 ## 2026-02-21
 
 ### FQ-PT：OW5 O5-C 收敛优化（auto policy + 两层 gate）

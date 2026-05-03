@@ -61,3 +61,14 @@
 - **Communication**: 全程使用中文交流 (Use Chinese throughout)
 - **Changelog**: Update `CHANGES_ZH.md`
 - **Main Programs**: `apps/cpim_test_parser.cpp` (CPU), `apps/gmodel_solver.cpp` (GPU)
+
+
+## DocOps Logic
+
+Read first:
+- .docops/s.md
+- .docops/c.yaml
+- last 20 lines of .docops/k.jsonl
+
+Before handoff:
+- dol lint --soft

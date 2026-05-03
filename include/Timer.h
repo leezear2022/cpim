@@ -7,7 +7,15 @@
 
 #pragma once
 #include <chrono>
+#if defined(__has_include)
+#if __has_include(<cuda_runtime.h>)
 #include <cuda_runtime.h>
+#define CPIM_HAS_CUDA_RUNTIME 1
+#endif
+#endif
+#ifndef CPIM_HAS_CUDA_RUNTIME
+#define CPIM_HAS_CUDA_RUNTIME 0
+#endif
 using namespace std;
 using namespace chrono;
 
@@ -66,8 +74,7 @@ class Timer {
 
 
 
-// CUDA error checking macro
-
+#if CPIM_HAS_CUDA_RUNTIME
 class CudaTimer {
 public:
     CudaTimer() {
@@ -113,5 +120,6 @@ public:
 private:
     cudaEvent_t start, stop;
 };
+#endif
 
 }

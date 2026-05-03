@@ -129,12 +129,11 @@ int GacCpuRunner::ReviseXY(int cid, int x, int y) {
   int deletions = 0;
   const int x_base = x * bit_words_;
   const int y_base = y * bit_words_;
-  const int x_size = dom_size_[x];
   const int bitsup_per_constraint = 2 * max_dom_size_ * bit_words_;
   const int sup_base = cid * bitsup_per_constraint;
 
   // 扫描 x 的每个取值，检查与 y 的交支持是否为空
-  for (int xv = 0; xv < x_size; ++xv) {
+  for (int xv = 0; xv < max_dom_size_; ++xv) {
     if (!BitTest(bit_dom_, x_base, xv)) continue;  // 已删除
 
     // 取出 x->y 的支持位集（跨 bit_words_）
@@ -181,11 +180,10 @@ int GacCpuRunner::PropagateOnConstraint(int cid) {
   const int y = m.y, x = m.x;
   const int y_base = y * bit_words_;
   const int x_base = x * bit_words_;
-  const int y_size = dom_size_[y];
   const int bitsup_per_constraint = 2 * max_dom_size_ * bit_words_;
   const int sup_base = cid * bitsup_per_constraint;
 
-  for (int yv = 0; yv < y_size; ++yv) {
+  for (int yv = 0; yv < max_dom_size_; ++yv) {
     if (!BitTest(bit_dom_, y_base, yv)) continue;
     const int idx_y = sup_base + (1 * max_dom_size_ + yv) * bit_words_;
     bool supported = false;

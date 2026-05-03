@@ -47,22 +47,87 @@
 
 
 cmake_minimum_required(VERSION 3.18)
-project(cpim LANGUAGES CXX CUDA)
+project(cpim LANGUAGES CXX)
 
 #set(CMAKE_CUDA_COMPILER /usr/local/cuda/bin/nvcc)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CUDA_STANDARD 17)
 
-# 设置 CUDA 架构
-set(CMAKE_CUDA_ARCHITECTURES 80 87)
+if(NOT CMAKE_TESTING_ENABLED)
+  enable_testing()
+endif()
 
-# 添加 CUDA Toolkit 的 include 路径
-include_directories(/usr/local/cuda/include)
-include_directories(${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+set(CPIM_ENABLE_CUDA "AUTO" CACHE STRING "Enable CUDA targets: AUTO, ON, or OFF")
+set_property(CACHE CPIM_ENABLE_CUDA PROPERTY STRINGS AUTO ON OFF)
+set(CPIM_ENABLE_METAL "AUTO" CACHE STRING "Enable Metal targets: AUTO, ON, or OFF")
+set_property(CACHE CPIM_ENABLE_METAL PROPERTY STRINGS AUTO ON OFF)
 
-# 添加库文件路径
-link_directories(/usr/local/cuda/lib64)
+include(CheckLanguage)
+
+set(CPIM_CUDA_ENABLED OFF)
+if(CPIM_ENABLE_CUDA STREQUAL "ON")
+  enable_language(CUDA)
+  set(CPIM_CUDA_ENABLED ON)
+elseif(CPIM_ENABLE_CUDA STREQUAL "AUTO")
+  check_language(CUDA)
+  if(CMAKE_CUDA_COMPILER)
+    enable_language(CUDA)
+    set(CPIM_CUDA_ENABLED ON)
+  endif()
+elseif(NOT CPIM_ENABLE_CUDA STREQUAL "OFF")
+  message(FATAL_ERROR "CPIM_ENABLE_CUDA must be AUTO, ON, or OFF")
+endif()
+
+if(CPIM_CUDA_ENABLED)
+  set(CMAKE_CUDA_STANDARD 17)
+  # 设置 CUDA 架构
+  set(CMAKE_CUDA_ARCHITECTURES 80 87)
+
+  # 添加 CUDA Toolkit 的 include 路径
+  include_directories(/usr/local/cuda/include)
+  include_directories(${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+
+  # 添加库文件路径
+  link_directories(/usr/local/cuda/lib64)
+  message(STATUS "CPIM CUDA targets enabled")
+else()
+  message(STATUS "CPIM CUDA targets disabled")
+endif()
+
+set(CPIM_METAL_ENABLED OFF)
+if(CPIM_ENABLE_METAL STREQUAL "ON" OR CPIM_ENABLE_METAL STREQUAL "AUTO")
+  if(APPLE)
+    execute_process(
+      COMMAND xcrun --find metal
+      RESULT_VARIABLE CPIM_METAL_FIND_RESULT
+      OUTPUT_VARIABLE CPIM_METAL_COMPILER
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      ERROR_QUIET
+    )
+    execute_process(
+      COMMAND xcrun --find metallib
+      RESULT_VARIABLE CPIM_METALLIB_FIND_RESULT
+      OUTPUT_VARIABLE CPIM_METALLIB_COMPILER
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      ERROR_QUIET
+    )
+    if(CPIM_METAL_FIND_RESULT EQUAL 0 AND CPIM_METALLIB_FIND_RESULT EQUAL 0)
+      enable_language(OBJCXX)
+      set(CPIM_METAL_ENABLED ON)
+      message(STATUS "CPIM Metal targets enabled")
+    elseif(CPIM_ENABLE_METAL STREQUAL "ON")
+      message(FATAL_ERROR "CPIM_ENABLE_METAL=ON but metal/metallib tools were not found")
+    endif()
+  elseif(CPIM_ENABLE_METAL STREQUAL "ON")
+    message(FATAL_ERROR "CPIM_ENABLE_METAL=ON requires an Apple platform")
+  endif()
+elseif(NOT CPIM_ENABLE_METAL STREQUAL "OFF")
+  message(FATAL_ERROR "CPIM_ENABLE_METAL must be AUTO, ON, or OFF")
+endif()
+
+if(NOT CPIM_METAL_ENABLED)
+  message(STATUS "CPIM Metal targets disabled")
+endif()
 
 # ============================================================================
 # Abseil 依赖配置 (使用 FetchContent)
@@ -95,17 +160,31 @@ include_directories(${LIBXML2_INCLUDE_DIR})
 # include_directories(${XercesC_INCLUDE_DIRS})
 
 # 查找依赖库 (GTest 和 gflags 改为可选)
-find_package(GTest)
-find_package(gflags)
-find_package(glog REQUIRED)
+find_package(GTest QUIET)
+find_package(gflags QUIET)
+find_package(glog QUIET)
+if(NOT glog_FOUND)
+  set(WITH_GFLAGS OFF CACHE BOOL "Build glog without gflags" FORCE)
+  set(WITH_GTEST OFF CACHE BOOL "Build glog without tests" FORCE)
+  FetchContent_Declare(
+    glog
+    GIT_REPOSITORY https://github.com/google/glog.git
+    GIT_TAG        v0.7.1
+    GIT_SHALLOW    TRUE
+  )
+  message(STATUS "Fetching glog...")
+  FetchContent_MakeAvailable(glog)
+endif()
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(Unwind REQUIRED libunwind)
+pkg_check_modules(Unwind libunwind)
 
 # 包含目录
 include_directories(${GTEST_INCLUDE_DIRS})
 include_directories(${GFLAGS_INCLUDE_DIRS})
 include_directories(${GLOG_INCLUDE_DIRS})
-include_directories(${Unwind_INCLUDE_DIRS})
+if(Unwind_FOUND)
+  include_directories(${Unwind_INCLUDE_DIRS})
+endif()
 
 # 添加头文件目录
 include_directories(include)
@@ -122,9 +201,13 @@ add_library(cpim_model STATIC
   src/model/libxml2_parser.cpp
   src/model/model_builder.cpp
   src/model/intermediate_model.cpp
-  src/model/cmodel_adapter.cpp
+  src/model/device_layout.cpp
   src/model/model_normalizer.cpp
 )
+
+if(CPIM_CUDA_ENABLED)
+  target_sources(cpim_model PRIVATE src/model/cmodel_adapter.cpp)
+endif()
 
 target_include_directories(cpim_model PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -203,6 +286,7 @@ target_link_libraries(cpim_solver_cpu PUBLIC
   absl::time
   absl::variant
   absl::optional
+  glog::glog
 )
 
 target_compile_options(cpim_solver_cpu PRIVATE
@@ -226,6 +310,7 @@ target_link_libraries(cpim_test_parser PRIVATE
 # ============================================================================
 # GPU CModel dump utility (parses XML -> IntermediateModel -> CModel)
 # ============================================================================
+if(CPIM_CUDA_ENABLED)
 add_executable(cpim_dump
   apps/cpim_dump.cpp
   src/solver/gpu/cuSAC.cu
@@ -534,6 +619,7 @@ set_tests_properties(test_stage2_persistent PROPERTIES
   LABELS "gpu;batch_ac;stage2"
   TIMEOUT 120
 )
+endif()
 
 # ============================================================================
 # CPU GAC baseline utility (serial event queue + propagation)
@@ -549,6 +635,157 @@ target_link_libraries(cpim_gac_cpu PRIVATE
   absl::flags
   absl::flags_parse
 )
+
+# ============================================================================
+# compare_cpu_metal: CPU vs Metal GAC correctness MVP
+# ============================================================================
+if(CPIM_METAL_ENABLED)
+  set(CPIM_METAL_AIR ${CMAKE_CURRENT_BINARY_DIR}/gac_kernels.air)
+  set(CPIM_METAL_LIB ${CMAKE_CURRENT_BINARY_DIR}/metal_gac.metallib)
+  set(CPIM_METAL_KERNELS ${CMAKE_CURRENT_SOURCE_DIR}/src/solver/metal/gac_kernels.metal)
+  set(CPIM_METAL_RUNTIME_SOURCES
+    src/solver/metal/metal_runtime.mm
+    src/solver/metal/metal_gac_solver.mm
+  )
+
+  add_custom_command(
+    OUTPUT ${CPIM_METAL_AIR}
+    COMMAND ${CPIM_METAL_COMPILER} -c ${CPIM_METAL_KERNELS} -o ${CPIM_METAL_AIR}
+    DEPENDS ${CPIM_METAL_KERNELS}
+    COMMENT "Compiling Metal GAC kernels"
+    VERBATIM
+  )
+
+  add_custom_command(
+    OUTPUT ${CPIM_METAL_LIB}
+    COMMAND ${CPIM_METALLIB_COMPILER} ${CPIM_METAL_AIR} -o ${CPIM_METAL_LIB}
+    DEPENDS ${CPIM_METAL_AIR}
+    COMMENT "Linking Metal GAC library"
+    VERBATIM
+  )
+
+  add_custom_target(cpim_metal_kernels DEPENDS ${CPIM_METAL_LIB})
+
+  add_executable(compare_cpu_metal
+    apps/compare_cpu_metal.cpp
+    src/model/gac_cpu.cpp
+    ${CPIM_METAL_RUNTIME_SOURCES}
+  )
+
+  add_dependencies(compare_cpu_metal cpim_metal_kernels)
+
+  target_link_libraries(compare_cpu_metal PRIVATE
+    cpim_model
+    glog::glog
+    absl::flags
+    absl::flags_parse
+    "-framework Foundation"
+    "-framework Metal"
+  )
+
+  target_compile_options(compare_cpu_metal PRIVATE
+    $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>
+  )
+
+  add_custom_command(
+    TARGET compare_cpu_metal
+    POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${CPIM_METAL_LIB}
+            $<TARGET_FILE_DIR:compare_cpu_metal>/metal_gac.metallib
+    VERBATIM
+  )
+
+  add_executable(benchmark_metal_gac
+    apps/benchmark_metal_gac.cpp
+    src/model/gac_cpu.cpp
+    ${CPIM_METAL_RUNTIME_SOURCES}
+  )
+
+  add_dependencies(benchmark_metal_gac cpim_metal_kernels)
+
+  target_link_libraries(benchmark_metal_gac PRIVATE
+    cpim_model
+    glog::glog
+    absl::flags
+    absl::flags_parse
+    "-framework Foundation"
+    "-framework Metal"
+  )
+
+  target_compile_options(benchmark_metal_gac PRIVATE
+    $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>
+  )
+
+  add_custom_command(
+    TARGET benchmark_metal_gac
+    POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${CPIM_METAL_LIB}
+            $<TARGET_FILE_DIR:benchmark_metal_gac>/metal_gac.metallib
+    VERBATIM
+  )
+
+  add_test(
+    NAME compare_cpu_metal_queens4
+    COMMAND $<TARGET_FILE:compare_cpu_metal>
+            --input=${CMAKE_SOURCE_DIR}/tests/data/bench/queens-4_ext.xml
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+  )
+  add_test(
+    NAME compare_cpu_metal_deletion
+    COMMAND $<TARGET_FILE:compare_cpu_metal>
+            --input=${CMAKE_SOURCE_DIR}/tests/data/bench/test.xml
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+  )
+  add_test(
+    NAME compare_cpu_metal_inconsistent
+    COMMAND $<TARGET_FILE:compare_cpu_metal>
+            --input=${CMAKE_SOURCE_DIR}/tests/data/metal/gac_inconsistent.xml
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+  )
+  add_test(
+    NAME compare_cpu_metal_bitwords2
+    COMMAND $<TARGET_FILE:compare_cpu_metal>
+            --input=${CMAKE_SOURCE_DIR}/tests/data/metal/gac_bitwords2.xml
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+  )
+  add_test(
+    NAME compare_cpu_metal_manifest
+    COMMAND $<TARGET_FILE:compare_cpu_metal>
+            --input=${CMAKE_SOURCE_DIR}/tests/data/bench/BMPath.xml
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+  )
+
+  set_tests_properties(
+    compare_cpu_metal_queens4
+    compare_cpu_metal_deletion
+    compare_cpu_metal_inconsistent
+    compare_cpu_metal_bitwords2
+    compare_cpu_metal_manifest
+    PROPERTIES
+      LABELS "metal;gac"
+      TIMEOUT 120
+  )
+
+  add_test(
+    NAME benchmark_metal_gac_smoke
+    COMMAND $<TARGET_FILE:benchmark_metal_gac>
+            --input=${CMAKE_SOURCE_DIR}/tests/data/metal/gac_bitwords2.xml
+            --runs=2
+            --warmup=1
+            --verify=true
+            --readonly_storage=private
+            --frontier_mode=compact
+            --csv=${CMAKE_BINARY_DIR}/metal_gac_benchmark_smoke.csv
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+  )
+
+  set_tests_properties(benchmark_metal_gac_smoke PROPERTIES
+    LABELS "metal;gac;benchmark"
+    TIMEOUT 120
+  )
+endif()
 
 # ============================================================================
 # 原始主程序 (已弃用，依赖旧的 XBuilder)
@@ -592,6 +829,7 @@ target_link_libraries(cpim_gac_cpu PRIVATE
 # # 确保 CUDA 链接器标志被设置
 # set_target_properties(cpim PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
+if(CPIM_CUDA_ENABLED)
 # 添加 CUDA 相关的路径
 include_directories(${CUDA_INCLUDE_DIRS})
 link_directories(${CUDA_TOOLKIT_ROOT_DIR}/lib64)
@@ -630,6 +868,7 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm")
     $<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=-DABSL_HAVE_NEON=0>
   )
 endif()
+endif()
 
 # ============================================================================
 # verify_gac: GAC 正确性验证工具 (穷举法对比 AC3bit)
@@ -664,6 +903,7 @@ target_link_libraries(verify_search PRIVATE
 # ============================================================================
 # test_batch3a: Batch-3A (约束聚合) 测试
 # ============================================================================
+if(CPIM_CUDA_ENABLED)
 add_executable(test_batch3a
   tests/cpp/test_batch3a.cpp
   src/solver/gpu/GModel.cu
@@ -793,4 +1033,5 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm")
     $<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=-U__ARM_NEON__>
     $<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=-DABSL_HAVE_NEON=0>
   )
+endif()
 endif()

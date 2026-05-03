@@ -69,6 +69,8 @@ class LibXml2Parser : public XcspParser {
   absl::StatusOr<std::string> GetNodeContent(xmlNodePtr node);
 
   absl::StatusOr<DomainValues> ParseDomainValues(absl::string_view values_str);
+  absl::StatusOr<std::vector<int>> ExpandDomainToken(
+      absl::string_view token);
   absl::StatusOr<std::vector<VariableId>> ParseScope(
       absl::string_view scope_str, const ModelBuilder& builder);
   absl::StatusOr<std::vector<std::vector<int>>> ParseTuples(

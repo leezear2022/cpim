@@ -1,5 +1,7 @@
 #include "model/libxml2_parser.h"
 
+#include <algorithm>
+#include <cctype>
 #include <sstream>
 #include <system_error>
 
@@ -633,14 +635,33 @@ absl::Status LibXml2Parser::ParseConstraints(xmlNodePtr root,
       return absl::InvalidArgumentError(
           absl::StrFormat("Constraint %d has no reference attribute", i));
     }
+    const std::string ref = *ref_str_or;
+
+    if (ref == "global:allDifferent") {
+      return absl::UnimplementedError(absl::StrFormat(
+          "global:allDifferent is not supported by Metal GAC v1: "
+          "constraint %d",
+          i));
+    }
+
+    if (!ref.empty() && ref[0] == 'P') {
+      return absl::UnimplementedError(absl::StrFormat(
+          "Predicate/intension references are not supported yet: "
+          "constraint %d reference=%s",
+          i, ref));
+    }
 
     // 提取 relation ID
-    auto rel_idx_or = ExtractNumberFromString(*ref_str_or);
+    auto rel_idx_or = ExtractNumberFromString(ref);
     if (!rel_idx_or.ok()) {
       return rel_idx_or.status();
     }
 
     RelationId rel_id{*rel_idx_or};
+    if (!builder.HasRelation(rel_id)) {
+      return absl::InvalidArgumentError(absl::StrFormat(
+          "Constraint %d references invalid relation ID: %d", i, rel_id.value));
+    }
     const auto& relation = builder.GetRelation(rel_id);
 
     // 创建约束（constraint name 自动生成）
@@ -742,34 +763,16 @@ absl::StatusOr<std::string> LibXml2Parser::GetNodeContent(xmlNodePtr node) {
 
 absl::StatusOr<DomainValues> LibXml2Parser::ParseDomainValues(
     absl::string_view values_str) {
-  // 检查是否是范围格式: "min..max"
-  size_t range_pos = values_str.find("..");
-  if (range_pos != absl::string_view::npos) {
-    // 范围格式
-    int min_val, max_val;
-    if (!absl::SimpleAtoi(values_str.substr(0, range_pos), &min_val)) {
-      return absl::InvalidArgumentError(
-          absl::StrFormat("Failed to parse range min: %s", values_str));
-    }
-    if (!absl::SimpleAtoi(values_str.substr(range_pos + 2), &max_val)) {
-      return absl::InvalidArgumentError(
-          absl::StrFormat("Failed to parse range max: %s", values_str));
-    }
-    return RangeDomain{min_val, max_val};
-  }
-
-  // 枚举格式: "1 3 5 7" 或 "1,3,5,7"
   std::vector<int> values;
   std::vector<absl::string_view> parts =
       absl::StrSplit(values_str, absl::ByAnyChar(" ,\t\n"), absl::SkipEmpty());
 
   for (absl::string_view part : parts) {
-    int value;
-    if (!absl::SimpleAtoi(part, &value)) {
-      return absl::InvalidArgumentError(
-          absl::StrFormat("Failed to parse domain value: %s", part));
+    auto expanded_or = ExpandDomainToken(part);
+    if (!expanded_or.ok()) {
+      return expanded_or.status();
     }
-    values.push_back(value);
+    values.insert(values.end(), expanded_or->begin(), expanded_or->end());
   }
 
   if (values.empty()) {
@@ -781,6 +784,41 @@ absl::StatusOr<DomainValues> LibXml2Parser::ParseDomainValues(
   values.erase(std::unique(values.begin(), values.end()), values.end());
 
   return EnumeratedDomain{std::move(values)};
+}
+
+absl::StatusOr<std::vector<int>> LibXml2Parser::ExpandDomainToken(
+    absl::string_view token) {
+  size_t range_pos = token.find("..");
+  if (range_pos == absl::string_view::npos) {
+    int value;
+    if (!absl::SimpleAtoi(token, &value)) {
+      return absl::InvalidArgumentError(
+          absl::StrFormat("Failed to parse domain value: %s", token));
+    }
+    return std::vector<int>{value};
+  }
+
+  int min_val;
+  int max_val;
+  if (!absl::SimpleAtoi(token.substr(0, range_pos), &min_val)) {
+    return absl::InvalidArgumentError(
+        absl::StrFormat("Failed to parse range min: %s", token));
+  }
+  if (!absl::SimpleAtoi(token.substr(range_pos + 2), &max_val)) {
+    return absl::InvalidArgumentError(
+        absl::StrFormat("Failed to parse range max: %s", token));
+  }
+  if (min_val > max_val) {
+    return absl::InvalidArgumentError(
+        absl::StrFormat("Invalid domain range: %s", token));
+  }
+
+  std::vector<int> values;
+  values.reserve(max_val - min_val + 1);
+  for (int value = min_val; value <= max_val; ++value) {
+    values.push_back(value);
+  }
+  return values;
 }
 
 absl::StatusOr<std::vector<VariableId>> LibXml2Parser::ParseScope(

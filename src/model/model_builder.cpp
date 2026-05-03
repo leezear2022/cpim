@@ -153,9 +153,14 @@ RelationId ModelBuilder::AddRelation(
 }
 
 const Relation& ModelBuilder::GetRelation(RelationId id) const {
-  CHECK(id.IsValid() && id.value < relations_.size())
-      << "Invalid relation ID: " << id.value;
+  CHECK(HasRelation(id)) << "Invalid relation ID: " << id.value;
   return relations_[id.value];
+}
+
+bool ModelBuilder::HasRelation(RelationId id) const {
+  return id.IsValid() &&
+         id.value >= 0 &&
+         static_cast<size_t>(id.value) < relations_.size();
 }
 
 std::optional<DomainId> ModelBuilder::GetDomainByName(

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<instance>
+  <presentation format="XCSP 2.0" maxConstraintArity="2" name="gac_bitwords2"/>
+  <domains nbDomains="1">
+    <domain name="D0" nbValues="40">0..39</domain>
+  </domains>
+  <variables nbVariables="2">
+    <variable domain="D0" name="V0"/>
+    <variable domain="D0" name="V1"/>
+  </variables>
+  <relations nbRelations="1">
+    <relation arity="2" name="R0" nbTuples="1" semantics="supports">39 39</relation>
+  </relations>
+  <constraints nbConstraints="1">
+    <constraint arity="2" name="C0" reference="R0" scope="V0 V1"/>
+  </constraints>
+</instance>

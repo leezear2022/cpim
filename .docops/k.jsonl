@@ -1,0 +1,8 @@
+{"id":"R001","ty":"R","k":"fix.needs.va","sc":"repo","if":"claim.fix","req":"va.pass|va.def","sev":"b","st":"acc"}
+{"id":"C001","ty":"C","k":"readme.static","sc":"repo","v":"README is nav only","st":"acc"}
+{"id":"L001","ty":"L","k":"bench.noise","sc":"repo","if":"claim.perf","req":"va.bench.runs>=3","conf":0.8,"st":"cand"}
+{"id":"X001","ty":"X","k":"unit.not.perf","sc":"repo","if":"claim.perf","bad":"unit.only","req":"bench","st":"acc"}
+{"id":"D001","ty":"D","k":"fixture.fail","sc":"repo","seq":"env->fixture->parser","st":"cand"}
+{"id":"P001","ty":"P","k":"token.mode","sc":"user","v":"short","cost":"long_doc:+2","st":"acc"}
+{"id":"C002","ty":"C","k":"doc.separate.microdocs","sc":"repo","v":"small plans and small changelogs require standalone docs","st":"cand"}
+{"id":"C002","ty":"C","k":"doc.separate.microdocs","sc":"repo","v":"small plans and small changelogs require standalone docs","st":"acc","prom_ts":"2026-05-03T07:09:07Z"}

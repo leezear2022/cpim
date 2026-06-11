@@ -44,6 +44,15 @@ Output:
 
 当前实现是 C++17 软件/周期级模拟器，加一个可用普通 `g++` 编译的 HLS-friendly 核心 testbench。
 
+HLS-friendly testbench：
+
+```bash
+g++ -std=c++17 -I fpga_cpim/hls \
+  fpga_cpim/hls/testbench_hls.cpp fpga_cpim/hls/*.cpp \
+  -o hls_tb
+./hls_tb
+```
+
 ## 为什么需要 VariableOwner
 
 Constraint tile 只读 domains 并产生 delete mask。`VariableOwner` 是唯一负责 domain update、delta、DWO 和 fanout 的模块。
@@ -123,6 +132,18 @@ fpga_cpim/scripts/run_phase_b_sweep.py \
   --partition-policies degree,contiguous \
   --support-banks 4
 ```
+
+## HLS Phase C.2
+
+HLS-friendly core 已支持：
+
+- 输入 `var_partition` / `constraint_partition`。
+- per-partition 环形 event queue。
+- round-robin 多 revise tile 调度。
+- queue peak、local/cross event、router overflow 统计。
+- `vars=128/domain=128/density≈0.10` pressure smoke。
+
+预算超限和 per-partition queue overflow 仍返回 `UNKNOWN`。
 
 ## 和 SAT-FPGA BCP 的关系
 

@@ -11,6 +11,9 @@ constexpr int MAX_DOMAIN = 128;
 constexpr int MAX_WORDS = 4;
 constexpr int MAX_WORLDS = 4;
 constexpr int MAX_QUEUE = 4096;
+constexpr int MAX_PARTITIONS = 8;
+constexpr int MAX_PARTITION_QUEUE = 1024;
+constexpr int MAX_REVISE_TILES = 4;
 
 using word_t = uint32_t;
 
@@ -63,6 +66,13 @@ struct ResultHls {
   uint32_t events = 0;
   uint32_t revise_calls = 0;
   uint32_t deleted_values = 0;
+  uint32_t epochs = 0;
+  uint32_t tile_steps = 0;
+  uint32_t local_events = 0;
+  uint32_t cross_events = 0;
+  uint32_t queue_peak_total = 0;
+  uint16_t queue_peak_partition = 0;
+  uint16_t router_overflow = 0;
 };
 
 struct ControlHls {
@@ -72,6 +82,9 @@ struct ControlHls {
   uint32_t max_events = 100000;
   uint32_t max_revise = 100000;
   uint32_t max_epochs = 1000;
+  uint16_t num_partitions = 1;
+  uint16_t num_revise_tiles = 1;
+  uint16_t partition_queue_capacity = MAX_PARTITION_QUEUE;
 };
 
 inline uint16_t word_count(uint16_t bits) {
@@ -94,12 +107,28 @@ void cpim_top_hls(
     const ConstraintHls constraints[MAX_CONSTRAINTS],
     const SubscriptionHls subscriptions[MAX_VARS],
     const uint16_t domain_size[MAX_VARS],
+    const uint16_t var_partition[MAX_VARS],
+    const uint16_t constraint_partition[MAX_CONSTRAINTS],
     const ProbeTaskHls tasks[MAX_WORLDS],
     ResultHls results[MAX_WORLDS],
     ControlHls control);
 
 bool hls_enqueue(DirtyEventHls queue[MAX_QUEUE], uint16_t* tail,
                  DirtyEventHls event);
+
+bool hls_enqueue_partition(
+    DirtyEventHls queues[MAX_PARTITIONS][MAX_PARTITION_QUEUE],
+    uint16_t heads[MAX_PARTITIONS], uint16_t tails[MAX_PARTITIONS],
+    uint16_t counts[MAX_PARTITIONS], uint16_t partition, uint16_t capacity,
+    DirtyEventHls event, uint32_t* total_occupancy, uint32_t* queue_peak_total,
+    uint16_t* queue_peak_partition);
+
+bool hls_dequeue_partition(
+    DirtyEventHls queues[MAX_PARTITIONS][MAX_PARTITION_QUEUE],
+    uint16_t heads[MAX_PARTITIONS], uint16_t tails[MAX_PARTITIONS],
+    uint16_t counts[MAX_PARTITIONS], uint16_t* rr_partition,
+    uint16_t num_partitions, uint16_t capacity, DirtyEventHls* event,
+    uint32_t* total_occupancy);
 
 bool hls_apply_delete(word_t domains[MAX_VARS][MAX_WORDS], uint16_t var,
                       uint16_t domain_bits, const word_t del_words[MAX_WORDS],

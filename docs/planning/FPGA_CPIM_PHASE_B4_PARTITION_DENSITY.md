@@ -68,9 +68,10 @@ random  128     4      785.0        3140.0     35.0      43        0.100    degr
 - 当前数据不足以证明 contiguous 更好；默认仍保留 `degree`。
 - `density=0.10` 是下一阶段 HLS dataflow 更合适的压力样例。
 
-## 下一步
+## 后续
 
-建议进入 HLS Phase C.2：
+HLS Phase C.2 已完成，见
+[FPGA_CPIM_PHASE_C2_HLS_DATAFLOW.md](FPGA_CPIM_PHASE_C2_HLS_DATAFLOW.md)：
 
 - 固定 `support_banks=ceil(domain/32)`。
 - 固定默认 `partition_policy=degree`。

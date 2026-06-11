@@ -1,5 +1,41 @@
 # 修改清单（中文）
 
+## 2026-06-12
+
+### FPGA CPIM：HLS Phase C.2 多 tile / 分区队列
+
+**目标**：承接 Phase B.4 的 `density=0.10` queue pressure 观察，把
+HLS-friendly core 从单队列推进到 partition-aware queue fabric，并保留
+`UNKNOWN` 的保守语义。
+
+**核心改动**：
+- `cpim_top_hls` 新增 `var_partition[MAX_VARS]` 与
+  `constraint_partition[MAX_CONSTRAINTS]` 输入。
+- `ControlHls` 新增 `num_partitions`、`num_revise_tiles`、
+  `partition_queue_capacity`。
+- `ResultHls` 新增 `epochs`、`tile_steps`、`local_events`、
+  `cross_events`、`queue_peak_total`、`queue_peak_partition`、
+  `router_overflow`。
+- `event_router_hls.cpp` 新增 per-partition 环形 event queue。
+- HLS testbench 新增多 revise tile round-robin、partition queue overflow
+  UNKNOWN、`vars=128/domain=128/density≈0.10` pressure smoke。
+- 新增记录：
+  `docs/planning/FPGA_CPIM_PHASE_C2_HLS_DATAFLOW.md`。
+
+**验证**：
+- `cmake --build build/fpga_cpim -j`
+- `ctest --test-dir build/fpga_cpim --output-on-failure`
+- `g++ -std=c++17 -I fpga_cpim/hls fpga_cpim/hls/testbench_hls.cpp fpga_cpim/hls/*.cpp -o /tmp/hls_tb_c2 && /tmp/hls_tb_c2`
+- `python3 -m py_compile fpga_cpim/scripts/*.py`
+- `git diff --check`
+- `dol lint --soft`
+
+**结果摘要**：
+- `ctest` 12/12 通过。
+- 手工 HLS testbench 输出 `hls_tb ok`。
+- overflow / budget 命中仍返回 `UNKNOWN`，不对外产生删除。
+- 当前仍是 HLS-friendly 调度 smoke，不是周期精确 RTL timing。
+
 ## 2026-05-27
 
 ### Metal SAC v3.18：fusion rounds sweep

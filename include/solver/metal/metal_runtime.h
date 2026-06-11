@@ -78,7 +78,17 @@ struct MetalBufferFill {
   uint8_t value = 0;
 };
 
+struct MetalComputeDispatch1D {
+  const MetalPipeline* pipeline = nullptr;
+  std::vector<MetalBufferBinding> bindings;
+  std::vector<uint8_t> params;
+  int params_index = 0;
+  uint64_t grid_size = 0;
+  uint64_t threads_per_threadgroup = 0;
+};
+
 struct MetalDispatchTimings {
+  double encode_ms = 0.0;
   double wall_ms = 0.0;
   double kernel_ms = 0.0;
   bool gpu_timing_available = false;
@@ -116,6 +126,9 @@ class MetalRuntime {
       int params_index,
       uint64_t grid_size,
       uint64_t threads_per_threadgroup) const;
+
+  absl::StatusOr<MetalDispatchTimings> Dispatch1DBatch(
+      const std::vector<MetalComputeDispatch1D>& dispatches) const;
 
   absl::StatusOr<MetalDispatchTimings> BlitCopyAndFill(
       const std::vector<MetalBufferCopy>& copies,

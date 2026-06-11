@@ -193,6 +193,65 @@ updated: 2026-05-03
 - v2.9 验收结果：TIER2 baseline `shared+flags+scalar+pair`
   `solve_ms p50=0.261 p95=5.132`；auto 封版路径 `flags+scalar+pair`
   `solve_ms p50=0.259 p95=5.079`，满足 p50/p95 不慢于 baseline 5% 的门槛。
+- Metal v3 已启动为 GAC evidence/recommender 线：
+  - `metal_gac_analyze.py --recommend-policy` 输出 report-only policy 建议；
+  - 通过 `--baseline-mode`、`--regression-threshold`、`--min-runs` 控制推荐口径；
+  - mode summary 新增 `kernel_share`、`dispatch_share`、`reset_share` 与
+    `worklist_push_per_round`；
+  - v3 不改变 v2 默认 fallback，不直接启用 simdgroup/threadgroup staging。
+- v3 TIER2 evidence：baseline `shared+flags+scalar+pair`
+  `solve_ms p50=0.290 p95=4.995`，`shared+auto`
+  `solve_ms p50=0.223 p95=6.293`；combined recommender 显示
+  `baseline_bottleneck_counts dispatch=76`，所以当前不提升 auto policy，也不进入
+  simdgroup kernel 实现。
+- v3 CPU vs Metal 对照已落地：
+  - `benchmark_metal_gac --cpu_timing=true` 只计 `GacCpuRunner::Run()` 时间；
+  - CSV/分析脚本记录 `cpu_solve_ms` 与 `metal_cpu_solve_ratio`；
+  - TIER2 auto 显示 Metal solve `p50=0.439ms p95=5.050ms`，CPU solve
+    `p50=0.008438ms p95=0.071971ms`，Metal faster `0/380`。
+- v3.4 CTA-local persistent worklist 已实现为显式实验路径
+  [CTA-local persistent worklist](metal_gac/CPIM_METAL_METAL_GAC_V3_CTA_WORKLIST_PLAN_2026_05_03.md)：
+  - 每个 CTA/threadgroup 使用独立 queue、dedup stamp/mask、tail 与 overflow；
+  - CTA 内在单次 dispatch 中执行多轮局部 worklist；
+  - 跨 CTA 传播第一版只写 global flags，由 host outer loop 重新播种；
+  - CSV/analysis 新增 `cta_local_rounds`、`cta_queue_push_count`、
+    `cta_cross_push_count`、`cta_overflow_count` 与 `host_round_count`；
+  - 不采用多个 CTA 竞争同一个全局 c queue，不改变默认 fallback。
+- v3.5 CTA evidence gate 已启动：
+  - `metal_gac_analyze.py` 新增 `[cta worklist gate]` report-only section；
+  - TIER2 对比 `shared+flags`、旧 `worklist` 与 `cta_worklist`；
+  - TIER2 gate 结论为 `decision=report_only`：
+    `cta_vs_shared+flags p50=1.27x p95=2.99x`，
+    `cta_vs_best_worklist p50=1.37x p95=2.99x`，
+    `host_round_ratio_vs_baseline p50=1.00x`，`cta_overflow_count p95=0`；
+  - 因 p95 回退且 host round 未下降，`cta_worklist` 不进入 `auto`。
+- v3.6 CTA owner partition exploration 已进入 default-off 实验
+  [CTA owner partition exploration](metal_gac/METAL_GAC_V36_CTA_OWNER_PARTITION_EXPLORATION_PLAN_2026_05_03.md)：
+  - 承接 v3.5 gate 失败，不继续把 `cid % cta_count` 当作默认 owner 策略；
+  - 记录 `owner_map_static`、`owner_bucketed_seed`、`dirty_var_pull`、
+    `hub_replication`、`hierarchical_steal`、`indirect_multiround` 六条可试分支；
+  - 已新增 `--cta_owner_mode=static_edge_cut`，Host 侧构建
+    `owner_of_constraint[cid]`，CTA seed/kernel 统一读取 owner map；
+  - `owner_map_static` TIER2 gate 未通过：
+    `cta_vs_shared+flags p50=1.83x p95=4.51x`，`cta_overflow_count p95=1`，
+    继续保持 report-only；
+  - v3.7 已新增 `--cta_queue_mode=spill_replay` 并拆分 seed/queue/budget
+    overflow；TIER2 显示 `queue_overflow_p95=0`、`seed_overflow_p95=0`、
+    `budget_spill_p95=1`，说明真 queue/seed overflow 不是主因；
+  - 优先探索 `primal_edge_cut_owner`、`vebo_weighted_owner`、
+    `bulk_sync_deletion_mask` 三条主线，分别对应变量图 edge-cut、VEBO-style
+    weighted ordering、bulk-synchronous deletion-mask merge；
+  - 每条分支必须用 CPU verify、`solve_ms` p50/p95/p99、`host_round_count`、
+    `cta_*` stats 和 `metal_cpu_solve_ratio` 过 gate；
+  - 默认 owner 仍为 `modulo`，不改变 `auto`，roadmap 保持 `v03`。
+- v3.8/v3.9 已继续评估 `bounded_replay` 与 `vebo_weighted_owner`，两者均为
+  report-only：budget spill 与 owner skew 有改善，但 p95/host-round gate 未通过。
+- v3.10 已新增 default-off `frontier_mode=bulk_sync_mask`：
+  - revise/apply 两阶段 bulk-synchronous deletion mask；
+  - CSV/analyzer 新增 `bulk_mask_*` stats 与 `large_any` / `large_prop` gate；
+  - TIER2 380/383 OK，但 `bulk_vs_shared+flags p50=1.86x p95=3.17x`，
+    `large_prop p50=1.94x p95=2.76x`，dispatch ratio 约 2x，因此保持
+    report-only，不进入 `auto`。
 
 ## 2. 当前 CUDA/Jetson UMA 依赖点
 
@@ -425,6 +484,93 @@ updated: 2026-05-03
 - 基于 v2.x CSV 再评估 worklist、SoA/packing、simdgroup ballot、threadgroup
   memory 与 texture 的收益；v2 已先落地 directional bitSup packing、word-parallel
   载体、epoch worklist 和 blit reset，texture 暂缓。
+- v3 先把评估收敛为 report-only recommender：按 family、constraint 数、
+  domain size、bit_words、frontier density 分桶，输出 candidate path、p50/p95
+  ratio、劣化实例和瓶颈 share；只有连续 tier evidence 指向 `kernel_ms` 主瓶颈时，
+  才单独推进 simdgroup/threadgroup staging。
+- v3 CPU vs Metal evidence 表明 GAC-only Metal 当前不是性能默认候选；后续若继续
+  Metal 性能线，应优先减少 host dispatch 往返，或转向 SAC/Batch 这种更适合 GPU
+  批量化的工作负载。
+- v3.8 CTA evidence 表明 local budget / bounded replay 能清零 budget spill，但
+  `cta_worklist` 仍无法降低 host round 或通过 p95 gate；下一步若继续 GAC 性能线，
+  应转向 `vebo_weighted_owner`，而不是继续优先调整 seed/overflow/budget 协议。
+- v3.9 `vebo_weighted_owner` 改善 owner weighted balance 与 CTA absolute p95，但
+  仍未降低 host round，保持 report-only。后续 CTA 方向应只做明确的
+  owner locality/cross-push hybrid 调优；否则优先回到 Batch/SAC 多任务吞吐。
+- v3.10 `bulk_sync_mask` correctness 成立，但 revise/apply 双 dispatch 让 TIER2
+  与大传播 bucket 都未通过 gate，保持 report-only。
+- v3.11 `dirty_var_pull` 将 CTA cross-owner push 改为 dirty var handoff，TIER2
+  相对 v3.9 小幅改善到 `solve_ms p50=0.470 p95=3.202`，但
+  `cta_vs_shared+flags p95=3.00x`，仍不进入 `auto`。
+- v3.12 `dirty_pull_hybrid` 新增 degree threshold，hybrid8 将 CTA absolute
+  `p95` 压到 `2.192ms`，但 shared+flags gate 仍拒绝；BH-4-4 bucket
+  `p50_ratio=0.40 p95_ratio=0.43`，适合 report-only bucket policy，不适合全局
+  默认。
+- v3.13 在 analyzer 中新增 bucket policy simulation：只选择无 regression 的
+  eligible bucket。当前只有 BH-4-4 bucket eligible，模拟 policy `p95=1.696ms`
+  对比 fallback `p95=2.987ms`，但仍保持 runtime `auto` 不变。
+- v3.14 将 BH-4-4 bucket simulation 落成 default-off runtime
+  `--policy_mode=bh_cta_allowlist`。TIER2 selected inputs 为 4/76，
+  selected-vs-shared+flags `p50=0.62x p95=0.68x`，regression rows 为 0；
+  `frontier_mode=auto` 仍不读取该 policy。
+- v3.15 新增 additive dispatch timing split，CSV 记录 `dispatch_encode_ms`、
+  `dispatch_wait_ms` 与 `dispatch_non_kernel_ms`。TIER2 baseline 显示
+  `encode=0.013ms`、`kernel=0.105ms`、`non_kernel=0.668ms`、
+  `non_kernel_share=0.86`，说明当前 Metal GAC-only 更受 command buffer
+  non-kernel 固定成本限制，而不是 CPU encode；下一步优先评估 Batch/SAC 吞吐或
+  command-buffer fusion。
+- v3.16 新增 default-off `benchmark_metal_sac` 和 Metal batch singleton probe
+  runner。BH smoke 中 384 probes/run，CPU/Metal probe status verify 通过，
+  `dispatch_per_probe=0.0182`、`non_kernel_per_probe≈0.0038ms`，初步证明
+  Batch/SAC 多 world probe 能摊薄 command buffer 固定成本。TIER2 为
+  380/383 OK，3 个 ERROR 均为历史 `unsupported_non_binary_extension`；
+  supported rows `verify_mismatches=0`、`UNKNOWN=0`，整体
+  `dispatch_per_probe avg=0.0527 p50=0.0182 p95=0.1402`、
+  `non_kernel_per_probe avg=0.014634ms p50=0.005242ms p95=0.023366ms`。本轮不接
+  完整 SAC preprocess 或搜索。
+- v3.17 在 `benchmark_metal_sac` 中新增 default-off host-side NSACQ：
+  `--sac_mode=nsacq|sacq_adj|sacq_full`，支持 allowed constraint mask、host
+  candidate queue、DWO writeback 和 post-delete stable Metal GAC。`queens-4`
+  smoke 中 24 probes、8 DWO、8 values written back、1 次 post-delete GAC；
+  metal-smoke 为 5/5 OK。TIER2 为 228/231 OK，3 个 ERROR 均为历史
+  `unsupported_non_binary_extension`；supported rows 有 12,094 confirmed DWO
+  writeback，但也有 4,970 rejected unconfirmed Metal DWO，因此 raw Metal DWO
+  status 不进入 promote，仍不接搜索或默认 GAC policy。
+- v3.18 大计划更新已落账为 docs-only 备忘
+  [DWO forensics / command fusion / NSACQ throughput](metal_gac/CPIM_METAL_METAL_SAC_V318_DWO_FORENSIC_FUSION_PLAN_2026_05_24.md)：
+  - 单实例 Metal GAC 性能线冻结为 correctness/fallback path；
+  - 新性能主线为 Batch/SAC/NSACQ 吞吐化；
+  - 下一步优先 `dwo_forensic_oracle`，再评估 `command_buffer_fusion`，最后做
+    `nsacq_batch_policy_sacq_compare`；
+  - 默认 GAC `auto`、v3.14 allowlist、CUDA path、search integration 均不变。
+- v3.18 第一段实现了 benchmark-only DWO forensic counters：
+  `benchmark_metal_sac --dwo_forensics=true|false` 可输出 raw/confirmed/rejected
+  DWO、raw precision、domain-size/popcount mismatch、rejected empty/nonempty
+  domain 分类和 first rejected probe metadata；`metal_sac_ablation.py` 增加
+  `--dwo-forensics|--no-dwo-forensics`。
+- v3.18 第二段修复了 `sac_probe_init_kernel` 的初始化竞争：world singleton
+  domain 现在直接从 snapshot 生成，不再依赖同一 dispatch 内先复制再覆盖的顺序。
+  Limited TIER0 NSACQ forensics 3 runs 达到 `852/852` confirmed DWO、`0`
+  rejected DWO；driver 定点 3 runs 达到 `12/12` confirmed DWO、`0` rejected
+  DWO。CPU-confirmed guard 继续保留到 TIER2 evidence 稳定。
+- v3.18 full TIER2 NSACQ forensics 已完成：228 OK rows、3 个历史
+  `unsupported_non_binary_extension`、286,744 probes、19,885 raw DWO 全部
+  confirmed、0 rejected DWO、0 UNKNOWN。Metal SAC/NSACQ 仍 default-off，后续再
+  决定 raw DWO 是否可进入更激进的 report-only/promote gate。
+- v3.18 command-buffer fusion 第一版已实现为 default-off benchmark path：
+  `MetalRuntime::Dispatch1DBatch` 支持一个 command buffer 内顺序编码多 compute
+  dispatch，`benchmark_metal_sac --probe_fusion=bounded --fusion_rounds=4`
+  预编码多轮 SAC probe propagation。TIER2 bounded 为 228 OK rows、3 个历史
+  unsupported、289,657 probes、22,777 confirmed DWO、0 rejected DWO、0
+  UNKNOWN；相对 `probe_fusion=none`，avg command-buffer/probe 从 `0.0528`
+  降到 `0.0076`，avg non-kernel/probe 从 `0.0310ms` 降到 `0.0198ms`。
+  默认仍为 `probe_fusion=none`，不接搜索，不移除 CPU-confirmed DWO guard。
+- v3.18 fusion-round sweep 已完成：
+  `metal_sac_ablation.py --fusion-rounds-sweep=2,4,8` 可一次扫描多段长并按
+  `probe_fusion/fusion_rounds` 输出 avg/p50/p95。TIER2 sweep 中
+  `fusion_rounds=4` 的 non-kernel/probe p95 为 `0.021674ms`，优于 `2`
+  的 `0.026859ms` 和 `8` 的 `0.023821ms`；`8` command-buffer/probe 更低但
+  wasted rounds 明显更多，因此当前保留 `4` 作为均衡显式 bounded 设置。
 - 只有在 GAC/SAC MVP 语义稳定后，再重新评估 Batch-3A/FQ-PT 是否值得迁移。
 
 ## 5. CUDA 到 Metal 的替换规则

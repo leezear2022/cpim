@@ -726,6 +726,36 @@ if(CPIM_METAL_ENABLED)
     VERBATIM
   )
 
+  add_executable(benchmark_metal_sac
+    apps/benchmark_metal_sac.cpp
+    ${CPIM_METAL_RUNTIME_SOURCES}
+    src/solver/metal/metal_sac_batch_probe.mm
+  )
+
+  add_dependencies(benchmark_metal_sac cpim_metal_kernels)
+
+  target_link_libraries(benchmark_metal_sac PRIVATE
+    cpim_model
+    glog::glog
+    absl::flags
+    absl::flags_parse
+    "-framework Foundation"
+    "-framework Metal"
+  )
+
+  target_compile_options(benchmark_metal_sac PRIVATE
+    $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>
+  )
+
+  add_custom_command(
+    TARGET benchmark_metal_sac
+    POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${CPIM_METAL_LIB}
+            $<TARGET_FILE_DIR:benchmark_metal_sac>/metal_gac.metallib
+    VERBATIM
+  )
+
   add_test(
     NAME compare_cpu_metal_queens4
     COMMAND $<TARGET_FILE:compare_cpu_metal>

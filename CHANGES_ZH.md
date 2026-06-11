@@ -1,6 +1,859 @@
 # 修改清单（中文）
 
+## 2026-05-27
+
+### Metal SAC v3.18：fusion rounds sweep
+
+**目标**：继续收敛 bounded command-buffer fusion，扫描 `fusion_rounds=2/4/8`，
+决定显式 bounded 路径先保留哪个段长作为均衡消融设置。
+
+**核心改动**：
+- 新增独立小计划/小 changelog：
+  - `docs/planning/metal_gac/CPIM_METAL_METAL_SAC_V318_FUSION_ROUNDS_SWEEP_PLAN_2026_05_27.md`
+  - `docs/planning/metal_gac/CPIM_METAL_METAL_SAC_V318_FUSION_ROUNDS_SWEEP_CHANGELOG_2026_05_27.md`
+- `tests/python/metal_sac_ablation.py` 新增
+  `--fusion-rounds-sweep=2,4,8`。
+- `[fusion summary]` 现在按 `probe_fusion/fusion_rounds` 输出
+  `dispatch_per_probe`、`command_buffer_per_probe`、`non_kernel_per_probe`
+  的 avg/p50/p95。
+- 默认仍为 `probe_fusion=none`；不接搜索，不移除 CPU-confirmed DWO guard。
+
+**验证**：
+- `python3 -m py_compile tests/python/metal_sac_ablation.py codex-docops-logic/scripts/dol.py`
+- `python3 tests/python/metal_sac_ablation.py --suite=metal-smoke --runs=1 --warmup=0 --probe-limit=64 --sac-mode=nsacq --activation-mode=neighbor --max-sac-batches=30 --outer-queue-budget=256 --verify-probe-limit=32 --probe-fusion=bounded --fusion-rounds-sweep=2,4,8 --dwo-forensics --timeout=120 --csv=out/metal_sac_v318_fusion_sweep_smoke.csv --quiet`
+- `python3 tests/python/metal_sac_ablation.py --tier=0 --runs=3 --warmup=0 --probe-limit=256 --sac-mode=nsacq --activation-mode=neighbor --max-sac-batches=30 --outer-queue-budget=256 --verify-probe-limit=32 --probe-fusion=bounded --fusion-rounds-sweep=2,4,8 --dwo-forensics --timeout=120 --csv=out/metal_sac_v318_fusion_sweep_tier0.csv --quiet`
+- `python3 tests/python/metal_sac_ablation.py --tier=2 --runs=3 --warmup=0 --probe-limit=0 --sac-mode=nsacq --activation-mode=neighbor --max-sac-batches=10000 --outer-queue-budget=0 --verify-probe-limit=32 --probe-fusion=bounded --fusion-rounds-sweep=2,4,8 --dwo-forensics --timeout=300 --csv=out/metal_sac_v318_fusion_sweep_tier2.csv --quiet`
+
+**结果摘要**：
+- TIER2 sweep：684 OK rows，9 个历史 unsupported rows，865,743 probes，
+  65,108 confirmed DWO，0 rejected DWO，0 UNKNOWN。
+- `fusion_rounds=2`：non-kernel/probe avg `0.018152ms`，p95
+  `0.026859ms`，wasted rounds `154`。
+- `fusion_rounds=4`：non-kernel/probe avg `0.016337ms`，p95
+  `0.021674ms`，wasted rounds `438`。
+- `fusion_rounds=8`：non-kernel/probe avg `0.015251ms`，p95
+  `0.023821ms`，wasted rounds `1398`。
+- 结论：`8` 的 command-buffer/probe 更低，但 p95 non-kernel 与浪费轮次劣于
+  `4`；当前保留 `fusion_rounds=4` 作为 balanced explicit bounded setting。
+
+## 2026-05-24
+
+### Metal SAC v3.18：DWO forensics / command fusion / NSACQ throughput
+
+**目标**：根据 v3.17 host-side NSACQ evidence 和外部 review 更新 Metal
+GAC/SAC 大计划。当前路线没有大方向偏移；单实例 Metal GAC 性能线冻结为
+stable correctness fallback，新性能主线转向 Batch/SAC/NSACQ 吞吐化。
+
+**核心改动**：
+- 新增独立小计划/小 changelog：
+  - `docs/planning/metal_gac/CPIM_METAL_METAL_SAC_V318_DWO_FORENSIC_FUSION_PLAN_2026_05_24.md`
+  - `docs/planning/metal_gac/CPIM_METAL_METAL_SAC_V318_DWO_FORENSIC_FUSION_CHANGELOG_2026_05_24.md`
+- 更新 `METAL_GAC_LONG_TERM_OPTIMIZATION.md`：
+  - GAC-only 瓶颈明确为短 kernel 周围的 command-buffer / wait /
+    non-kernel fixed cost；
+  - NSACQ 瓶颈明确为 raw Metal DWO 可信度、CPU-confirm guard 成本、
+    batch/queue 组织；
+  - v3.18 三项优先实验固定为 `dwo_forensic_oracle`、
+    `command_buffer_fusion`、`nsacq_batch_policy_sacq_compare`。
+- 更新 `METAL_GAC_CHANGELOG.md` 与 `METAL_MIGRATION_PLAN.md` 导航。
+- 第一段实现 benchmark-only DWO forensic counters：
+  - `benchmark_metal_sac --dwo_forensics=true|false`
+  - `MetalBatchProbeRunner` 可按需回拷 final world bit-domain/domain-size
+  - CSV 新增 raw/confirmed/rejected DWO、raw precision、domain-size/popcount
+    mismatch、rejected empty/nonempty domain、first rejected probe metadata
+  - `metal_sac_ablation.py --dwo-forensics|--no-dwo-forensics`
+- 第二段定位并修复一个 raw DWO 误报源：
+  - DWO status debug words 记录 first status transition 的
+    `var/cid/dir/old_size/deletion_count/round`
+  - first rejected sample 指向 `sac_probe_init_kernel` 的 missing-value path
+    (`status_cid=-1`)
+  - init kernel 不再在同一 dispatch 内先复制 snapshot 再由 `cid==0` 覆盖
+    singleton，而是直接从 immutable snapshot 生成每个 world 的 singleton domain
+- 第三段实现 benchmark-only bounded command-buffer fusion：
+  - `MetalRuntime::Dispatch1DBatch` 可在一个 command buffer 内顺序编码多个
+    compute dispatch
+  - `MetalBatchProbeOptions::probe_fusion=none|bounded` 与 `fusion_rounds`
+    控制 SAC probe fusion，默认仍为 `none`
+  - `benchmark_metal_sac --probe_fusion=none|bounded --fusion_rounds=<n>`
+    与 `metal_sac_ablation.py --probe-fusion --fusion-rounds` 透传消融
+  - 新增 `command_buffer_count`、`command_buffer_per_probe`、
+    `fused_rounds_encoded`、`fused_rounds_wasted` 等 CSV 字段
+- Roadmap 保持 `cpim-metal rm: v03`，不改变 solver 默认行为。
+
+**验证**：
+- `python3 -m py_compile codex-docops-logic/scripts/dol.py`
+- `python3 -m py_compile tests/python/metal_sac_ablation.py codex-docops-logic/scripts/dol.py`
+- `cmake --build build_metal --target benchmark_metal_sac -j8`
+- `./build_metal/benchmark_metal_sac --input=tests/data/bench/queens-4_ext.xml --runs=1 --warmup=0 --probe_limit=16 --sac_mode=nsacq --activation_mode=neighbor --max_sac_batches=2 --outer_queue_budget=16 --max_probe_rounds=1000 --verify=true --verify_probe_limit=16 --dwo_forensics=true --csv=out/metal_sac_v318_dwo_forensics_queens4.csv`
+- `python3 tests/python/metal_sac_ablation.py --instances tests/data/bench/queens-4_ext.xml --runs=1 --warmup=0 --probe-limit=16 --sac-mode=nsacq --activation-mode=neighbor --max-sac-batches=2 --outer-queue-budget=16 --max-probe-rounds=1000 --verify-probe-limit=16 --dwo-forensics --timeout=60 --csv=out/metal_sac_v318_dwo_forensics_ablation_queens4.csv`
+- `python3 tests/python/metal_sac_ablation.py --tier=0 --runs=3 --warmup=0 --probe-limit=256 --sac-mode=nsacq --activation-mode=neighbor --max-sac-batches=30 --outer-queue-budget=256 --max-probe-rounds=10000 --verify-probe-limit=32 --dwo-forensics --timeout=120 --csv=out/metal_sac_v318_forensics_tier0_fixed_r3.csv --quiet`
+- `./build_metal/benchmark_metal_sac --input=benchmarks/driver/driverlogw-01c-sat_ext.xml --runs=3 --warmup=0 --probe_limit=256 --sac_mode=nsacq --activation_mode=neighbor --max_sac_batches=30 --outer_queue_budget=256 --max_probe_rounds=10000 --verify=true --verify_probe_limit=32 --dwo_forensics=true --csv=out/metal_sac_v318_forensics_driver_fixed.csv`
+- `./build_metal/benchmark_metal_sac --input=tests/data/bench/queens-4_ext.xml --runs=1 --warmup=0 --probe_limit=16 --sac_mode=nsacq --verify=true --verify_probe_limit=16 --probe_fusion=none --csv=out/metal_sac_v318_fusion_none_smoke.csv`
+- `./build_metal/benchmark_metal_sac --input=tests/data/bench/queens-4_ext.xml --runs=3 --warmup=0 --probe_limit=64 --sac_mode=nsacq --verify=true --verify_probe_limit=64 --probe_fusion=bounded --fusion_rounds=4 --dwo_forensics=true --csv=out/metal_sac_v318_fusion_bounded_smoke.csv`
+- `python3 tests/python/metal_sac_ablation.py --tier=0 --runs=3 --warmup=0 --probe-limit=256 --sac-mode=nsacq --activation-mode=neighbor --max-sac-batches=30 --outer-queue-budget=256 --verify-probe-limit=32 --probe-fusion=bounded --fusion-rounds=4 --dwo-forensics --timeout=120 --csv=out/metal_sac_v318_fusion_tier0_bounded.csv --quiet`
+- `python3 tests/python/metal_sac_ablation.py --tier=2 --runs=3 --warmup=0 --probe-limit=0 --sac-mode=nsacq --activation-mode=neighbor --max-sac-batches=10000 --outer-queue-budget=0 --verify-probe-limit=32 --probe-fusion=bounded --fusion-rounds=4 --dwo-forensics --timeout=300 --csv=out/metal_sac_v318_fusion_tier2_bounded.csv --quiet`
+- `python3 tests/python/metal_sac_ablation.py --tier=2 --runs=3 --warmup=0 --probe-limit=0 --sac-mode=nsacq --activation-mode=neighbor --max-sac-batches=10000 --outer-queue-budget=0 --verify-probe-limit=32 --probe-fusion=none --fusion-rounds=4 --dwo-forensics --timeout=300 --csv=out/metal_sac_v318_fusion_tier2_none.csv --quiet`
+- `git diff --check`
+- `python3 codex-docops-logic/scripts/dol.py lint --soft`
+
+**结果摘要**：
+- 本轮第一段为 benchmark-only instrumentation，不修改 Metal solver 默认行为、GAC
+  `auto`、v3.14 allowlist、CUDA path 或 search integration。
+- 修复后 limited TIER0 NSACQ forensics：36 rows，852 raw DWO 全部
+  confirmed，0 rejected；driver 定点 3 runs：12 raw DWO 全部 confirmed，0
+  rejected。
+- full TIER2 NSACQ forensics：228 OK rows，3 个历史
+  `unsupported_non_binary_extension`，286,744 probes，19,885 raw DWO 全部
+  confirmed，0 rejected DWO，0 UNKNOWN。
+- v3.18 command fusion TIER2 对照：
+  - `probe_fusion=none`：228 OK rows，3 个历史 unsupported，291,297 probes，
+    24,402 confirmed DWO，0 rejected DWO，0 UNKNOWN，
+    avg command-buffer/probe `0.0528`，avg non-kernel/probe `0.0310ms`
+  - `probe_fusion=bounded`：228 OK rows，3 个历史 unsupported，289,657 probes，
+    22,777 confirmed DWO，0 rejected DWO，0 UNKNOWN，
+    avg command-buffer/probe `0.0076`，avg non-kernel/probe `0.0198ms`
+- v3.18 明确：在 v3.17 的 `4,970` rejected unconfirmed Metal DWO 被解释前，
+  raw Metal DWO 不能 promote，CPU-confirmed DWO guard 保持必要。
+
+## 2026-05-09
+
+### Metal SAC v3.17：host-side NSACQ queue
+
+**目标**：承接 v3.16 batch probe evidence，把 benchmark-only probe 扩展成
+default-off 的 host-side NSACQ 原型，验证 DWO probe 能否安全回写主 domain，并在
+每批删除后重新运行 stable Metal GAC。
+
+**核心改动**：
+- 新增 `MetalSacMode { batch_probe, nsacq, sacq_adj, sacq_full }`。
+- `MetalBatchProbeOptions` 新增 `allowed_constraints` mask。
+- Metal SAC kernels 的 init、revise、subscription enqueue 均尊重 allowed
+  constraint mask。
+- `benchmark_metal_sac` 新增：
+  - `--sac_mode=batch_probe|nsacq|sacq_adj|sacq_full`
+  - `--max_sac_batches`
+  - `--outer_queue_budget`
+  - host-side remaining-value queue
+  - DWO writeback 到 host snapshot
+  - delete batch 后 stable Metal GAC rerun
+  - NSACQ queue/delete/GAC rerun CSV 字段
+- `tests/python/metal_sac_ablation.py` 新增 `--sac-mode`、
+  `--max-sac-batches`、`--outer-queue-budget` 并透传新 CSV 字段。
+- 新增独立小计划/小 changelog：
+  - `docs/planning/metal_gac/CPIM_METAL_METAL_SAC_V317_HOST_NSACQ_PLAN_2026_05_09.md`
+  - `docs/planning/metal_gac/CPIM_METAL_METAL_SAC_V317_HOST_NSACQ_CHANGELOG_2026_05_09.md`
+
+**验证**：
+- `cmake -S . -B build_metal`
+- `cmake --build build_metal --target benchmark_metal_sac -j8`
+- `cmake --build build_metal --target benchmark_metal_gac -j8`
+- `python3 -m py_compile tests/python/metal_sac_ablation.py codex-docops-logic/scripts/dol.py`
+- v3.16 regression 单例：2 probes，CPU/Metal status verify 通过。
+- NSACQ 单例：2 probes，CPU/Metal status verify 通过。
+- `queens-4` NSACQ：24 probes，16 OK，8 DWO，0 UNKNOWN；8 values written
+  back；1 次 post-delete stable Metal GAC；CPU/Metal status verify 通过。
+- metal-smoke NSACQ：5/5 OK，178 probes，8 batches，10 DWO values written
+  back，0 rejected DWO。
+- BH NSACQ smoke：384 probes/run，3 measured runs，0 DWO，0 UNKNOWN，
+  `dispatch_per_probe=0.0182292`，CPU/Metal verify 通过。
+- TIER2 NSACQ：228/231 OK rows，3 个 ERROR 均为历史
+  `unsupported_non_binary_extension`；278,172 probes，0 UNKNOWN，
+  12,094 confirmed DWO writeback，4,970 rejected unconfirmed Metal DWO。
+
+**结果摘要**：
+- v3.17 已覆盖完整 benchmark-only NSACQ 回路：probe -> DWO writeback ->
+  post-delete GAC -> requeue。
+- 默认仍是 `sac_mode=batch_probe`；不影响 `benchmark_metal_gac`、GAC
+  `frontier_mode=auto`、v3.14 allowlist 或 CUDA。
+- TIER2 说明 CPU guard 是必要的：raw Metal DWO status 在部分实例上会比 CPU
+  reference 更激进，因此 v3.17 只能保持 report-only；若继续推进 SAC preprocess，
+  下一步应先做 deterministic/double-buffer probe，或把 CPU-confirmed DWO guard
+  纳入 promote gate。
+
+## 2026-05-04
+
+### Metal Batch/SAC v3.16：batch probe benchmark MVP
+
+**目标**：先做 Metal-first、default-off 的 Batch/SAC singleton probe
+benchmark，验证多 world probe 是否能摊薄 v3.15 观察到的 command buffer
+non-kernel 固定成本。
+
+**核心改动**：
+- 新增 `MetalSacProbeStatus { ok, dwo, unknown }`、
+  `MetalSacActivationMode { neighbor, full }`、
+  `MetalSacProbeTask`、`MetalSacBudget` 与 `MetalBatchProbeStats`。
+- 新增 `MetalBatchProbeRunner`：
+  - 输入 stable Metal GAC 的 AC snapshot；
+  - 从 snapshot remaining values 生成多 world singleton probes；
+  - 每个 world 独立 domain/frontier/status；
+  - `UNKNOWN` 仅表示预算超限，不产生删值。
+- 新增 Metal kernels：
+  - `sac_probe_init_kernel`
+  - `sac_probe_revise_kernel`
+  - `sac_probe_frontier_kernel`
+  - `sac_probe_mark_unknown_kernel`
+- 新增 benchmark app `benchmark_metal_sac`，CSV 与 Metal GAC 分离。
+- 新增批量脚本 `tests/python/metal_sac_ablation.py`。
+- 新增独立小计划/小 changelog：
+  - `docs/planning/metal_gac/CPIM_METAL_METAL_BATCH_SAC_V316_BATCH_PROBE_PLAN_2026_05_04.md`
+  - `docs/planning/metal_gac/CPIM_METAL_METAL_BATCH_SAC_V316_BATCH_PROBE_CHANGELOG_2026_05_04.md`
+
+**验证**：
+- `python3 -m py_compile tests/python/metal_sac_ablation.py codex-docops-logic/scripts/dol.py`
+- `cmake -S . -B build_metal`
+- `cmake --build build_metal --target benchmark_metal_sac -j8`
+- 单例 `gac_bitwords2.xml`：2 probes，CPU/Metal probe status verify 通过。
+- BH smoke：384 probes/run，3 measured runs，CPU/Metal verify 通过。
+- metal-smoke：15/15 OK rows。
+- TIER2：380/383 OK rows，3 个 ERROR 均为历史
+  `unsupported_non_binary_extension`；supported rows `verify_mismatches=0`，
+  `UNKNOWN=0`。
+
+**结果摘要**：
+- BH smoke：
+  - `dispatch_per_probe=0.0182292`
+  - `non_kernel_per_probe≈0.0037-0.0039ms`
+  - `probes_per_sec≈195k-202k`
+- metal-smoke 小例子：
+  - `avg_dispatch_per_probe=0.9536`
+  - `avg_non_kernel_per_probe=0.370296ms`
+- TIER2：
+  - total measured probes：163,605
+  - `dispatch_per_probe avg=0.0527 p50=0.0182 p95=0.1402`
+  - `non_kernel_per_probe avg=0.014634ms p50=0.005242ms p95=0.023366ms`
+  - `probes_per_sec avg≈144k p50≈146k p95≈255k`
+- 结论：TIER2 与 BH bucket 均显示 batch singleton probe 能明显摊薄 v3.15
+  观察到的 command-buffer fixed cost；v3.16 仍保持 benchmark-only。若继续推进，
+  下一步进入 v3.17 host-side NSACQ、queue budget 与 DWO writeback。
+
+### Metal GAC v3.15：dispatch timing split
+
+**目标**：拆开 Metal command buffer 的 encode / wait / kernel /
+non-kernel 时间，判断当前 GAC 性能瓶颈是 CPU encode 还是短 kernel 周围的
+dispatch/sync 固定成本。
+
+**核心改动**：
+- `MetalDispatchTimings` 新增 `encode_ms`。
+- `MetalGacStats` / benchmark CSV 新增：
+  - `dispatch_encode_ms`
+  - `dispatch_wait_ms`
+  - `dispatch_non_kernel_ms`
+- `metal_gac_ablation.py` 透传新字段。
+- `metal_gac_analyze.py` 在 mode summary 与新增 `[dispatch timing split]`
+  中显示 encode/wait/kernel/non-kernel 及 per-dispatch 成本。
+- v3.14 runtime policy summary 增加 eligible/report-only 决策行。
+- 新增独立小计划/小 changelog：
+  - `docs/planning/metal_gac/CPIM_METAL_METAL_GAC_V315_DISPATCH_TIMING_SPLIT_PLAN_2026_05_04.md`
+  - `docs/planning/metal_gac/CPIM_METAL_METAL_GAC_V315_DISPATCH_TIMING_SPLIT_CHANGELOG_2026_05_04.md`
+
+**验证**：
+- `python3 -m py_compile tests/python/metal_gac_ablation.py tests/python/metal_gac_analyze.py codex-docops-logic/scripts/dol.py`
+- `cmake --build build_metal --target benchmark_metal_gac -j8`
+- 单例 `gac_bitwords2.xml` CPU/Metal verify 通过。
+- TIER2 `out/metal_gac_v315_dispatch_timing_split_tier2.csv`：380/383 OK，
+  3 个 ERROR 均为历史 `unsupported_non_binary_extension`。
+
+**结果摘要**：
+- shared+flags baseline：`solve_ms p50=0.236 p95=5.403`。
+- dispatch split：`encode=0.013ms`、`wait=0.773ms`、
+  `kernel=0.105ms`、`non_kernel=0.668ms`。
+- per dispatch：`encode=0.0039ms`、`wait=0.2356ms`、
+  `kernel=0.0321ms`、`non_kernel=0.2035ms`。
+- `non_kernel_share=0.86`。
+- 结论：瓶颈不是 CPU encode，而是短 kernel 周围的 command buffer wait /
+  non-kernel 固定成本；下一步优先考虑 Batch/SAC 吞吐或能摊薄 dispatch 的方案。
+
+### Metal GAC v3.14：runtime bucket allowlist
+
+**目标**：把 v3.13 analyzer-only BH bucket recommendation 落成 default-off
+runtime policy，不改变 `frontier_mode=auto` 或稳定 fallback。
+
+**核心改动**：
+- benchmark 新增 `--policy_mode=none|bh_cta_allowlist`。
+- 命中 `BH-4-4 cons=128-511 dom<17 bitw<2` 时自动选择 CTA hybrid8：
+  `cta_worklist + word_parallel + directional + vebo_weighted +
+  bounded_replay + dirty_var_pull + local=16 + replay=8 + dirty_min=8`。
+- 未命中 allowlist 时保留用户请求路径。
+- CSV / ablation / analyzer 新增 policy 字段与 runtime policy summary：
+  `policy_mode`、`policy_selected`、`policy_reason`、`policy_bucket`。
+- 新增独立小计划/小 changelog：
+  - `docs/planning/metal_gac/CPIM_METAL_METAL_GAC_V314_RUNTIME_BUCKET_ALLOWLIST_PLAN_2026_05_04.md`
+  - `docs/planning/metal_gac/CPIM_METAL_METAL_GAC_V314_RUNTIME_BUCKET_ALLOWLIST_CHANGELOG_2026_05_04.md`
+
+**验证**：
+- `python3 -m py_compile tests/python/metal_gac_ablation.py tests/python/metal_gac_analyze.py codex-docops-logic/scripts/dol.py`
+- `cmake --build build_metal --target benchmark_metal_gac -j8`
+- 单例 BH / fallback 均 CPU/Metal verify 通过。
+- TIER2 `out/metal_gac_v314_runtime_bucket_allowlist_tier2.csv`：380/383 OK，
+  3 个 ERROR 均为历史 `unsupported_non_binary_extension`。
+
+**结果摘要**：
+- selected inputs：4/76。
+- selected rows：20。
+- selected-vs-shared+flags：`p50=0.62x p95=0.68x`。
+- better：4/4。
+- regressions over 1.05：0。
+- analyzer decision：`eligible`。
+- 结论：CTA hybrid8 可以作为 BH-like default-off runtime allowlist probe；
+  仍不进入全局 `auto`。
+
+### Metal GAC v3.13：bucket policy simulation
+
+**目标**：在 v3.12 显示 CTA dirty hybrid 只对少数 bucket 有强信号后，先做
+analyzer report-only policy simulation，不改变 runtime `auto`。
+
+**核心改动**：
+- `metal_gac_analyze.py --recommend-policy` 新增 `[bucket policy simulation]`。
+- 新增完整候选路径分组：
+  - non-CTA 区分 storage/frontier/kernel/bitsup/reset；
+  - CTA 额外区分 owner/queue/handoff/local/replay/dirty threshold。
+- 新增 `--bucket-min-instances`，默认 3。
+- 只有 bucket 内候选路径 `p95 <= 1.0x` 且 regression rows 为 0 时才进入
+  eligible；其它输入回退 fallback。
+- 新增独立小计划/小 changelog：
+  - `docs/planning/metal_gac/METAL_GAC_V313_BUCKET_POLICY_SIMULATION_PLAN_2026_05_04.md`
+  - `docs/planning/metal_gac/METAL_GAC_V313_BUCKET_POLICY_SIMULATION_CHANGELOG_2026_05_04.md`
+
+**验证**：
+- `python3 -m py_compile tests/python/metal_gac_analyze.py tests/python/metal_gac_ablation.py codex-docops-logic/scripts/dol.py`
+- `python3 tests/python/metal_gac_analyze.py out/metal_gac_v35_tier2_baseline.csv out/metal_gac_v35_tier2_frontier.csv out/metal_gac_v39_vebo_weighted_local16_tier2.csv out/metal_gac_v311_dirty_var_pull_tier2.csv out/metal_gac_v312_dirty_pull_hybrid8_tier2.csv --top=10 --recommend-policy --baseline-mode shared+flags --regression-threshold 1.05 --min-runs 3 --bucket-min-instances 3`
+
+**结果摘要**：
+- eligible bucket：1。
+- selected inputs：4/76。
+- policy：`p50=0.312ms p95=1.696ms`。
+- fallback：`p50=0.312ms p95=2.987ms`。
+- `regressions_gt_threshold=0`。
+- 唯一 eligible bucket 为 `BH-4-4` feature bucket，推荐 CTA hybrid8 path，
+  bucket 内 `p50=0.33x p95=0.34x`。
+- 结论：CTA 不适合全局默认，但适合少数 allowlist bucket；本轮只做
+  report-only simulation，不改 `auto`。
+
+### Metal GAC v3.12：`dirty_pull_hybrid`
+
+**目标**：在 v3.11 `dirty_var_pull` 小幅改善 CTA 但仍未过 gate 后，评估
+dirty pull 是否应只作用于高度变量，低度变量继续 direct push。
+
+**核心改动**：
+- 新增 `MetalGacOptions::cta_dirty_pull_min_degree`。
+- 新增 benchmark flag `--cta_dirty_pull_min_degree=<N>`；默认 0，完全复现 v3.11。
+- CTA kernel 在 `dirty_var_pull` 下按目标变量 subscription degree 决策：
+  - `degree >= N`：标记 dirty var；
+  - `degree < N`：回退 direct global push。
+- 新增 `dirty_pull_fallback_push_count`。
+- `metal_gac_ablation.py` 新增 `--cta-dirty-pull-min-degree`。
+- `metal_gac_analyze.py` 在 CTA gate 中按 dirty pull threshold 分组，并显示
+  fallback push。
+- 新增独立小计划/小 changelog：
+  - `docs/planning/metal_gac/METAL_GAC_V312_DIRTY_PULL_HYBRID_PLAN_2026_05_04.md`
+  - `docs/planning/metal_gac/METAL_GAC_V312_DIRTY_PULL_HYBRID_CHANGELOG_2026_05_04.md`
+
+**验证**：
+- `python3 -m py_compile tests/python/metal_gac_ablation.py tests/python/metal_gac_analyze.py codex-docops-logic/scripts/dol.py`
+- `cmake --build build_metal --target benchmark_metal_gac -j8`
+- `./build_metal/benchmark_metal_gac --input=tests/data/metal/gac_bitwords2.xml --runs=1 --warmup=0 --verify=true --runner_mode=prepared --frontier_mode=cta_worklist --kernel_variant=word_parallel --bitsup_layout=directional --cta_owner_mode=vebo_weighted --cta_queue_mode=bounded_replay --cta_local_round_budget=16 --cta_replay_round_budget=8 --cta_handoff_mode=dirty_var_pull --cta_dirty_pull_min_degree=16 --csv=out/metal_gac_v312_dirty_pull_hybrid16_single.csv`
+- `python3 tests/python/metal_gac_ablation.py --suite=metal-smoke --mode-preset=cta --runs=3 --warmup=1 --runner-mode=prepared --kernel-variant=word_parallel --bitsup-layout=directional --cta-owner-mode=vebo_weighted --cta-queue-mode=bounded_replay --cta-local-round-budget=16 --cta-replay-round-budget=8 --cta-handoff-mode=dirty_var_pull --cta-dirty-pull-min-degree=16 --cpu-timing --timeout=60 --csv=out/metal_gac_v312_dirty_pull_hybrid16_smoke.csv`
+- `python3 tests/python/metal_gac_ablation.py --tier=2 --mode-preset=cta --runs=5 --warmup=2 --runner-mode=prepared --kernel-variant=word_parallel --bitsup-layout=directional --cta-owner-mode=vebo_weighted --cta-queue-mode=bounded_replay --cta-local-round-budget=16 --cta-replay-round-budget=8 --cta-handoff-mode=dirty_var_pull --cta-dirty-pull-min-degree=8 --cpu-timing --timeout=300 --csv=out/metal_gac_v312_dirty_pull_hybrid8_tier2.csv --quiet`
+
+**结果摘要**：
+- hybrid16 single / smoke correctness 通过。
+- hybrid16 TIER2：380/383 OK，`solve_ms p50=0.576 p95=2.723`。
+- hybrid8 TIER2：380/383 OK，`solve_ms avg=0.837 p50=0.488 p95=2.192`。
+- 相对 v3.11 dirty-all：hybrid8 `p50 0.470 -> 0.488` 略慢，
+  `p95 3.202 -> 2.192` 明显改善。
+- 相对 v3.9 push：hybrid8 `p50 0.513 -> 0.488`，
+  `p95 3.357 -> 2.192`。
+- hybrid8 gate 仍未通过：`cta_vs_shared+flags p50=1.41x p95=3.21x`，
+  `decision=report_only`。
+- `BH-4-4` bucket 继续强信号：`p50_ratio=0.40 p95_ratio=0.43`，
+  `regressions_gt_threshold=0`。
+- 结论：hybrid 能压 CTA 尾部，但不解决全局 promote；保留 report-only，
+  后续只适合做 BH-like bucket policy 或转向 dispatch/Batch/SAC。
+
+### Metal GAC v3.11：`dirty_var_pull`
+
+**目标**：在 v3.10 `bulk_sync_mask` 因双 dispatch 成本未通过 gate 后，
+回到 CTA worklist，评估跨 owner push 是否可以由 dirty-var pull 替代。
+
+**核心改动**：
+- 新增 `MetalCtaHandoffMode { push_constraints, dirty_var_pull }`。
+- 新增 benchmark flag `--cta_handoff_mode=push_constraints|dirty_var_pull`；
+  默认 `push_constraints`，仅 CTA worklist 实验路径读取。
+- CTA kernel 在 `dirty_var_pull` 下对跨 owner subscription 标记 dirty var，
+  不直接写 global next active；same-owner subscription 仍进入 CTA local queue。
+- Host 在 CTA dispatch 后扫描 dirty vars 的 subscriptions，重建下一轮 frontier。
+- 新增 dirty stats：
+  - `dirty_var_count`
+  - `dirty_pull_scan_count`
+  - `dirty_pull_hit_count`
+  - `cross_push_avoided_count`
+- `metal_gac_ablation.py` 新增 `--cta-handoff-mode`。
+- `metal_gac_analyze.py` 在 mode summary / CTA gate 中纳入 handoff mode 与 dirty
+  stats。
+- 新增独立小计划/小 changelog：
+  - `docs/planning/metal_gac/METAL_GAC_V311_DIRTY_VAR_PULL_PLAN_2026_05_04.md`
+  - `docs/planning/metal_gac/METAL_GAC_V311_DIRTY_VAR_PULL_CHANGELOG_2026_05_04.md`
+
+**验证**：
+- `python3 -m py_compile tests/python/metal_gac_ablation.py tests/python/metal_gac_analyze.py codex-docops-logic/scripts/dol.py`
+- `cmake --build build_metal --target benchmark_metal_gac -j8`
+- `./build_metal/benchmark_metal_gac --input=tests/data/metal/gac_bitwords2.xml --runs=1 --warmup=0 --verify=true --runner_mode=prepared --frontier_mode=cta_worklist --kernel_variant=word_parallel --bitsup_layout=directional --cta_owner_mode=vebo_weighted --cta_queue_mode=bounded_replay --cta_local_round_budget=16 --cta_replay_round_budget=8 --cta_handoff_mode=dirty_var_pull --csv=out/metal_gac_v311_dirty_var_pull_single.csv`
+- `python3 tests/python/metal_gac_ablation.py --suite=metal-smoke --mode-preset=cta --runs=3 --warmup=1 --runner-mode=prepared --kernel-variant=word_parallel --bitsup-layout=directional --cta-owner-mode=vebo_weighted --cta-queue-mode=bounded_replay --cta-local-round-budget=16 --cta-replay-round-budget=8 --cta-handoff-mode=dirty_var_pull --cpu-timing --timeout=60 --csv=out/metal_gac_v311_dirty_var_pull_smoke.csv`
+- `python3 tests/python/metal_gac_ablation.py --tier=2 --mode-preset=cta --runs=5 --warmup=2 --runner-mode=prepared --kernel-variant=word_parallel --bitsup-layout=directional --cta-owner-mode=vebo_weighted --cta-queue-mode=bounded_replay --cta-local-round-budget=16 --cta-replay-round-budget=8 --cta-handoff-mode=dirty_var_pull --cpu-timing --timeout=300 --csv=out/metal_gac_v311_dirty_var_pull_tier2.csv --quiet`
+- `python3 tests/python/metal_gac_analyze.py out/metal_gac_v35_tier2_baseline.csv out/metal_gac_v35_tier2_frontier.csv out/metal_gac_v39_vebo_weighted_local16_tier2.csv out/metal_gac_v310_bulk_sync_mask_tier2.csv out/metal_gac_v311_dirty_var_pull_tier2.csv --top=10 --recommend-policy --baseline-mode shared+flags --regression-threshold 1.05 --min-runs 3`
+
+**结果摘要**：
+- single smoke：CPU verify 通过，`deletions=78`。
+- metal-smoke：15/15 OK，`avg_solve_ms=0.448`。
+- TIER2：380/383 OK，3 个 ERROR 均为历史 `unsupported_non_binary_extension`。
+- v3.11 absolute：`solve_ms p50=0.470 p95=3.202`。
+- 相对 v3.9 `vebo_weighted local=16 replay=8`：`p50 0.513 -> 0.470`，
+  `p95 3.357 -> 3.202`，45/76 个实例更快。
+- Combined gate：`cta_vs_shared+flags p50=1.31x p95=3.00x`，
+  `cta_vs_best_worklist p50=1.48x p95=2.98x`，
+  `host_round_ratio_vs_baseline p50=1.00x`，`decision=report_only`。
+- 结论：`dirty_var_pull` correctness 成立并小幅改善 CTA，但仍未通过 promote
+  gate；保持 default-off，`auto` 不读取。
+
+### Metal GAC v3.10：`bulk_sync_deletion_mask`
+
+**目标**：从 CTA owner 路线切到 default-off `bulk_sync_mask`，评估大例子 /
+传播重例子是否能从 bulk-synchronous deletion mask 受益。
+
+**核心改动**：
+- 新增 `frontier_mode=bulk_sync_mask`，默认仍为 `flags`，`auto` 不读取新路径。
+- 新增两阶段 Metal kernel：
+  - `gac_revise_bulk_mask_kernel` 只计算 `delete_masks[var][word]`；
+  - `gac_apply_bulk_mask_kernel` 统一 apply deletion mask，更新 domain 并生成下一轮
+    frontier。
+- 新增 bulk stats：
+  - `bulk_mask_proposed_deletion_count`
+  - `bulk_mask_actual_deletion_count`
+  - `bulk_mask_changed_word_count`
+  - `bulk_mask_frontier_push_count`
+  - `bulk_mask_rounds`
+- `metal_gac_ablation.py` 新增 `--mode-preset=bulk_sync`。
+- `metal_gac_analyze.py` 新增 `[bulk sync mask gate]`，并拆出 `large_any` /
+  `large_prop` gate。
+- Tensor-core-like 约束检查不进入 v3.10 主线；当前参考 CUDA 路线仍是 bitset、
+  warp/subwarp 与 shared packing，后续若要评估 packed8/tile 需另开 microbench。
+- 新增独立小计划/小 changelog：
+  - `docs/planning/metal_gac/METAL_GAC_V310_BULK_SYNC_MASK_PLAN_2026_05_04.md`
+  - `docs/planning/metal_gac/METAL_GAC_V310_BULK_SYNC_MASK_CHANGELOG_2026_05_04.md`
+
+**验证**：
+- `python3 -m py_compile tests/python/metal_gac_ablation.py tests/python/metal_gac_analyze.py codex-docops-logic/scripts/dol.py`
+- `cmake --build build_metal --target benchmark_metal_gac -j8`
+- `./build_metal/benchmark_metal_gac --input=tests/data/metal/gac_bitwords2.xml --runs=1 --warmup=0 --verify=true --runner_mode=prepared --frontier_mode=bulk_sync_mask --kernel_variant=word_parallel --bitsup_layout=directional --csv=out/metal_gac_v310_bulk_sync_mask_single.csv`
+- `python3 tests/python/metal_gac_ablation.py --suite=metal-smoke --mode-preset=bulk_sync --runs=3 --warmup=1 --runner-mode=prepared --kernel-variant=word_parallel --bitsup-layout=directional --cpu-timing --timeout=60 --csv=out/metal_gac_v310_bulk_sync_mask_smoke.csv`
+- `python3 tests/python/metal_gac_ablation.py --tier=2 --mode-preset=bulk_sync --runs=5 --warmup=2 --runner-mode=prepared --kernel-variant=word_parallel --bitsup-layout=directional --cpu-timing --timeout=300 --csv=out/metal_gac_v310_bulk_sync_mask_tier2.csv --quiet`
+- `python3 tests/python/metal_gac_analyze.py out/metal_gac_v35_tier2_baseline.csv out/metal_gac_v35_tier2_frontier.csv out/metal_gac_v39_vebo_weighted_local16_tier2.csv out/metal_gac_v310_bulk_sync_mask_tier2.csv --top=10 --recommend-policy --baseline-mode shared+flags --regression-threshold 1.05 --min-runs 3`
+
+**结果摘要**：
+- single smoke：CPU verify 通过；`deletions=78`，
+  `bulk_mask_proposed_deletion_count=78`，
+  `bulk_mask_actual_deletion_count=78`。
+- metal-smoke：15/15 OK，`avg_solve_ms=0.694`。
+- TIER2：380/383 OK，3 个 ERROR 均为历史 `unsupported_non_binary_extension`。
+- TIER2 absolute：`solve_ms p50=0.712 p95=10.474`。
+- Combined gate：
+  - `bulk_vs_shared+flags p50=1.86x p95=3.17x`；
+  - `large_any p50=1.87x p95=2.98x`；
+  - `large_prop p50=1.94x p95=2.76x`；
+  - `dispatch_ratio_vs_baseline p50=2.00x p95=2.04x`；
+  - `actual_deletion_mismatch_rows=0`。
+- 结论：correctness 成立，但 bulk path 因 revise/apply 双 dispatch 成本未通过
+  全局或大例子 promote gate，继续保持 report-only，不进入 `auto`。
+
+### Metal GAC v3.9：`vebo_weighted_owner`
+
+**目标**：在 v3.8 确认 seed/overflow/budget 协议不是主因后，进入
+`vebo_weighted_owner`，评估 weighted owner load 是否能改善 CTA worklist p95。
+
+**核心改动**：
+- 新增 `--cta_owner_mode=vebo_weighted`，默认仍为 `modulo`。
+- Host owner map 新增 `BuildVeboWeightedOwnerMap()`：
+  - variable degree 降序生成 VEBO 风格遍历顺序；
+  - constraint weight 使用 `bit_words * (degree(x) + degree(y))`；
+  - soft count/weight 内优先保留邻接 locality，再按 owner weighted load、
+    owner count、owner id 兜底。
+- 新增 `owner_weight_balance_p95`，用于观察 weighted owner load skew。
+- `metal_gac_ablation.py` / `metal_gac_analyze.py` 支持
+  `cta_owner_mode=vebo_weighted` 与新 owner weight balance 字段。
+- 新增独立小计划/小 changelog：
+  - `docs/planning/metal_gac/METAL_GAC_V39_VEBO_WEIGHTED_OWNER_PLAN_2026_05_04.md`
+  - `docs/planning/metal_gac/METAL_GAC_V39_VEBO_WEIGHTED_OWNER_CHANGELOG_2026_05_04.md`
+
+**验证**：
+- `python3 -m py_compile tests/python/metal_gac_ablation.py tests/python/metal_gac_analyze.py codex-docops-logic/scripts/dol.py`
+- `cmake --build build_metal --target benchmark_metal_gac -j8`
+- `./build_metal/benchmark_metal_gac --input=tests/data/metal/gac_bitwords2.xml --runs=1 --warmup=0 --verify=true --runner_mode=prepared --frontier_mode=cta_worklist --kernel_variant=word_parallel --bitsup_layout=directional --cta_owner_mode=vebo_weighted --cta_queue_mode=bounded_replay --cta_local_round_budget=8 --cta_replay_round_budget=8 --csv=out/metal_gac_v39_vebo_weighted_single.csv`
+- `python3 tests/python/metal_gac_ablation.py --suite=metal-smoke --mode-preset=cta --runs=3 --warmup=1 --runner-mode=prepared --kernel-variant=word_parallel --bitsup-layout=directional --cta-owner-mode=vebo_weighted --cta-queue-mode=bounded_replay --cta-local-round-budget=8 --cta-replay-round-budget=8 --cpu-timing --timeout=60 --csv=out/metal_gac_v39_vebo_weighted_smoke.csv`
+- `python3 tests/python/metal_gac_ablation.py --tier=2 --mode-preset=cta --runs=5 --warmup=2 --runner-mode=prepared --kernel-variant=word_parallel --bitsup-layout=directional --cta-owner-mode=vebo_weighted --cta-queue-mode=bounded_replay --cta-local-round-budget=8 --cta-replay-round-budget=8 --cpu-timing --timeout=300 --csv=out/metal_gac_v39_vebo_weighted_tier2.csv --quiet`
+- `python3 tests/python/metal_gac_ablation.py --tier=2 --mode-preset=cta --runs=5 --warmup=2 --runner-mode=prepared --kernel-variant=word_parallel --bitsup-layout=directional --cta-owner-mode=vebo_weighted --cta-queue-mode=bounded_replay --cta-local-round-budget=16 --cta-replay-round-budget=8 --cpu-timing --timeout=300 --csv=out/metal_gac_v39_vebo_weighted_local16_tier2.csv --quiet`
+- `python3 tests/python/metal_gac_analyze.py out/metal_gac_v35_tier2_baseline.csv out/metal_gac_v35_tier2_frontier.csv out/metal_gac_v38_bounded_replay_tier2.csv out/metal_gac_v39_vebo_weighted_tier2.csv out/metal_gac_v39_vebo_weighted_local16_tier2.csv --top=10 --recommend-policy --baseline-mode shared+flags --regression-threshold 1.05 --min-runs 3`
+
+**结果摘要**：
+- single smoke：CPU verify 通过。
+- metal-smoke：15/15 OK。
+- TIER2：380/383 OK，3 个 ERROR 均为历史 `unsupported_non_binary_extension`。
+- `vebo_weighted local=16 replay=8`：
+  - `solve_ms p50=0.513 p95=3.325`；
+  - `cta_vs_shared+flags p50=1.41x p95=3.14x`；
+  - `cta_vs_best_worklist p50=1.40x p95=3.13x`；
+  - `owner_balance_p95_avg=1.28`；
+  - `owner_weight_balance_p95_avg=1.22`；
+  - `budget_spill_p95=0`；
+  - `host_round_ratio_vs_baseline p50=1.00x`；
+  - `decision=report_only`。
+- 结论：`vebo_weighted_owner` 比 v3.8 owner map 更有信号，但仍未通过 auto
+  promote gate。若继续 CTA，应转向 owner locality/cross-push hybrid 调优。
+
 ## 2026-05-03
+
+### Metal GAC v3.8：local budget / bounded replay 评估
+
+**目标**：在进入 `vebo_weighted_owner` 前，先确认 v3.7 的
+`cta_budget_spill_count` 是否能通过增加 local budget 或 bounded replay 解决。
+
+**核心改动**：
+- 新增 `--cta_queue_mode=bounded_replay`，默认仍为 `local_only`。
+- 新增 `--cta_local_round_budget`，默认 8。
+- 新增 `--cta_replay_round_budget`，默认 8，仅 `bounded_replay` 生效。
+- 新增 replay stats：
+  - `cta_budget_replay_rounds`
+  - `cta_budget_replay_drain_count`
+  - `cta_budget_replay_spill_count`
+- analyzer 按 owner、queue mode、local budget、replay budget 拆分 CTA gate。
+- 新增独立小计划/小 changelog：
+  - `docs/planning/metal_gac/METAL_GAC_V38_BUDGET_REPLAY_PLAN_2026_05_03.md`
+  - `docs/planning/metal_gac/METAL_GAC_V38_BUDGET_REPLAY_CHANGELOG_2026_05_03.md`
+
+**验证**：
+- `python3 -m py_compile tests/python/metal_gac_ablation.py tests/python/metal_gac_analyze.py codex-docops-logic/scripts/dol.py`
+- `cmake --build build_metal --target benchmark_metal_gac -j8`
+- `./build_metal/benchmark_metal_gac --input=tests/data/metal/gac_bitwords2.xml --runs=1 --warmup=0 --verify=true --runner_mode=prepared --frontier_mode=cta_worklist --kernel_variant=word_parallel --bitsup_layout=directional --cta_owner_mode=static_edge_cut --cta_queue_mode=bounded_replay --cta_local_round_budget=8 --cta_replay_round_budget=8 --csv=out/metal_gac_v38_bounded_replay_single.csv`
+- `python3 tests/python/metal_gac_ablation.py --suite=metal-smoke --mode-preset=cta --runs=3 --warmup=1 --runner-mode=prepared --kernel-variant=word_parallel --bitsup-layout=directional --cta-owner-mode=static_edge_cut --cta-queue-mode=bounded_replay --cta-local-round-budget=8 --cta-replay-round-budget=8 --cpu-timing --timeout=60 --csv=out/metal_gac_v38_bounded_replay_smoke.csv`
+- `python3 tests/python/metal_gac_ablation.py --tier=2 --mode-preset=cta --runs=5 --warmup=2 --runner-mode=prepared --kernel-variant=word_parallel --bitsup-layout=directional --cta-owner-mode=static_edge_cut --cta-queue-mode=bounded_replay --cta-local-round-budget=8 --cta-replay-round-budget=8 --cpu-timing --timeout=300 --csv=out/metal_gac_v38_bounded_replay_tier2.csv --quiet`
+- `python3 tests/python/metal_gac_ablation.py --tier=2 --mode-preset=cta --runs=5 --warmup=2 --runner-mode=prepared --kernel-variant=word_parallel --bitsup-layout=directional --cta-owner-mode=static_edge_cut --cta-queue-mode=spill_replay --cta-local-round-budget=16 --cta-replay-round-budget=0 --cpu-timing --timeout=300 --csv=out/metal_gac_v38_local_budget16_tier2.csv --quiet`
+- `python3 tests/python/metal_gac_analyze.py out/metal_gac_v35_tier2_baseline.csv out/metal_gac_v35_tier2_frontier.csv out/metal_gac_v36_owner_map_static_tier2.csv out/metal_gac_v37_seed_overflow_tier2.csv out/metal_gac_v38_bounded_replay_tier2.csv out/metal_gac_v38_local_budget16_tier2.csv --top=10 --recommend-policy --baseline-mode shared+flags --regression-threshold 1.05 --min-runs 3`
+
+**结果摘要**：
+- single smoke：CPU verify 通过。
+- metal-smoke：15/15 OK。
+- `bounded_replay local=8 replay=8` TIER2：380/383 OK；
+  `budget_spill_p95=0`，`replay_drain_p95=1`，
+  `cta_vs_shared+flags p50=1.36x p95=3.49x`，
+  `host_round_ratio_vs_baseline p50=1.00x`，`decision=report_only`。
+- `spill_replay local=16` TIER2：380/383 OK；
+  `budget_spill_p95=0`，
+  `cta_vs_shared+flags p50=1.39x p95=3.57x`，
+  `host_round_ratio_vs_baseline p50=1.00x`，`decision=report_only`。
+- 结论：local budget / bounded replay 能消除 budget spill，但不能降低 host round
+  或解除 p95 regression。下一步应转向 `vebo_weighted_owner`。
+
+### Metal GAC v3.7：Seed/Overflow 拆分与 spill replay
+
+**目标**：在进入 `vebo_weighted_owner` 前，先判断 v3.6 `owner_map_static`
+失败是否主要来自 CTA queue/seed/overflow 协议。
+
+**核心改动**：
+- 新增 `--cta_queue_mode=local_only|spill_replay`，默认 `local_only`。
+- 拆分 CTA overflow stats：
+  - `cta_queue_overflow_count`
+  - `cta_budget_spill_count`
+  - `cta_seed_overflow_count`
+  - `cta_overflow_count` 继续作为兼容总数。
+- 新增 seed owner 统计：
+  - `seed_owner_nonempty_count`
+  - `seed_empty_owner_count`
+  - `seed_max_owner_load`
+  - `seed_owner_balance_p95`
+- analyzer 按 `owner_mode + queue_mode` 拆分 CTA gate；新 CSV 优先使用
+  queue/seed overflow 判断 gate，旧 CSV 回退到 `cta_overflow_count`。
+- 新增独立小计划/小 changelog：
+  - `docs/planning/metal_gac/METAL_GAC_V37_SEED_OVERFLOW_PLAN_2026_05_03.md`
+  - `docs/planning/metal_gac/METAL_GAC_V37_SEED_OVERFLOW_CHANGELOG_2026_05_03.md`
+
+**验证**：
+- `python3 -m py_compile tests/python/metal_gac_ablation.py tests/python/metal_gac_analyze.py codex-docops-logic/scripts/dol.py`
+- `cmake --build build_metal --target benchmark_metal_gac -j8`
+- `./build_metal/benchmark_metal_gac --input=tests/data/metal/gac_bitwords2.xml --runs=1 --warmup=0 --verify=true --runner_mode=prepared --frontier_mode=cta_worklist --kernel_variant=word_parallel --bitsup_layout=directional --cta_owner_mode=static_edge_cut --cta_queue_mode=spill_replay --csv=out/metal_gac_v37_seed_overflow_single.csv`
+- `python3 tests/python/metal_gac_ablation.py --suite=metal-smoke --mode-preset=cta --runs=3 --warmup=1 --runner-mode=prepared --kernel-variant=word_parallel --bitsup-layout=directional --cta-owner-mode=static_edge_cut --cta-queue-mode=spill_replay --cpu-timing --timeout=60 --csv=out/metal_gac_v37_seed_overflow_smoke.csv`
+- `python3 tests/python/metal_gac_ablation.py --tier=2 --mode-preset=cta --runs=5 --warmup=2 --runner-mode=prepared --kernel-variant=word_parallel --bitsup-layout=directional --cta-owner-mode=static_edge_cut --cta-queue-mode=spill_replay --cpu-timing --timeout=300 --csv=out/metal_gac_v37_seed_overflow_tier2.csv --quiet`
+- `python3 tests/python/metal_gac_analyze.py out/metal_gac_v35_tier2_baseline.csv out/metal_gac_v35_tier2_frontier.csv out/metal_gac_v36_owner_map_static_tier2.csv out/metal_gac_v37_seed_overflow_tier2.csv --top=10 --recommend-policy --baseline-mode shared+flags --regression-threshold 1.05 --min-runs 3`
+
+**结果摘要**：
+- metal-smoke：15/15 OK。
+- TIER2：380/383 OK，3 个 ERROR 均为历史 `unsupported_non_binary_extension`。
+- `spill_replay`：`solve_ms p50=0.478 p95=3.853`，
+  `metal_cpu_solve_ratio p50=60.02x p95=403.55x`。
+- Combined gate：`queue_overflow_p95=0`，`seed_overflow_p95=0`，
+  `budget_spill_p95=1`，`host_round_ratio_vs_baseline p50=1.00x`，
+  `decision=report_only`。
+- 结论：seed/queue 真 overflow 不是主因；剩余问题集中在 local budget spill
+  和 host round 未下降。下一步优先做 local budget / bounded replay，再视结果
+  决定是否进入 `vebo_weighted_owner`。
+
+### Metal GAC v3.6：`owner_map_static` 实验路径
+
+**目标**：实现 `primal_edge_cut_owner` 的最小落地形态，用显式
+`--cta_owner_mode=static_edge_cut` 替换 CTA worklist 内部的
+`cid % cta_count` owner 策略，不改变默认 fallback 和 `auto`。
+
+**核心改动**：
+- `MetalGacOptions` / `benchmark_metal_gac` 新增 `cta_owner_mode`：
+  `modulo|static_edge_cut`，默认保持 `modulo`。
+- Host 侧为 CTA worklist 构建 `owner_of_constraint[cid]` buffer：
+  - `modulo` 保持旧策略；
+  - `static_edge_cut` 基于 constraint subscription adjacency 做轻量 greedy
+    owner 分配，优先已分配邻居数，其次 owner load，最后 owner id。
+- `gac_revise_cta_worklist_kernel` 和 CPU seed 阶段统一读取 owner map。
+- CSV/analyzer 新增：
+  - `cta_owner_mode`
+  - `owner_map_build_ms`
+  - `owner_balance_p95`
+  - `owner_local_push_count`
+  - `owner_cross_push_count`
+- `metal_gac_ablation.py --cta-owner-mode` 负责转发实验开关；
+  `metal_gac_analyze.py` 在 mode summary 和 CTA gate 中区分 owner mode。
+
+**验证**：
+- `python3 -m py_compile tests/python/metal_gac_ablation.py tests/python/metal_gac_analyze.py codex-docops-logic/scripts/dol.py`
+- `cmake --build build_metal --target benchmark_metal_gac -j8`
+- `./build_metal/benchmark_metal_gac --input=tests/data/metal/gac_bitwords2.xml --runs=1 --warmup=0 --verify=true --runner_mode=prepared --frontier_mode=cta_worklist --kernel_variant=word_parallel --bitsup_layout=directional --cta_owner_mode=static_edge_cut --csv=out/metal_gac_v36_owner_map_static_single.csv`
+- `python3 tests/python/metal_gac_ablation.py --suite=metal-smoke --mode-preset=cta --runs=3 --warmup=1 --runner-mode=prepared --kernel-variant=word_parallel --bitsup-layout=directional --cta-owner-mode=static_edge_cut --cpu-timing --timeout=60 --csv=out/metal_gac_v36_owner_map_static_smoke.csv`
+- `python3 tests/python/metal_gac_analyze.py out/metal_gac_v36_owner_map_static_smoke.csv --top=5 --recommend-policy --baseline-mode shared+flags --regression-threshold 1.05 --min-runs 3`
+- `python3 tests/python/metal_gac_ablation.py --tier=2 --mode-preset=cta --runs=5 --warmup=2 --runner-mode=prepared --kernel-variant=word_parallel --bitsup-layout=directional --cta-owner-mode=static_edge_cut --cpu-timing --timeout=300 --csv=out/metal_gac_v36_owner_map_static_tier2.csv --quiet`
+- `python3 tests/python/metal_gac_analyze.py out/metal_gac_v35_tier2_baseline.csv out/metal_gac_v35_tier2_frontier.csv out/metal_gac_v36_owner_map_static_tier2.csv --top=10 --recommend-policy --baseline-mode shared+flags --regression-threshold 1.05 --min-runs 3`
+
+**结果摘要**：
+- 单例 `gac_bitwords2.xml` CPU verify 通过，`host_round_count=1`，
+  `owner_balance_p95=1.000`，`owner_cross_push_count=0`。
+- metal-smoke `static_edge_cut`：15/15 OK，analyzer 能按
+  `owner=static_edge_cut` 独立汇总。
+- TIER2 `static_edge_cut`：380/383 OK，3 个 ERROR 均为历史
+  `unsupported_non_binary_extension`；`solve_ms p50=0.797 p95=3.503`。
+- Combined CTA gate：`cta_vs_shared+flags p50=1.83x p95=4.51x`，
+  `host_round_ratio_vs_baseline p50=1.00x`，`cta_overflow_count p95=1`，
+  `decision=report_only`。
+- 结论：`owner_map_static` 不通过 v3.6 promote gate；下一条应转向
+  `vebo_weighted_owner` 或重新设计 overflow/seed。
+- `cta_worklist` 仍是 report-only；`frontier_mode=auto` 不变。
+
+### Metal GAC v3.6：CTA owner partition 分叉探索备忘
+
+**目标**：承接 v3.5 `cta_worklist` TIER2 gate 未通过后的 owner partition
+重设计，把后续值得探索的分支、判退门槛、证据文件和回滚锚点写入独立文档。
+
+**核心改动**：
+- 新增独立小计划/小 changelog：
+  - `docs/planning/metal_gac/METAL_GAC_V36_CTA_OWNER_PARTITION_EXPLORATION_PLAN_2026_05_03.md`
+  - `docs/planning/metal_gac/METAL_GAC_V36_CTA_OWNER_PARTITION_EXPLORATION_CHANGELOG_2026_05_03.md`
+- 记录 6 条后续分支：
+  - `owner_map_static`
+  - `owner_bucketed_seed`
+  - `dirty_var_pull`
+  - `hub_replication`
+  - `hierarchical_steal`
+  - `indirect_multiround`
+- 将更有希望的方向提升为 3 条优先主线：
+  - `primal_edge_cut_owner`：CSP primal graph / edge-cut owner partition；
+  - `vebo_weighted_owner`：VEBO-style weighted ordering，平衡 constraint work 与
+    touched variables；
+  - `bulk_sync_deletion_mask`：CTA 先产出 deletion masks，再 bulk-synchronous
+    merge/apply。
+- 每条分支都必须记录 hypothesis、实现草图、stats、smoke/TIER2 命令、
+  promote gate、reject gate 与 evidence CSV。
+- 更新 `METAL_GAC_CHANGELOG.md`、`METAL_GAC_LONG_TERM_OPTIMIZATION.md` 与
+  `METAL_MIGRATION_PLAN.md` 的导航。
+
+**验证**：
+- `python3 -m py_compile codex-docops-logic/scripts/dol.py`
+- `git diff --check`
+- `python3 codex-docops-logic/scripts/dol.py lint --soft`
+
+**结果摘要**：
+- 本轮 docs-only，不修改 Metal solver，不改变 `frontier_mode=auto` 或默认
+  fallback。
+- v3.6 结论锚定 v3.5：`cta_vs_shared+flags p95=2.99x` 且
+  `host_round_ratio_vs_baseline p50=1.00x p95=1.00x`，因此不能继续把
+  `cid % cta_count` 当作默认 owner 策略。
+- 下一步实现顺序建议：先 `primal_edge_cut_owner`，再
+  `vebo_weighted_owner`，最后视 atomic/cross-push evidence 决定是否推进
+  `bulk_sync_deletion_mask`。
+
+### Metal GAC v3.5：CTA evidence / auto gate
+
+**目标**：正式评估 `cta_worklist` 是否值得进入 recommender，甚至后续成为
+`auto` 候选；本轮不改变默认 Metal fallback。
+
+**核心改动**：
+- 新增独立小计划/小 changelog：
+  - `docs/planning/metal_gac/METAL_GAC_V35_CTA_EVIDENCE_PLAN_2026_05_03.md`
+  - `docs/planning/metal_gac/METAL_GAC_V35_CTA_EVIDENCE_CHANGELOG_2026_05_03.md`
+- `metal_gac_analyze.py` 新增 `[cta worklist gate]`：
+  - `cta_worklist` 相对 `shared+flags` 的 p50/p95/p99 ratio；
+  - `cta_worklist` 相对旧 `worklist` 的 p50/p95 ratio；
+  - `host_round_count` 是否低于 baseline；
+  - `cta_overflow_count`、`cta_cross_push_count`、`cta_queue_push_count`；
+  - `metal_cpu_solve_ratio` 是否优于 baseline。
+- 更新 `METAL_GAC_CHANGELOG.md`、`METAL_GAC_LONG_TERM_OPTIMIZATION.md` 与
+  `METAL_MIGRATION_PLAN.md`。
+
+**验证**：
+- `python3 -m py_compile tests/python/metal_gac_ablation.py tests/python/metal_gac_analyze.py codex-docops-logic/scripts/dol.py`
+- `cmake --build build_metal --target benchmark_metal_gac compare_cpu_metal -j`
+- `ctest --test-dir build_metal -R compare_cpu_metal --output-on-failure`
+- `ctest --test-dir build_metal -R benchmark_metal_gac --output-on-failure`
+- `python3 tests/python/metal_gac_ablation.py --suite=metal-smoke --mode-preset=cta --runs=3 --warmup=1 --runner-mode=prepared --kernel-variant=word_parallel --bitsup-layout=directional --cpu-timing --timeout=60 --csv=out/metal_gac_v35_smoke_cta.csv`
+- `python3 tests/python/metal_gac_ablation.py --tier=2 --mode-preset=baseline --runs=5 --warmup=2 --runner-mode=prepared --cpu-timing --timeout=300 --csv=out/metal_gac_v35_tier2_baseline.csv --quiet`
+- `python3 tests/python/metal_gac_ablation.py --tier=2 --mode-preset=frontier --runs=5 --warmup=2 --runner-mode=prepared --kernel-variant=word_parallel --bitsup-layout=directional --cpu-timing --timeout=300 --csv=out/metal_gac_v35_tier2_frontier.csv --quiet`
+- `python3 tests/python/metal_gac_ablation.py --tier=2 --mode-preset=cta --runs=5 --warmup=2 --runner-mode=prepared --kernel-variant=word_parallel --bitsup-layout=directional --cpu-timing --timeout=300 --csv=out/metal_gac_v35_tier2_cta.csv --quiet`
+- `python3 tests/python/metal_gac_analyze.py out/metal_gac_v35_tier2_baseline.csv out/metal_gac_v35_tier2_frontier.csv out/metal_gac_v35_tier2_cta.csv --top=10 --recommend-policy --baseline-mode shared+flags --regression-threshold 1.05 --min-runs 3`
+- `git diff --check`
+- `python3 codex-docops-logic/scripts/dol.py lint --soft`
+
+**结果摘要**：
+- metal-smoke CTA：15/15 OK，Metal faster `0/15`。
+- TIER2 baseline：380/383 rows OK，`shared+flags solve_ms p50=0.253 p95=5.109`。
+- TIER2 worklist：`shared+worklist solve_ms p50=0.328 p95=5.351`。
+- TIER2 CTA：380/383 rows OK，`cta_worklist solve_ms p50=0.453 p95=5.356`。
+- `[cta worklist gate]`：
+  - `cta_vs_shared+flags p50=1.27x p95=2.99x p99=4.04x`；
+  - `cta_vs_best_worklist p50=1.37x p95=2.99x`；
+  - `host_round_ratio_vs_baseline p50=1.00x p95=1.00x`；
+  - `cta_overflow_count p95=0 max=0`；
+  - `decision=report_only`。
+- 结论：`cta_worklist` 不进入 `auto`，下一步应转向 Batch/SAC 多任务吞吐或
+  owner partition 重设计，不进入 simdgroup。
+
+### Metal GAC v3.3-v3.4：CTA-local persistent worklist 实验路径
+
+**目标**：针对 CPU vs Metal evidence 暴露的 dispatch/round 往返瓶颈，实现
+`cta_worklist` 实验路径；v3.3 simdgroup gate 继续保持关闭。
+
+**核心改动**：
+- `MetalFrontierMode` / `benchmark_metal_gac --frontier_mode` 新增
+  `cta_worklist`。
+- 新增 `gac_revise_cta_worklist_kernel`：
+  - 每个 CTA/threadgroup 使用独立 queue A/B；
+  - CTA-local stamp 去重；
+  - 单 dispatch 内最多 8 轮 local worklist；
+  - 跨 CTA 传播写 global next active list，由 host outer loop 重新播种。
+- `MetalGacStats`、benchmark CSV、ablation CSV 与 analyzer 新增：
+  - `cta_local_rounds`
+  - `cta_queue_push_count`
+  - `cta_cross_push_count`
+  - `cta_overflow_count`
+  - `host_round_count`
+- `metal_gac_ablation.py --mode-preset=cta` 新增 CTA 实验扫描入口。
+- 新增独立小计划/小 changelog：
+  - `docs/planning/metal_gac/CPIM_METAL_METAL_GAC_V3_CTA_WORKLIST_PLAN_2026_05_03.md`
+  - `docs/planning/metal_gac/CPIM_METAL_METAL_GAC_V3_CTA_WORKLIST_CHANGELOG_2026_05_03.md`
+- 不让多个 CTA 直接竞争同一个全局 c queue；默认 fallback 与 `auto` policy
+  不变。
+- 更新 `METAL_GAC_CHANGELOG.md`、`METAL_GAC_LONG_TERM_OPTIMIZATION.md` 与
+  `METAL_MIGRATION_PLAN.md` 的下一步链接和状态摘要。
+
+**验证**：
+- `python3 -m py_compile tests/python/metal_gac_ablation.py tests/python/metal_gac_analyze.py codex-docops-logic/scripts/dol.py`
+- `cmake --build build_metal --target benchmark_metal_gac compare_cpu_metal -j`
+- `ctest --test-dir build_metal -R compare_cpu_metal --output-on-failure`
+- `ctest --test-dir build_metal -R benchmark_metal_gac --output-on-failure`
+- `./build_metal/benchmark_metal_gac --input=tests/data/metal/gac_bitwords2.xml --runs=3 --warmup=1 --verify=true --runner_mode=prepared --frontier_mode=cta_worklist --kernel_variant=word_parallel --bitsup_layout=directional --csv=out/metal_gac_v34_cta_worklist_smoke.csv`
+- `python3 tests/python/metal_gac_ablation.py --suite=metal-smoke --mode-preset=cta --runs=2 --warmup=1 --runner-mode=prepared --kernel-variant=word_parallel --bitsup-layout=directional --timeout=60 --csv=out/metal_gac_v34_cta_smoke.csv`
+- `python3 tests/python/metal_gac_analyze.py out/metal_gac_v34_cta_smoke.csv --top=5 --recommend-policy --baseline-mode shared+flags --regression-threshold 1.05 --min-runs=2`
+- `git diff --check`
+- `python3 codex-docops-logic/scripts/dol.py lint --soft`
+
+**结果摘要**：
+- `compare_cpu_metal`：5/5 passed。
+- `benchmark_metal_gac`：1/1 passed。
+- `gac_bitwords2.xml` CTA smoke：CPU verify 通过，`host_round_count=1`，
+  `cta_local_rounds=2`，`cta_queue_push_count=1`，`cta_overflow_count=0`。
+- `metal-smoke --mode-preset=cta`：10/10 OK，5 个实例全部 CPU verify 通过。
+
+### Metal GAC v3：CPU vs Metal 正式对照
+
+**目标**：把 CPU GAC 求解时间纳入 Metal benchmark/CSV/analyzer，正式回答
+“Metal 和 CPU 哪个快”。
+
+**核心改动**：
+- `benchmark_metal_gac` 新增：
+  - `--cpu_timing`
+  - `--cpu_warmup`
+  - `--cpu_runs`
+- benchmark CSV 与 ablation CSV 新增：
+  - `cpu_timing_enabled`
+  - `cpu_solve_ms`
+  - `cpu_iterations`
+  - `cpu_deletions`
+  - `cpu_inconsistent`
+  - `metal_cpu_solve_ratio`
+  - `metal_faster_than_cpu`
+- `metal_gac_analyze.py` 新增 `[metal vs cpu]` section，明确
+  `metal_cpu_solve_ratio < 1.0` 表示 Metal 更快。
+- 新增独立小计划/小 changelog：
+  - `docs/planning/metal_gac/METAL_GAC_V3_CPU_METAL_COMPARISON_PLAN_2026_05_03.md`
+  - `docs/planning/metal_gac/METAL_GAC_V3_CPU_METAL_COMPARISON_CHANGELOG_2026_05_03.md`
+
+**验证**：
+- `python3 -m py_compile tests/python/metal_gac_ablation.py tests/python/metal_gac_analyze.py codex-docops-logic/scripts/dol.py`
+- `cmake --build build_metal --target benchmark_metal_gac compare_cpu_metal -j`
+- `ctest --test-dir build_metal -R compare_cpu_metal --output-on-failure`
+- `ctest --test-dir build_metal -R benchmark_metal_gac --output-on-failure`
+- `./build_metal/benchmark_metal_gac --input=tests/data/metal/gac_bitwords2.xml --runs=3 --warmup=1 --verify=true --cpu_timing=true --runner_mode=prepared --frontier_mode=flags --kernel_variant=scalar --bitsup_layout=pair --csv=out/metal_gac_v3_cpu_metal_smoke.csv`
+- `python3 tests/python/metal_gac_ablation.py --suite=metal-smoke --mode-preset=auto --runs=5 --warmup=2 --runner-mode=prepared --cpu-timing --timeout=60 --csv=out/metal_gac_v3_cpu_metal_smoke_auto.csv`
+- `python3 tests/python/metal_gac_ablation.py --tier=2 --mode-preset=auto --runs=5 --warmup=2 --runner-mode=prepared --cpu-timing --timeout=300 --csv=out/metal_gac_v3_cpu_metal_tier2_auto.csv --quiet`
+- `python3 tests/python/metal_gac_analyze.py out/metal_gac_v3_cpu_metal_smoke_auto.csv out/metal_gac_v3_cpu_metal_tier2_auto.csv --top=10 --recommend-policy --baseline-mode shared+flags --regression-threshold 1.05 --min-runs 3`
+
+**结果摘要**：
+- metal-smoke auto：25/25 OK，Metal faster `0/25`。
+- TIER2 auto：380/383 rows OK，3 个 ERROR 均为
+  `unsupported_non_binary_extension`。
+- TIER2 auto：Metal solve `p50=0.439ms p95=5.050ms`，CPU solve
+  `p50=0.008438ms p95=0.071971ms`。
+- Metal/CPU ratio：`p50=33.65x p95=427.90x`，Metal faster `0/380`。
+- 结论：当前 GAC-only Metal 不比 CPU 快；后续 Metal 性能线应优先减少
+  dispatch 往返，或转向更适合 GPU 批量化的 SAC/Batch 工作负载。
+
+### Metal GAC v3：evidence recommender 与 simdgroup gate
+
+**目标**：启动 Metal GAC v3，但不直接修改 v2 默认 fallback；先用可复跑
+CSV evidence 判断哪些实例适合激进路径，以及 simdgroup/threadgroup staging 是否
+值得进入真实实现。
+
+**核心改动**：
+- DocOps roadmap 从 `v02` bump 到 `v03`，并新增独立小计划/小 changelog：
+  - `docs/planning/metal_gac/METAL_GAC_V3_POLICY_RECOMMENDER_PLAN_2026_05_03.md`
+  - `docs/planning/metal_gac/METAL_GAC_V3_POLICY_RECOMMENDER_CHANGELOG_2026_05_03.md`
+- `metal_gac_analyze.py` 新增 report-only recommender：
+  - `--recommend-policy`
+  - `--baseline-mode shared+flags`
+  - `--regression-threshold 1.05`
+  - `--min-runs 3`
+- mode summary 新增 `kernel_share`、`dispatch_share`、`reset_share` 与
+  `worklist_push_per_round`，帮助判断瓶颈是在 kernel、host dispatch 还是 reset。
+- recommender 输出全局 candidate、bucket candidate、baseline bottleneck counts
+  与超过阈值的 regression 样例；推荐只作为报告，不改变 Metal solver 默认路径。
+
+**验证**：
+- `python3 -m py_compile tests/python/metal_gac_analyze.py`
+- `python3 tests/python/metal_gac_analyze.py out/metal_gac_v2x_tier2_all.csv out/metal_gac_v2x_tier2_auto.csv --top=3 --recommend-policy --baseline-mode shared+flags --regression-threshold 1.05 --min-runs 3`
+- `python3 tests/python/metal_gac_ablation.py --tier=2 --mode-preset=all --runs=5 --warmup=2 --runner-mode=prepared --timeout=300 --csv=out/metal_gac_v3_tier2_all.csv --quiet`
+- `python3 tests/python/metal_gac_ablation.py --tier=2 --mode-preset=auto --runs=5 --warmup=2 --runner-mode=prepared --timeout=300 --csv=out/metal_gac_v3_tier2_auto.csv --quiet`
+- `python3 tests/python/metal_gac_analyze.py out/metal_gac_v3_tier2_all.csv out/metal_gac_v3_tier2_auto.csv --top=10 --recommend-policy --baseline-mode shared+flags --regression-threshold 1.05 --min-runs 3`
+
+**结果摘要**：
+- v3 TIER2 all：2280/2298 rows OK，18 个 ERROR 均为
+  `unsupported_non_binary_extension`。
+- v3 TIER2 auto：380/383 rows OK，3 个 ERROR 均为
+  `unsupported_non_binary_extension`。
+- baseline `shared+flags+scalar+pair`：`solve_ms p50=0.290 p95=4.995`；
+  `shared+auto`：`solve_ms p50=0.223 p95=6.293`。
+- combined recommender 显示 `baseline_bottleneck_counts dispatch=76`；
+  `shared+auto` 的 `p95_ratio=1.54` 且 19 个实例超过 5% regression threshold，
+  因此 v3 不提升 auto policy，不进入 simdgroup kernel 实现。
 
 ### Metal GAC 文档落账：每个小计划/小 changelog 独立成文
 

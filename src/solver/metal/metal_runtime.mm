@@ -294,6 +294,7 @@ absl::StatusOr<MetalDispatchTimings> MetalRuntime::Dispatch1D(
       return absl::InvalidArgumentError("Metal dispatch requires non-zero grid size");
     }
 
+    const auto encode_start = std::chrono::steady_clock::now();
     id<MTLCommandBuffer> command_buffer = [impl_->queue commandBuffer];
     if (command_buffer == nil) {
       return absl::InternalError("Failed to create Metal command buffer");
@@ -322,6 +323,7 @@ absl::StatusOr<MetalDispatchTimings> MetalRuntime::Dispatch1D(
         MTLSizeMake(static_cast<NSUInteger>(threads_per_threadgroup), 1, 1);
     [encoder dispatchThreads:grid threadsPerThreadgroup:group];
     [encoder endEncoding];
+    const auto encode_end = std::chrono::steady_clock::now();
 
     const auto start = std::chrono::steady_clock::now();
     [command_buffer commit];
@@ -334,6 +336,96 @@ absl::StatusOr<MetalDispatchTimings> MetalRuntime::Dispatch1D(
     }
 
     MetalDispatchTimings timings;
+    timings.encode_ms =
+        std::chrono::duration<double, std::milli>(encode_end - encode_start)
+            .count();
+    timings.wall_ms =
+        std::chrono::duration<double, std::milli>(end - start).count();
+    const double gpu_start = [command_buffer GPUStartTime];
+    const double gpu_end = [command_buffer GPUEndTime];
+    if (gpu_start > 0.0 && gpu_end >= gpu_start) {
+      timings.kernel_ms = (gpu_end - gpu_start) * 1000.0;
+      timings.gpu_timing_available = true;
+    }
+    return timings;
+  }
+}
+
+absl::StatusOr<MetalDispatchTimings> MetalRuntime::Dispatch1DBatch(
+    const std::vector<MetalComputeDispatch1D>& dispatches) const {
+  @autoreleasepool {
+    if (impl_ == nullptr || impl_->queue == nil) {
+      return absl::FailedPreconditionError("Metal runtime is not initialized");
+    }
+    if (dispatches.empty()) {
+      return MetalDispatchTimings();
+    }
+
+    const auto encode_start = std::chrono::steady_clock::now();
+    id<MTLCommandBuffer> command_buffer = [impl_->queue commandBuffer];
+    if (command_buffer == nil) {
+      return absl::InternalError("Failed to create Metal batch command buffer");
+    }
+
+    for (const MetalComputeDispatch1D& dispatch : dispatches) {
+      if (dispatch.grid_size == 0) {
+        continue;
+      }
+      if (dispatch.pipeline == nullptr || !dispatch.pipeline->valid()) {
+        return absl::InvalidArgumentError(
+            "Metal batch dispatch requires a valid pipeline");
+      }
+      if (dispatch.threads_per_threadgroup == 0) {
+        return absl::InvalidArgumentError(
+            "Metal batch dispatch requires non-zero threadgroup size");
+      }
+
+      id<MTLComputeCommandEncoder> encoder =
+          [command_buffer computeCommandEncoder];
+      if (encoder == nil) {
+        return absl::InternalError("Failed to create Metal batch encoder");
+      }
+
+      [encoder setComputePipelineState:dispatch.pipeline->impl_->pipeline];
+      for (const auto& binding : dispatch.bindings) {
+        if (binding.buffer == nullptr || !binding.buffer->valid()) {
+          return absl::InvalidArgumentError(absl::StrFormat(
+              "Invalid Metal batch buffer binding at index %d", binding.index));
+        }
+        [encoder setBuffer:binding.buffer->impl_->buffer
+                    offset:0
+                   atIndex:binding.index];
+      }
+      if (!dispatch.params.empty()) {
+        [encoder setBytes:dispatch.params.data()
+                   length:dispatch.params.size()
+                  atIndex:dispatch.params_index];
+      }
+
+      const MTLSize grid =
+          MTLSizeMake(static_cast<NSUInteger>(dispatch.grid_size), 1, 1);
+      const MTLSize group = MTLSizeMake(
+          static_cast<NSUInteger>(dispatch.threads_per_threadgroup), 1, 1);
+      [encoder dispatchThreads:grid threadsPerThreadgroup:group];
+      [encoder endEncoding];
+    }
+    const auto encode_end = std::chrono::steady_clock::now();
+
+    const auto start = std::chrono::steady_clock::now();
+    [command_buffer commit];
+    [command_buffer waitUntilCompleted];
+    const auto end = std::chrono::steady_clock::now();
+
+    if ([command_buffer status] == MTLCommandBufferStatusError) {
+      return absl::InternalError(absl::StrFormat(
+          "Metal batch command buffer failed: %s",
+          NSErrorToString([command_buffer error])));
+    }
+
+    MetalDispatchTimings timings;
+    timings.encode_ms =
+        std::chrono::duration<double, std::milli>(encode_end - encode_start)
+            .count();
     timings.wall_ms =
         std::chrono::duration<double, std::milli>(end - start).count();
     const double gpu_start = [command_buffer GPUStartTime];
@@ -357,6 +449,7 @@ absl::StatusOr<MetalDispatchTimings> MetalRuntime::BlitCopyAndFill(
       return MetalDispatchTimings();
     }
 
+    const auto encode_start = std::chrono::steady_clock::now();
     id<MTLCommandBuffer> command_buffer = [impl_->queue commandBuffer];
     if (command_buffer == nil) {
       return absl::InternalError("Failed to create Metal blit command buffer");
@@ -409,6 +502,7 @@ absl::StatusOr<MetalDispatchTimings> MetalRuntime::BlitCopyAndFill(
     }
 
     [encoder endEncoding];
+    const auto encode_end = std::chrono::steady_clock::now();
 
     const auto start = std::chrono::steady_clock::now();
     [command_buffer commit];
@@ -422,6 +516,9 @@ absl::StatusOr<MetalDispatchTimings> MetalRuntime::BlitCopyAndFill(
     }
 
     MetalDispatchTimings timings;
+    timings.encode_ms =
+        std::chrono::duration<double, std::milli>(encode_end - encode_start)
+            .count();
     timings.wall_ms =
         std::chrono::duration<double, std::milli>(end - start).count();
     const double gpu_start = [command_buffer GPUStartTime];

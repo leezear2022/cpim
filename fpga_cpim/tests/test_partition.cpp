@@ -37,5 +37,26 @@ int main() {
     CHECK_TRUE(stats.high_degree_hub_count >= 1u);
     CHECK_EQ(stats.max_var_degree, 15u);
   }
+
+  {
+    SyntheticConfig cfg;
+    cfg.graph = "chain";
+    cfg.vars = 8;
+    cfg.domain = 4;
+    Model model = MakeSyntheticModel(cfg);
+    PartitionConfig pcfg;
+    pcfg.num_partitions = 4;
+    pcfg.policy = PartitionPolicy::kContiguous;
+    PartitionStats stats = BuildPartition(model, pcfg);
+    CHECK_EQ(stats.policy, PartitionPolicy::kContiguous);
+    CHECK_EQ(stats.var_partition[0], 0u);
+    CHECK_EQ(stats.var_partition[1], 0u);
+    CHECK_EQ(stats.var_partition[2], 1u);
+    CHECK_EQ(stats.var_partition[3], 1u);
+    CHECK_EQ(stats.var_partition[4], 2u);
+    CHECK_EQ(stats.var_partition[5], 2u);
+    CHECK_EQ(stats.var_partition[6], 3u);
+    CHECK_EQ(stats.var_partition[7], 3u);
+  }
   return 0;
 }

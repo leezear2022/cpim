@@ -5,7 +5,8 @@ import subprocess
 from pathlib import Path
 
 
-def run_case(binary, graph, domain, support_banks, seed, args):
+def run_case(binary, graph, domain, density, support_banks, partition_policy,
+             seed, args):
     cmd = [
         str(binary),
         "--instance",
@@ -15,7 +16,7 @@ def run_case(binary, graph, domain, support_banks, seed, args):
         "--domain",
         str(domain),
         "--density",
-        str(args.density),
+        str(density),
         "--tightness",
         str(args.tightness),
         "--seed",
@@ -26,6 +27,8 @@ def run_case(binary, graph, domain, support_banks, seed, args):
         str(args.worlds),
         "--partitions",
         str(args.partitions),
+        "--partition-policy",
+        partition_policy,
         "--support-banks",
         str(support_banks),
         "--support-base-latency",
@@ -40,6 +43,8 @@ def run_case(binary, graph, domain, support_banks, seed, args):
     return {
         "graph": graph,
         "domain": domain,
+        "density": density,
+        "partition_policy": partition_policy,
         "support_banks": support_banks,
         "seed": seed,
         "constraints": data["model"]["num_constraints"],
@@ -68,10 +73,13 @@ def main():
     parser.add_argument("--domain", type=int, default=32)
     parser.add_argument("--domains", default="")
     parser.add_argument("--density", type=float, default=0.2)
+    parser.add_argument("--densities", default="")
     parser.add_argument("--tightness", type=float, default=0.5)
     parser.add_argument("--mode", default="nsacq")
     parser.add_argument("--worlds", type=int, default=4)
     parser.add_argument("--partitions", type=int, default=4)
+    parser.add_argument("--partition-policy", default="degree")
+    parser.add_argument("--partition-policies", default="")
     parser.add_argument("--support-banks", type=int, default=4)
     parser.add_argument("--support-banks-list", default="")
     parser.add_argument("--support-base-latency", type=int, default=1)
@@ -90,12 +98,27 @@ def main():
         if args.support_banks_list
         else [args.support_banks]
     )
+    densities = (
+        [float(d.strip()) for d in args.densities.split(",") if d.strip()]
+        if args.densities
+        else [args.density]
+    )
+    partition_policies = (
+        [p.strip() for p in args.partition_policies.split(",") if p.strip()]
+        if args.partition_policies
+        else [args.partition_policy]
+    )
     rows = []
     for graph in [g.strip() for g in args.graphs.split(",") if g.strip()]:
         for domain in domains:
-            for support_banks in support_banks_values:
-                for seed in range(args.seeds):
-                    rows.append(run_case(binary, graph, domain, support_banks, seed, args))
+            for density in densities:
+                for partition_policy in partition_policies:
+                    for support_banks in support_banks_values:
+                        for seed in range(args.seeds):
+                            rows.append(
+                                run_case(binary, graph, domain, density, support_banks,
+                                         partition_policy, seed, args)
+                            )
 
     if args.jsonl:
         with open(args.jsonl, "w", encoding="utf-8") as f:
@@ -107,41 +130,52 @@ def main():
         by_graph.setdefault(row["graph"], []).append(row)
     print(
         "graph domain banks constraints bitSupKiB queueP95 queueMax "
-        "latencyM bankConflicts conflictRate maxBankAccess crossRatio hubs bram18 uram288 unknownRate"
+        "density policy latencyM bankConflicts conflictRate maxBankAccess "
+        "crossRatio hubs bram18 uram288 unknownRate"
     )
     for graph, graph_rows in by_graph.items():
         by_domain = {}
         for row in graph_rows:
             by_domain.setdefault(row["domain"], []).append(row)
         for domain, domain_rows in sorted(by_domain.items()):
-            by_banks = {}
+            by_density = {}
             for row in domain_rows:
-                by_banks.setdefault(row["support_banks"], []).append(row)
-            for banks, bank_rows in sorted(by_banks.items()):
-                avg = lambda key: sum(r[key] for r in bank_rows) / len(bank_rows)
-                conflict_rate = (
-                    avg("support_bank_conflicts") / avg("support_words_touched")
-                    if avg("support_words_touched") > 0
-                    else 0.0
-                )
-                print(
-                    graph,
-                    domain,
-                    banks,
-                    f"{avg('constraints'):.1f}",
-                    f"{avg('bit_sup_bytes') / 1024.0:.1f}",
-                    f"{avg('queue_occupancy_p95'):.1f}",
-                    f"{max(r['queue_occupancy_max'] for r in bank_rows)}",
-                    f"{avg('support_latency_cycles') / 1_000_000.0:.2f}",
-                    f"{avg('support_bank_conflicts'):.1f}",
-                    f"{conflict_rate:.4f}",
-                    f"{max(r['support_max_bank_accesses'] for r in bank_rows)}",
-                    f"{avg('cross_event_ratio'):.3f}",
-                    f"{avg('high_degree_hub_count'):.1f}",
-                    f"{avg('bram18_estimate'):.1f}",
-                    f"{avg('uram288_estimate'):.1f}",
-                    f"{avg('unknown_rate'):.3f}",
-                )
+                by_density.setdefault(row["density"], []).append(row)
+            for density, density_rows in sorted(by_density.items()):
+                by_policy = {}
+                for row in density_rows:
+                    by_policy.setdefault(row["partition_policy"], []).append(row)
+                for policy, policy_rows in sorted(by_policy.items()):
+                    by_banks = {}
+                    for row in policy_rows:
+                        by_banks.setdefault(row["support_banks"], []).append(row)
+                    for banks, bank_rows in sorted(by_banks.items()):
+                        avg = lambda key: sum(r[key] for r in bank_rows) / len(bank_rows)
+                        conflict_rate = (
+                            avg("support_bank_conflicts") / avg("support_words_touched")
+                            if avg("support_words_touched") > 0
+                            else 0.0
+                        )
+                        print(
+                            graph,
+                            domain,
+                            banks,
+                            f"{avg('constraints'):.1f}",
+                            f"{avg('bit_sup_bytes') / 1024.0:.1f}",
+                            f"{avg('queue_occupancy_p95'):.1f}",
+                            f"{max(r['queue_occupancy_max'] for r in bank_rows)}",
+                            f"{density:.3f}",
+                            policy,
+                            f"{avg('support_latency_cycles') / 1_000_000.0:.2f}",
+                            f"{avg('support_bank_conflicts'):.1f}",
+                            f"{conflict_rate:.4f}",
+                            f"{max(r['support_max_bank_accesses'] for r in bank_rows)}",
+                            f"{avg('cross_event_ratio'):.3f}",
+                            f"{avg('high_degree_hub_count'):.1f}",
+                            f"{avg('bram18_estimate'):.1f}",
+                            f"{avg('uram288_estimate'):.1f}",
+                            f"{avg('unknown_rate'):.3f}",
+                        )
 
 
 if __name__ == "__main__":

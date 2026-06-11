@@ -64,9 +64,10 @@ hub    128     4      127.0        508.0      1.0       127       13.56     0.0 
 
 ## 下一步
 
-建议进入 Phase B.4：
+Phase B.4 已完成：
 
 - 加 `--partition-policy=degree|contiguous`。
 - 对 `random/domain=128` 扫 `density=0.02/0.05/0.10`。
 - 同时固定 `support_banks=4`，观察 queue pressure 和 cross-event ratio 的拐点。
-- 若 partition 策略差异不大，再推进 HLS 多 tile dataflow；若差异明显，先确定 partition policy。
+- 结果见 [FPGA_CPIM_PHASE_B4_PARTITION_DENSITY.md](FPGA_CPIM_PHASE_B4_PARTITION_DENSITY.md)。
+- 当前数据下 partition 策略差异不大，建议推进 HLS 多 tile dataflow。

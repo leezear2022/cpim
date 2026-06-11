@@ -8,14 +8,21 @@
 
 namespace fpga_cpim {
 
+enum class PartitionPolicy {
+  kDegree,
+  kContiguous
+};
+
 struct PartitionConfig {
   uint32_t num_partitions = 4;
   uint32_t max_vars_per_partition = 0;         // 0 means unlimited.
   uint32_t max_constraints_per_partition = 0;  // 0 means unlimited.
+  PartitionPolicy policy = PartitionPolicy::kDegree;
 };
 
 struct PartitionStats {
   uint32_t num_partitions = 0;
+  PartitionPolicy policy = PartitionPolicy::kDegree;
   std::vector<uint32_t> var_partition;
   std::vector<uint32_t> constraint_partition;
   std::vector<uint32_t> vars_per_partition;
@@ -28,6 +35,8 @@ struct PartitionStats {
   uint32_t max_var_degree = 0;
 };
 
+const char* PartitionPolicyName(PartitionPolicy policy);
+PartitionStats BuildPartition(const Model& model, PartitionConfig cfg);
 PartitionStats BuildGreedyPartition(const Model& model, PartitionConfig cfg);
 
 }  // namespace fpga_cpim

@@ -110,6 +110,20 @@ fpga_cpim/scripts/run_phase_b_sweep.py \
 `support_banks >= ceil(domain / 32)`。在 128 变量 synthetic sweep 中，
 `domain=128` 从 2 banks 提升到 4 banks 后，query-level bank conflict 降为 0。
 
+Partition / density sweep：
+
+```bash
+fpga_cpim/scripts/run_phase_b_sweep.py \
+  --binary build/fpga_cpim/fpga_cpim_sim \
+  --graphs random \
+  --seeds 1 \
+  --vars 128 \
+  --domain 128 \
+  --densities 0.02,0.05,0.10 \
+  --partition-policies degree,contiguous \
+  --support-banks 4
+```
+
 ## 和 SAT-FPGA BCP 的关系
 
 相似点：

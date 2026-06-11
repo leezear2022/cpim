@@ -4,6 +4,7 @@
 #include <iostream>
 #include <map>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -44,6 +45,16 @@ std::string GetArgValue(int argc, char** argv, int* i) {
   }
   ++(*i);
   return argv[*i];
+}
+
+PartitionPolicy ParsePartitionPolicyName(const std::string& name) {
+  if (name == "degree") {
+    return PartitionPolicy::kDegree;
+  }
+  if (name == "contiguous") {
+    return PartitionPolicy::kContiguous;
+  }
+  throw std::invalid_argument("unknown partition policy: " + name);
 }
 
 CliOptions ParseArgs(int argc, char** argv) {
@@ -98,6 +109,9 @@ CliOptions ParseArgs(int argc, char** argv) {
     } else if (arg == "--partitions" || arg.rfind("--partitions=", 0) == 0) {
       opt.partition.num_partitions =
           static_cast<uint32_t>(std::stoul(GetArgValue(argc, argv, &i)));
+    } else if (arg == "--partition-policy" ||
+               arg.rfind("--partition-policy=", 0) == 0) {
+      opt.partition.policy = ParsePartitionPolicyName(GetArgValue(argc, argv, &i));
     } else if (arg == "--max-vars-per-partition" ||
                arg.rfind("--max-vars-per-partition=", 0) == 0) {
       opt.partition.max_vars_per_partition =
@@ -112,7 +126,8 @@ CliOptions ParseArgs(int argc, char** argv) {
       std::cout
           << "fpga_cpim_sim --instance synthetic --vars 32 --domain 32 "
           << "--density 0.2 --mode ac|sacq|qsac|nsacq --worlds 4 "
-          << "--partitions 4 --support-banks 4 --json out.json\n";
+          << "--partitions 4 --partition-policy degree "
+          << "--support-banks 4 --json out.json\n";
       std::exit(0);
     }
   }
@@ -252,6 +267,8 @@ void WriteJson(const CliOptions& opt, const Model& model,
       << opt.max_events << ",\"max_revise\":" << opt.max_revise
       << ",\"max_epochs\":" << opt.max_epochs
       << ",\"partitions\":" << opt.partition.num_partitions
+      << ",\"partition_policy\":\"" << PartitionPolicyName(opt.partition.policy)
+      << "\""
       << ",\"support_banks\":" << opt.support_oracle.num_banks
       << ",\"support_base_latency\":"
       << opt.support_oracle.base_latency_cycles
@@ -292,6 +309,7 @@ void WriteJson(const CliOptions& opt, const Model& model,
       << ",\"router_events_dropped_overflow\":" << router_overflow_drops
       << "},\n";
   *os << "  \"partition\": {\"num_partitions\":" << partition.num_partitions
+      << ",\"policy\":\"" << PartitionPolicyName(partition.policy) << "\""
       << ",\"local_events\":" << partition.local_events
       << ",\"cross_events\":" << partition.cross_events
       << ",\"cross_event_ratio\":" << partition.cross_event_ratio
@@ -368,7 +386,7 @@ int main(int argc, char** argv) {
 
   StorageEstimate storage =
       EstimateStorage(model, opt.worlds, 4096);
-  PartitionStats partition = BuildGreedyPartition(model, opt.partition);
+  PartitionStats partition = BuildPartition(model, opt.partition);
   if (!opt.json_path.empty()) {
     std::ofstream out(opt.json_path);
     if (!out) {

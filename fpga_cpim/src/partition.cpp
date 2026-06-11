@@ -56,20 +56,23 @@ uint32_t ChooseConstraintPartition(
   return constraints_per_partition[px] <= constraints_per_partition[py] ? px : py;
 }
 
-}  // namespace
-
-PartitionStats BuildGreedyPartition(const Model& model, PartitionConfig cfg) {
-  if (cfg.num_partitions == 0) {
-    cfg.num_partitions = 1;
+uint32_t FirstNonFullPartition(const std::vector<uint32_t>& vars_per_partition,
+                               uint32_t start,
+                               uint32_t max_vars_per_partition) {
+  if (max_vars_per_partition == 0) {
+    return start;
   }
+  for (uint32_t offset = 0; offset < vars_per_partition.size(); ++offset) {
+    const uint32_t part = (start + offset) % vars_per_partition.size();
+    if (vars_per_partition[part] < max_vars_per_partition) {
+      return part;
+    }
+  }
+  return start;
+}
 
-  PartitionStats stats;
-  stats.num_partitions = cfg.num_partitions;
-  stats.var_partition.assign(model.num_vars, 0);
-  stats.constraint_partition.assign(model.num_constraints, 0);
-  stats.vars_per_partition.assign(cfg.num_partitions, 0);
-  stats.constraints_per_partition.assign(cfg.num_partitions, 0);
-
+void AssignDegreePolicy(const Model& model, const PartitionConfig& cfg,
+                        PartitionStats* stats) {
   std::vector<uint32_t> order(model.num_vars);
   std::iota(order.begin(), order.end(), 0);
   std::sort(order.begin(), order.end(), [&](uint32_t lhs, uint32_t rhs) {
@@ -82,20 +85,66 @@ PartitionStats BuildGreedyPartition(const Model& model, PartitionConfig cfg) {
   });
 
   std::vector<uint64_t> degree_load(cfg.num_partitions, 0);
+  for (VarId var : order) {
+    const uint32_t part = ChooseVariablePartition(
+        stats->vars_per_partition, degree_load, cfg.max_vars_per_partition);
+    stats->var_partition[var] = part;
+    ++stats->vars_per_partition[part];
+    degree_load[part] += model.subscription[var].size();
+  }
+}
+
+void AssignContiguousPolicy(const Model& model, const PartitionConfig& cfg,
+                            PartitionStats* stats) {
+  const uint32_t chunk =
+      std::max<uint32_t>(1, (model.num_vars + cfg.num_partitions - 1) /
+                                cfg.num_partitions);
+  for (VarId var = 0; var < model.num_vars; ++var) {
+    uint32_t part = std::min<uint32_t>(var / chunk, cfg.num_partitions - 1);
+    part = FirstNonFullPartition(stats->vars_per_partition, part,
+                                 cfg.max_vars_per_partition);
+    stats->var_partition[var] = part;
+    ++stats->vars_per_partition[part];
+  }
+}
+
+}  // namespace
+
+const char* PartitionPolicyName(PartitionPolicy policy) {
+  switch (policy) {
+    case PartitionPolicy::kDegree:
+      return "degree";
+    case PartitionPolicy::kContiguous:
+      return "contiguous";
+  }
+  return "degree";
+}
+
+PartitionStats BuildPartition(const Model& model, PartitionConfig cfg) {
+  if (cfg.num_partitions == 0) {
+    cfg.num_partitions = 1;
+  }
+
+  PartitionStats stats;
+  stats.num_partitions = cfg.num_partitions;
+  stats.policy = cfg.policy;
+  stats.var_partition.assign(model.num_vars, 0);
+  stats.constraint_partition.assign(model.num_constraints, 0);
+  stats.vars_per_partition.assign(cfg.num_partitions, 0);
+  stats.constraints_per_partition.assign(cfg.num_partitions, 0);
+
   std::vector<uint64_t> degrees;
   degrees.reserve(model.num_vars);
   for (VarId var = 0; var < model.num_vars; ++var) {
     degrees.push_back(model.subscription[var].size());
-  }
-
-  for (VarId var : order) {
-    const uint32_t part = ChooseVariablePartition(
-        stats.vars_per_partition, degree_load, cfg.max_vars_per_partition);
-    stats.var_partition[var] = part;
-    ++stats.vars_per_partition[part];
-    degree_load[part] += model.subscription[var].size();
     stats.max_var_degree =
         std::max<uint32_t>(stats.max_var_degree, model.subscription[var].size());
+  }
+
+  if (cfg.policy == PartitionPolicy::kContiguous) {
+    AssignContiguousPolicy(model, cfg, &stats);
+  } else {
+    AssignDegreePolicy(model, cfg, &stats);
   }
 
   for (Cid cid = 0; cid < model.num_constraints; ++cid) {
@@ -130,6 +179,11 @@ PartitionStats BuildGreedyPartition(const Model& model, PartitionConfig cfg) {
     }
   }
   return stats;
+}
+
+PartitionStats BuildGreedyPartition(const Model& model, PartitionConfig cfg) {
+  cfg.policy = PartitionPolicy::kDegree;
+  return BuildPartition(model, cfg);
 }
 
 }  // namespace fpga_cpim

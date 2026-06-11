@@ -142,6 +142,7 @@ HLS-friendly core 已支持：
 - round-robin 多 revise tile 调度。
 - queue peak、local/cross event、router overflow 统计。
 - `vars=128/domain=128/density≈0.10` pressure smoke。
+- `1/2/4` revise tile 对照的稳定 `hls_pressure` 输出。
 
 预算超限和 per-partition queue overflow 仍返回 `UNKNOWN`。
 

@@ -11,6 +11,9 @@ namespace {
 
 constexpr std::size_t kBitSupWords =
     MAX_CONSTRAINTS * MAX_DOMAIN * MAX_WORDS * 2;
+constexpr uint16_t kPressureVars = 128;
+constexpr uint16_t kPressureDomain = 128;
+constexpr uint16_t kPressurePartitions = 4;
 
 void reset_inputs(word_t bit_sup[kBitSupWords],
                   ConstraintHls constraints[MAX_CONSTRAINTS],
@@ -77,6 +80,18 @@ void build_subscriptions(const ConstraintHls constraints[MAX_CONSTRAINTS],
     subscriptions[c.x].cids[subscriptions[c.x].count++] = cid;
     subscriptions[c.y].cids[subscriptions[c.y].count++] = cid;
   }
+}
+
+const char* status_name(Status status) {
+  switch (status) {
+    case OK:
+      return "OK";
+    case DWO:
+      return "DWO";
+    case UNKNOWN:
+      return "UNKNOWN";
+  }
+  return "UNKNOWN";
 }
 
 void run_equality_ok() {
@@ -230,38 +245,35 @@ void run_partition_queue_overflow_unknown() {
   assert(results[0].router_overflow == 1);
 }
 
-void run_density_010_pressure_smoke() {
-  word_t bit_sup[kBitSupWords] = {};
-  ConstraintHls constraints[MAX_CONSTRAINTS] = {};
-  SubscriptionHls subscriptions[MAX_VARS] = {};
-  uint16_t domain_size[MAX_VARS] = {};
-  uint16_t var_partition[MAX_VARS] = {};
-  uint16_t constraint_partition[MAX_CONSTRAINTS] = {};
-  ProbeTaskHls tasks[MAX_WORLDS] = {};
-  ResultHls results[MAX_WORLDS] = {};
+uint16_t build_density_010_pressure_case(
+    word_t bit_sup[kBitSupWords],
+    ConstraintHls constraints[MAX_CONSTRAINTS],
+    SubscriptionHls subscriptions[MAX_VARS],
+    uint16_t domain_size[MAX_VARS],
+    uint16_t var_partition[MAX_VARS],
+    uint16_t constraint_partition[MAX_CONSTRAINTS],
+    ProbeTaskHls tasks[MAX_WORLDS],
+    ResultHls results[MAX_WORLDS]) {
   reset_inputs(bit_sup, constraints, subscriptions, domain_size, var_partition,
                constraint_partition, tasks, results);
-
-  constexpr uint16_t kVars = 128;
-  constexpr uint16_t kDomain = 128;
-  constexpr uint16_t kPartitions = 4;
   uint16_t partition_load[MAX_PARTITIONS] = {};
-  for (uint16_t var = 0; var < kVars; ++var) {
-    domain_size[var] = kDomain;
+  for (uint16_t var = 0; var < kPressureVars; ++var) {
+    domain_size[var] = kPressureDomain;
     var_partition[var] = static_cast<uint16_t>(var / 32u);
   }
 
   uint16_t cid = 0;
   uint32_t offset = 0;
-  for (uint16_t x = 0; x < kVars; ++x) {
-    for (uint16_t y = static_cast<uint16_t>(x + 1u); y < kVars; ++y) {
+  for (uint16_t x = 0; x < kPressureVars; ++x) {
+    for (uint16_t y = static_cast<uint16_t>(x + 1u); y < kPressureVars; ++y) {
       if (((x * 53u + y * 97u + 11u) % 10u) != 0) {
         continue;
       }
       if (cid >= MAX_CONSTRAINTS) {
         break;
       }
-      add_equality_constraint(bit_sup, constraints, cid, x, y, kDomain, &offset);
+      add_equality_constraint(bit_sup, constraints, cid, x, y, kPressureDomain,
+                              &offset);
       const uint16_t px = var_partition[x];
       const uint16_t py = var_partition[y];
       const uint16_t owner = partition_load[px] <= partition_load[py] ? px : py;
@@ -273,24 +285,88 @@ void run_density_010_pressure_smoke() {
 
   build_subscriptions(constraints, cid, subscriptions);
   tasks[0] = ProbeTaskHls{1, 0, 7};
-  ControlHls control = make_control(kVars, cid, kDomain);
-  control.num_partitions = kPartitions;
-  control.num_revise_tiles = 4;
+  return cid;
+}
+
+ResultHls run_density_010_pressure_case(uint16_t revise_tiles,
+                                        uint16_t* constraints_built) {
+  word_t bit_sup[kBitSupWords] = {};
+  ConstraintHls constraints[MAX_CONSTRAINTS] = {};
+  SubscriptionHls subscriptions[MAX_VARS] = {};
+  uint16_t domain_size[MAX_VARS] = {};
+  uint16_t var_partition[MAX_VARS] = {};
+  uint16_t constraint_partition[MAX_CONSTRAINTS] = {};
+  ProbeTaskHls tasks[MAX_WORLDS] = {};
+  ResultHls results[MAX_WORLDS] = {};
+  const uint16_t cid = build_density_010_pressure_case(
+      bit_sup, constraints, subscriptions, domain_size, var_partition,
+      constraint_partition, tasks, results);
+
+  ControlHls control = make_control(kPressureVars, cid, kPressureDomain);
+  control.num_partitions = kPressurePartitions;
+  control.num_revise_tiles = revise_tiles;
   control.partition_queue_capacity = MAX_PARTITION_QUEUE;
   control.max_events = 300000;
   control.max_revise = 300000;
   control.max_epochs = 300000;
   cpim_top_hls(bit_sup, constraints, subscriptions, domain_size, var_partition,
                constraint_partition, tasks, results, control);
+  *constraints_built = cid;
+  return results[0];
+}
 
-  assert(cid >= 750);
-  assert(cid <= 850);
-  assert(results[0].status == OK);
-  assert(results[0].deleted_values > 0);
-  assert(results[0].events > 0);
-  assert(results[0].cross_events > 0);
-  assert(results[0].queue_peak_total > 0);
-  assert(results[0].queue_peak_partition < MAX_PARTITION_QUEUE);
+void print_pressure_row(uint16_t revise_tiles, uint16_t constraints,
+                        const ResultHls& result) {
+  std::cout << "hls_pressure"
+            << " graph=random"
+            << " vars=" << kPressureVars
+            << " domain=" << kPressureDomain
+            << " density=0.10"
+            << " partitions=" << kPressurePartitions
+            << " tiles=" << revise_tiles
+            << " constraints=" << constraints
+            << " status=" << status_name(result.status)
+            << " events=" << result.events
+            << " epochs=" << result.epochs
+            << " tile_steps=" << result.tile_steps
+            << " queue_peak_total=" << result.queue_peak_total
+            << " queue_peak_partition=" << result.queue_peak_partition
+            << " local_events=" << result.local_events
+            << " cross_events=" << result.cross_events
+            << " deleted_values=" << result.deleted_values
+            << " router_overflow=" << result.router_overflow
+            << "\n";
+}
+
+void run_density_010_pressure_smoke() {
+  uint16_t cid_1 = 0;
+  uint16_t cid_2 = 0;
+  uint16_t cid_4 = 0;
+  const ResultHls one_tile = run_density_010_pressure_case(1, &cid_1);
+  const ResultHls two_tiles = run_density_010_pressure_case(2, &cid_2);
+  const ResultHls four_tiles = run_density_010_pressure_case(4, &cid_4);
+
+  print_pressure_row(1, cid_1, one_tile);
+  print_pressure_row(2, cid_2, two_tiles);
+  print_pressure_row(4, cid_4, four_tiles);
+
+  assert(cid_1 == cid_2);
+  assert(cid_2 == cid_4);
+  assert(cid_1 >= 750);
+  assert(cid_1 <= 850);
+  assert(one_tile.status == OK);
+  assert(two_tiles.status == OK);
+  assert(four_tiles.status == OK);
+  assert(one_tile.deleted_values > 0);
+  assert(one_tile.deleted_values == two_tiles.deleted_values);
+  assert(two_tiles.deleted_values == four_tiles.deleted_values);
+  assert(one_tile.events == two_tiles.events);
+  assert(two_tiles.events == four_tiles.events);
+  assert(one_tile.cross_events > 0);
+  assert(one_tile.queue_peak_total > 0);
+  assert(one_tile.queue_peak_partition < MAX_PARTITION_QUEUE);
+  assert(two_tiles.epochs <= one_tile.epochs);
+  assert(four_tiles.epochs <= two_tiles.epochs);
 }
 
 }  // namespace

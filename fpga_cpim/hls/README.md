@@ -46,3 +46,16 @@ testbench 覆盖：
 - per-partition queue overflow UNKNOWN。
 - 多 revise tile round-robin 调度。
 - `vars=128/domain=128/density≈0.10` pressure smoke。
+
+## Phase C.3 输出
+
+`hls_tb` 会输出可脚本采样的 pressure rows：
+
+```text
+hls_pressure graph=random vars=128 domain=128 density=0.10 partitions=4 tiles=1 constraints=793 status=OK events=1586 epochs=1586 tile_steps=1586 queue_peak_total=592 queue_peak_partition=273 local_events=973 cross_events=613 deleted_values=16129 router_overflow=0
+hls_pressure graph=random vars=128 domain=128 density=0.10 partitions=4 tiles=2 constraints=793 status=OK events=1586 epochs=793 tile_steps=1586 queue_peak_total=592 queue_peak_partition=273 local_events=973 cross_events=613 deleted_values=16129 router_overflow=0
+hls_pressure graph=random vars=128 domain=128 density=0.10 partitions=4 tiles=4 constraints=793 status=OK events=1586 epochs=397 tile_steps=1586 queue_peak_total=592 queue_peak_partition=273 local_events=973 cross_events=613 deleted_values=16129 router_overflow=0
+```
+
+其中 `events` 是实际消费的 dirty events，`epochs` 是 tile 调度轮数，
+`queue_peak_total` / `queue_peak_partition` 是 per-partition queue 峰值。

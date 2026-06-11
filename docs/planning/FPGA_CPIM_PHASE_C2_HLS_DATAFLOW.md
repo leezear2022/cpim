@@ -64,11 +64,13 @@ hls_tb ok
 - `density≈0.10` pressure smoke 能覆盖 128 变量、128 domain、约 10% random graph 的 bitSup 和队列压力。
 - 当前仍是调度语义 smoke，不是周期精确 RTL timing。
 
-## 下一步
+## 后续
 
-建议进入 Phase C.3：
+Phase C.3 已完成，见
+[FPGA_CPIM_PHASE_C3_HLS_TILE_SWEEP.md](FPGA_CPIM_PHASE_C3_HLS_TILE_SWEEP.md)：
 
-- 给 HLS core 增加可导出的 `TraceLite` 结构，记录每个 world 的 queue peak、epochs、events、cross/local event。
+- 复用 `ResultHls` 统计 queue peak、epochs、events、cross/local event。
 - 增加单 tile vs 2 tile vs 4 tile 的 HLS testbench 对照。
-- 将 `density≈0.10` pressure smoke 的结果打印为稳定一行，便于后续 CI/脚本采样。
+- 将 `density≈0.10` pressure smoke 的结果打印为稳定 `hls_pressure` 行，
+  便于后续 CI/脚本采样。
 - 若后续接 Vitis，再把 fallback integer 类型替换为真实 `ap_uint` 并加 synthesis-only pragma。

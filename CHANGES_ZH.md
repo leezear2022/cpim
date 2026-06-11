@@ -2,6 +2,38 @@
 
 ## 2026-06-12
 
+### FPGA CPIM：HLS Phase C.3 tile sweep 输出
+
+**目标**：把 HLS-friendly pressure smoke 的
+`events/epochs/queue_peak/cross_events` 变成稳定一行输出，并开始做
+`1/2/4` revise tile 对照。
+
+**核心改动**：
+- `testbench_hls.cpp` 将 `random/vars=128/domain=128/density≈0.10`
+  pressure case 抽成可重复 fixture。
+- 同一 fixture 分别运行 `num_revise_tiles=1/2/4`。
+- 新增稳定前缀 `hls_pressure`，输出 constraints、status、events、
+  epochs、tile steps、queue peak、local/cross events、deleted values 与
+  router overflow。
+- 新增记录：
+  `docs/planning/FPGA_CPIM_PHASE_C3_HLS_TILE_SWEEP.md`。
+
+**验证**：
+- `g++ -std=c++17 -I fpga_cpim/hls fpga_cpim/hls/testbench_hls.cpp fpga_cpim/hls/*.cpp -o /tmp/hls_tb_c3 && /tmp/hls_tb_c3`
+- `cmake --build build/fpga_cpim -j`
+- `ctest --test-dir build/fpga_cpim --output-on-failure`
+- `python3 -m py_compile fpga_cpim/scripts/*.py`
+- `git diff --check`
+- `dol lint --soft`
+
+**结果摘要**：
+- 三种 tile 数均为 `status=OK`、`constraints=793`、`events=1586`、
+  `deleted_values=16129`。
+- epochs 随 tile 数增加下降：`1586 -> 793 -> 397`。
+- queue peak 稳定：`queue_peak_total=592`、
+  `queue_peak_partition=273`。
+- local/cross event 稳定：`local_events=973`、`cross_events=613`。
+
 ### FPGA CPIM：HLS Phase C.2 多 tile / 分区队列
 
 **目标**：承接 Phase B.4 的 `density=0.10` queue pressure 观察，把

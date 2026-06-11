@@ -10,6 +10,20 @@
 
 namespace fpga_cpim {
 
+namespace {
+
+void AttachRouterStats(const EventRouter& router, WorldResult* result) {
+  const RouterStats& stats = router.Stats();
+  result->queue_occupancy_p50 = Percentile(stats.occupancy_samples, 50);
+  result->queue_occupancy_p95 = Percentile(stats.occupancy_samples, 95);
+  result->queue_occupancy_max = stats.max_queue_occupancy;
+  result->router_events_enqueued = stats.events_enqueued;
+  result->router_events_deduped = stats.events_deduped;
+  result->router_events_dropped_overflow = stats.events_dropped_overflow;
+}
+
+}  // namespace
+
 PropagationEngine::PropagationEngine(const Model& model, EngineConfig cfg)
     : model_(model), cfg_(cfg) {}
 
@@ -26,11 +40,13 @@ WorldResult PropagationEngine::RunAC(
     if (cid < model_.num_constraints &&
         !router.EnqueueConstraint(0, cid, 0x3u)) {
       result.status = WorldStatus::kUNKNOWN;
+      AttachRouterStats(router, &result);
       return result;
     }
   }
   if (router.HasOverflow()) {
     result.status = WorldStatus::kUNKNOWN;
+    AttachRouterStats(router, &result);
     return result;
   }
 
@@ -40,6 +56,7 @@ WorldResult PropagationEngine::RunAC(
     ++result.epochs;
     if (result.epochs > cfg_.max_epochs_per_probe) {
       result.status = WorldStatus::kUNKNOWN;
+      AttachRouterStats(router, &result);
       return result;
     }
     const size_t epoch_events = router.PendingEventCount();
@@ -51,6 +68,7 @@ WorldResult PropagationEngine::RunAC(
       ++result.events;
       if (result.events > cfg_.max_events_per_probe) {
         result.status = WorldStatus::kUNKNOWN;
+        AttachRouterStats(router, &result);
         return result;
       }
       const uint32_t dir_count =
@@ -59,6 +77,7 @@ WorldResult PropagationEngine::RunAC(
       result.revise_calls += dir_count;
       if (result.revise_calls > cfg_.max_revise_calls_per_probe) {
         result.status = WorldStatus::kUNKNOWN;
+        AttachRouterStats(router, &result);
         return result;
       }
       std::vector<ReviseOutput> outputs = tile.Process(*ev, owner.WorldDomains(0));
@@ -70,11 +89,13 @@ WorldResult PropagationEngine::RunAC(
       }
       if (overflow) {
         result.status = WorldStatus::kUNKNOWN;
+        AttachRouterStats(router, &result);
         return result;
       }
       result.support_words_touched += words;
       if (result.support_words_touched > cfg_.max_support_words_per_probe) {
         result.status = WorldStatus::kUNKNOWN;
+        AttachRouterStats(router, &result);
         return result;
       }
       for (const ReviseOutput& output : outputs) {
@@ -89,17 +110,20 @@ WorldResult PropagationEngine::RunAC(
         result.deleted_values += applied.deleted_count;
         if (applied.dwo) {
           result.status = WorldStatus::kDWO;
+          AttachRouterStats(router, &result);
           return result;
         }
         if (!EnqueueFromVar(&router, output.world, output.target_var, allowed) ||
             router.HasOverflow()) {
           result.status = WorldStatus::kUNKNOWN;
+          AttachRouterStats(router, &result);
           return result;
         }
       }
     }
   }
   result.status = WorldStatus::kOK;
+  AttachRouterStats(router, &result);
   return result;
 }
 
@@ -124,6 +148,7 @@ WorldResult PropagationEngine::RunProbe(
   const std::vector<bool> allowed = BuildAllowedConstraints(var);
   if (!EnqueueFromVar(&router, 0, var, allowed) || router.HasOverflow()) {
     result.status = WorldStatus::kUNKNOWN;
+    AttachRouterStats(router, &result);
     return result;
   }
 
@@ -134,6 +159,7 @@ WorldResult PropagationEngine::RunProbe(
     ++result.epochs;
     if (result.epochs > cfg_.max_epochs_per_probe) {
       result.status = WorldStatus::kUNKNOWN;
+      AttachRouterStats(router, &result);
       return result;
     }
 
@@ -149,6 +175,7 @@ WorldResult PropagationEngine::RunProbe(
       ++result.events;
       if (result.events > cfg_.max_events_per_probe) {
         result.status = WorldStatus::kUNKNOWN;
+        AttachRouterStats(router, &result);
         return result;
       }
 
@@ -158,6 +185,7 @@ WorldResult PropagationEngine::RunProbe(
       result.revise_calls += dir_count;
       if (result.revise_calls > cfg_.max_revise_calls_per_probe) {
         result.status = WorldStatus::kUNKNOWN;
+        AttachRouterStats(router, &result);
         return result;
       }
 
@@ -170,11 +198,13 @@ WorldResult PropagationEngine::RunProbe(
       }
       if (overflow) {
         result.status = WorldStatus::kUNKNOWN;
+        AttachRouterStats(router, &result);
         return result;
       }
       result.support_words_touched += new_support_words;
       if (result.support_words_touched > cfg_.max_support_words_per_probe) {
         result.status = WorldStatus::kUNKNOWN;
+        AttachRouterStats(router, &result);
         return result;
       }
 
@@ -190,11 +220,13 @@ WorldResult PropagationEngine::RunProbe(
         result.deleted_values += applied.deleted_count;
         if (applied.dwo) {
           result.status = WorldStatus::kDWO;
+          AttachRouterStats(router, &result);
           return result;
         }
         if (!EnqueueFromVar(&router, output.world, output.target_var, allowed) ||
             router.HasOverflow()) {
           result.status = WorldStatus::kUNKNOWN;
+          AttachRouterStats(router, &result);
           return result;
         }
       }
@@ -202,6 +234,7 @@ WorldResult PropagationEngine::RunProbe(
   }
 
   result.status = WorldStatus::kOK;
+  AttachRouterStats(router, &result);
   return result;
 }
 

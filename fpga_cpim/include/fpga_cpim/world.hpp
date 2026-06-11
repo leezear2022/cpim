@@ -35,6 +35,12 @@ struct WorldResult {
   uint64_t support_words_touched = 0;
   uint64_t epochs = 0;
   uint64_t deleted_values = 0;
+  double queue_occupancy_p50 = 0.0;
+  double queue_occupancy_p95 = 0.0;
+  uint64_t queue_occupancy_max = 0;
+  uint64_t router_events_enqueued = 0;
+  uint64_t router_events_deduped = 0;
+  uint64_t router_events_dropped_overflow = 0;
 };
 
 class WorldManager {

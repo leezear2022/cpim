@@ -12,6 +12,7 @@
 #include "fpga_cpim/engine.hpp"
 #include "fpga_cpim/golden.hpp"
 #include "fpga_cpim/model.hpp"
+#include "fpga_cpim/partition.hpp"
 #include "fpga_cpim/sim_stats.hpp"
 
 namespace fpga_cpim {
@@ -27,6 +28,7 @@ struct CliOptions {
   uint64_t max_epochs = 1000;
   uint64_t max_support_words = 1000000;
   uint32_t nsac_radius = 1;
+  PartitionConfig partition;
   std::string json_path;
 };
 
@@ -80,6 +82,17 @@ CliOptions ParseArgs(int argc, char** argv) {
       opt.max_support_words = std::stoull(GetArgValue(argc, argv, &i));
     } else if (arg == "--nsac-radius" || arg.rfind("--nsac-radius=", 0) == 0) {
       opt.nsac_radius = static_cast<uint32_t>(std::stoul(GetArgValue(argc, argv, &i)));
+    } else if (arg == "--partitions" || arg.rfind("--partitions=", 0) == 0) {
+      opt.partition.num_partitions =
+          static_cast<uint32_t>(std::stoul(GetArgValue(argc, argv, &i)));
+    } else if (arg == "--max-vars-per-partition" ||
+               arg.rfind("--max-vars-per-partition=", 0) == 0) {
+      opt.partition.max_vars_per_partition =
+          static_cast<uint32_t>(std::stoul(GetArgValue(argc, argv, &i)));
+    } else if (arg == "--max-constraints-per-partition" ||
+               arg.rfind("--max-constraints-per-partition=", 0) == 0) {
+      opt.partition.max_constraints_per_partition =
+          static_cast<uint32_t>(std::stoul(GetArgValue(argc, argv, &i)));
     } else if (arg == "--json" || arg.rfind("--json=", 0) == 0) {
       opt.json_path = GetArgValue(argc, argv, &i);
     } else if (arg == "--help") {
@@ -149,10 +162,35 @@ std::string JsonEscape(const std::string& text) {
   return out;
 }
 
+double PercentileDouble(std::vector<double> values, double p) {
+  if (values.empty()) {
+    return 0.0;
+  }
+  std::sort(values.begin(), values.end());
+  const double clamped = std::max(0.0, std::min(100.0, p));
+  const double rank = (clamped / 100.0) * (values.size() - 1);
+  const size_t lo = static_cast<size_t>(rank);
+  const size_t hi = std::min(lo + 1, values.size() - 1);
+  const double t = rank - lo;
+  return values[lo] * (1.0 - t) + values[hi] * t;
+}
+
+void WriteUintArray(std::ostream* os, const std::vector<uint32_t>& values) {
+  *os << "[";
+  for (size_t i = 0; i < values.size(); ++i) {
+    if (i != 0) {
+      *os << ",";
+    }
+    *os << values[i];
+  }
+  *os << "]";
+}
+
 void WriteJson(const CliOptions& opt, const Model& model,
                const std::vector<WorldResult>& results,
                const std::vector<uint64_t>& epoch_samples,
-               const StorageEstimate& storage, std::ostream* os) {
+               const StorageEstimate& storage,
+               const PartitionStats& partition, std::ostream* os) {
   uint64_t ok = 0;
   uint64_t dwo = 0;
   uint64_t unknown = 0;
@@ -160,6 +198,12 @@ void WriteJson(const CliOptions& opt, const Model& model,
   uint64_t revise = 0;
   uint64_t support_words = 0;
   uint64_t deleted = 0;
+  uint64_t router_enqueued = 0;
+  uint64_t router_deduped = 0;
+  uint64_t router_overflow_drops = 0;
+  std::vector<double> queue_p50_samples;
+  std::vector<double> queue_p95_samples;
+  std::vector<uint64_t> queue_max_samples;
   for (const WorldResult& result : results) {
     ok += result.status == WorldStatus::kOK;
     dwo += result.status == WorldStatus::kDWO;
@@ -168,6 +212,12 @@ void WriteJson(const CliOptions& opt, const Model& model,
     revise += result.revise_calls;
     support_words += result.support_words_touched;
     deleted += result.status == WorldStatus::kDWO ? 1 : 0;
+    router_enqueued += result.router_events_enqueued;
+    router_deduped += result.router_events_deduped;
+    router_overflow_drops += result.router_events_dropped_overflow;
+    queue_p50_samples.push_back(result.queue_occupancy_p50);
+    queue_p95_samples.push_back(result.queue_occupancy_p95);
+    queue_max_samples.push_back(result.queue_occupancy_max);
   }
   std::vector<uint64_t> degrees = SubscriptionDegrees(model);
   const double unknown_rate =
@@ -176,7 +226,8 @@ void WriteJson(const CliOptions& opt, const Model& model,
   *os << "  \"config\": {\"mode\":\"" << JsonEscape(opt.mode)
       << "\",\"worlds\":" << opt.worlds << ",\"max_events\":"
       << opt.max_events << ",\"max_revise\":" << opt.max_revise
-      << ",\"max_epochs\":" << opt.max_epochs << "},\n";
+      << ",\"max_epochs\":" << opt.max_epochs
+      << ",\"partitions\":" << opt.partition.num_partitions << "},\n";
   *os << "  \"model\": {\"num_vars\":" << model.num_vars
       << ",\"num_constraints\":" << model.num_constraints
       << ",\"max_domain_size\":" << model.max_domain_size
@@ -195,10 +246,31 @@ void WriteJson(const CliOptions& opt, const Model& model,
       << ",\"support_words_touched\":" << support_words
       << ",\"epochs_p50\":" << Percentile(epoch_samples, 50)
       << ",\"epochs_p95\":" << Percentile(epoch_samples, 95)
-      << ",\"queue_occupancy_p95\":0,\"queue_occupancy_max\":0"
+      << ",\"queue_occupancy_p50\":" << PercentileDouble(queue_p50_samples, 50)
+      << ",\"queue_occupancy_p95\":" << PercentileDouble(queue_p95_samples, 95)
+      << ",\"queue_occupancy_max\":"
+      << (queue_max_samples.empty() ? 0
+                                    : *std::max_element(queue_max_samples.begin(),
+                                                        queue_max_samples.end()))
       << ",\"fanout_p95\":" << Percentile(degrees, 95)
-      << ",\"partition_cross_event_ratio\":0.0"
-      << ",\"deleted_values\":" << deleted << "},\n";
+      << ",\"partition_cross_event_ratio\":" << partition.cross_event_ratio
+      << ",\"deleted_values\":" << deleted
+      << ",\"router_events_enqueued\":" << router_enqueued
+      << ",\"router_events_deduped\":" << router_deduped
+      << ",\"router_events_dropped_overflow\":" << router_overflow_drops
+      << "},\n";
+  *os << "  \"partition\": {\"num_partitions\":" << partition.num_partitions
+      << ",\"local_events\":" << partition.local_events
+      << ",\"cross_events\":" << partition.cross_events
+      << ",\"cross_event_ratio\":" << partition.cross_event_ratio
+      << ",\"max_partition_degree\":" << partition.max_partition_degree
+      << ",\"max_var_degree\":" << partition.max_var_degree
+      << ",\"high_degree_hub_count\":" << partition.high_degree_hub_count
+      << ",\"vars_per_partition\":";
+  WriteUintArray(os, partition.vars_per_partition);
+  *os << ",\"constraints_per_partition\":";
+  WriteUintArray(os, partition.constraints_per_partition);
+  *os << "},\n";
   *os << "  \"storage\": {\"bit_sup_bytes\":" << storage.bit_sup_bytes
       << ",\"domain_state_bytes_per_world\":"
       << storage.domain_state_bytes_per_world
@@ -234,13 +306,16 @@ int main(int argc, char** argv) {
   std::vector<uint64_t> epoch_samples;
 
   if (opt.mode == "ac") {
-    GoldenResult ac = EnforceAC_Golden(model, base_domains, AllConstraints(model));
-    WorldResult result;
-    result.status = ac.status == PropStatus::kDWO ? WorldStatus::kDWO : WorldStatus::kOK;
-    result.revise_calls = ac.revise_calls;
-    result.deleted_values = ac.deleted_values;
+    EngineConfig cfg;
+    cfg.num_worlds = opt.worlds;
+    cfg.max_events_per_probe = opt.max_events;
+    cfg.max_revise_calls_per_probe = opt.max_revise;
+    cfg.max_epochs_per_probe = opt.max_epochs;
+    cfg.max_support_words_per_probe = opt.max_support_words;
+    PropagationEngine engine(model, cfg);
+    WorldResult result = engine.RunAC(base_domains, AllConstraints(model));
     results.push_back(result);
-    epoch_samples.push_back(0);
+    epoch_samples.push_back(result.epochs);
   } else {
     EngineConfig cfg;
     cfg.num_worlds = opt.worlds;
@@ -259,14 +334,15 @@ int main(int argc, char** argv) {
 
   StorageEstimate storage =
       EstimateStorage(model, opt.worlds, 4096);
+  PartitionStats partition = BuildGreedyPartition(model, opt.partition);
   if (!opt.json_path.empty()) {
     std::ofstream out(opt.json_path);
     if (!out) {
       std::cerr << "无法写入 JSON: " << opt.json_path << "\n";
       return 1;
     }
-    WriteJson(opt, model, results, epoch_samples, storage, &out);
+    WriteJson(opt, model, results, epoch_samples, storage, partition, &out);
   }
-  WriteJson(opt, model, results, epoch_samples, storage, &std::cout);
+  WriteJson(opt, model, results, epoch_samples, storage, partition, &std::cout);
   return 0;
 }

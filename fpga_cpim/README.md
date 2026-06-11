@@ -20,6 +20,7 @@ ctest --test-dir build/fpga_cpim --output-on-failure
   --density 0.2 \
   --mode nsacq \
   --worlds 4 \
+  --partitions 4 \
   --json out.json
 ```
 
@@ -62,6 +63,29 @@ UNKNOWN must never remove a value.
 ## NSACQ 语义
 
 第一版只实现 `nsac_radius=1`。对 focal variable `i`，允许传播的约束是 `{i} ∪ neighbors(i)` 诱导子图内的 binary constraints。该 mask 只过滤 event enqueue，不改 `bitSup & other_domain` 的单约束支持检查。
+
+## Phase B 统计
+
+模拟器输出硬件形态相关指标：
+
+- queue occupancy p50/p95/max。
+- fanout p50/p95/max。
+- greedy variable partition。
+- local/cross partition event ratio。
+- high-degree hub count。
+- BRAM18 / URAM288 粗估。
+
+快速 sweep：
+
+```bash
+fpga_cpim/scripts/run_phase_b_sweep.py \
+  --binary build/fpga_cpim/fpga_cpim_sim \
+  --seeds 3 \
+  --vars 32 \
+  --domain 32 \
+  --graphs chain,grid,random,hub \
+  --partitions 4
+```
 
 ## 和 SAT-FPGA BCP 的关系
 

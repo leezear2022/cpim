@@ -101,10 +101,14 @@ fpga_cpim/scripts/run_phase_b_sweep.py \
   --vars 128 \
   --domains 64,128 \
   --density 0.05 \
-  --support-banks 2 \
+  --support-banks-list 2,4,8,16 \
   --support-base-latency 1 \
   --support-conflict-penalty 3
 ```
+
+经验规则：当前 bitSup word 为 32-bit，第一版 banking 可先令
+`support_banks >= ceil(domain / 32)`。在 128 变量 synthetic sweep 中，
+`domain=128` 从 2 banks 提升到 4 banks 后，query-level bank conflict 降为 0。
 
 ## 和 SAT-FPGA BCP 的关系
 

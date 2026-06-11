@@ -72,9 +72,13 @@ hub    128     127.0        508.0      1.0       127       30.72     5721523.0  
 
 ## 下一步
 
-建议进入 Phase B.3：
+Phase B.3 已完成：
 
-- 比较 `support_banks=2/4/8/16` 的 bank conflict 曲线。
+- `support_banks=2/4/8/16` 曲线见 [FPGA_CPIM_PHASE_B3_BANK_SWEEP.md](FPGA_CPIM_PHASE_B3_BANK_SWEEP.md)。
+- 本轮数据支持一个简单 banking 规则：`banks >= ceil(domain / 32)`。
+
+后续建议：
+
 - 增加 `--partition-policy=degree|contiguous`，确认 partition 策略对 cross-event ratio 的影响。
 - 对 random/domain=128 增加 `density=0.02/0.05/0.10` sweep，找出 queue 与 bank pressure 的拐点。
 - 若 bank conflict 在 4/8 banks 下仍可控，再推进 HLS 多 tile dataflow；否则先考虑 bitSup row layout / banking policy。

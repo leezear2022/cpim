@@ -61,9 +61,10 @@ ctest --test-dir build/fpga_cpim --output-on-failure
 - cross/local event 统计稳定：
   `cross_events=613`、`local_events=973`。
 
-## 下一步
+## 后续
 
-建议进入 Phase C.4：
+Phase C.4 已完成，见
+[FPGA_CPIM_PHASE_C4_HLS_CLI_TRACE.md](FPGA_CPIM_PHASE_C4_HLS_CLI_TRACE.md)：
 
 - 给 HLS testbench 增加 `--tiles=1,2,4` / `--pressure-only` 轻量参数解析，
   便于 CI 只跑 pressure rows。

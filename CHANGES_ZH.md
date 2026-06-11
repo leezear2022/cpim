@@ -2,6 +2,41 @@
 
 ## 2026-06-12
 
+### FPGA CPIM：HLS Phase C.4 CLI / trace 转换 / capacity sweep
+
+**目标**：给 HLS testbench 增加 `--pressure-only`、`--tiles` 和
+`--capacity-sweep` 参数，把 `hls_pressure` / `hls_capacity` 行转换成
+JSONL/CSV，并扫描 per-partition queue capacity 的 `UNKNOWN` 门槛。
+
+**核心改动**：
+- `testbench_hls.cpp` 新增轻量参数解析：
+  `--pressure-only`、`--tiles=<csv>`、`--capacity-sweep=<csv>|none`。
+- `hls_pressure` 行新增 `capacity` 字段。
+- 新增 `hls_capacity` 输出，默认扫 `64/128/256/512/1024`。
+- 新增 `fpga_cpim/scripts/parse_hls_trace.py`，支持
+  `--format jsonl|csv` 与 `--kind all|pressure|capacity`。
+- 新增记录：
+  `docs/planning/FPGA_CPIM_PHASE_C4_HLS_CLI_TRACE.md`。
+
+**验证**：
+- `g++ -std=c++17 -I fpga_cpim/hls fpga_cpim/hls/testbench_hls.cpp fpga_cpim/hls/*.cpp -o /tmp/hls_tb_c4`
+- `/tmp/hls_tb_c4 --pressure-only --tiles=1,2,4 --capacity-sweep=64,128,256,512,1024`
+- `fpga_cpim/scripts/parse_hls_trace.py --input /tmp/hls_c4.out --format jsonl --output /tmp/hls_c4.jsonl`
+- `fpga_cpim/scripts/parse_hls_trace.py --input /tmp/hls_c4.out --format csv --kind capacity --output /tmp/hls_c4_capacity.csv`
+- `cmake --build build/fpga_cpim -j`
+- `ctest --test-dir build/fpga_cpim --output-on-failure`
+- `python3 -m py_compile fpga_cpim/scripts/*.py`
+- `git diff --check`
+- `dol lint --soft`
+
+**结果摘要**：
+- `tiles=1/2/4` 仍为 `status=OK`，`events=1586`、
+  `deleted_values=16129`。
+- epochs 为 `1586 -> 793 -> 397`。
+- capacity sweep：`64/128/256` 为 `UNKNOWN` 且
+  `router_overflow=1`；`512/1024` 为 `OK`。
+- 当前 fixture 的 queue capacity 门槛落在 `256` 与 `512` 之间。
+
 ### FPGA CPIM：HLS Phase C.3 tile sweep 输出
 
 **目标**：把 HLS-friendly pressure smoke 的

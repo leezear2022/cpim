@@ -133,7 +133,7 @@ fpga_cpim/scripts/run_phase_b_sweep.py \
   --support-banks 4
 ```
 
-## HLS Phase C.2
+## HLS Phase C
 
 HLS-friendly core 已支持：
 
@@ -143,6 +143,8 @@ HLS-friendly core 已支持：
 - queue peak、local/cross event、router overflow 统计。
 - `vars=128/domain=128/density≈0.10` pressure smoke。
 - `1/2/4` revise tile 对照的稳定 `hls_pressure` 输出。
+- `--pressure-only`、`--tiles`、`--capacity-sweep` 参数与
+  `parse_hls_trace.py` JSONL/CSV 转换。
 
 预算超限和 per-partition queue overflow 仍返回 `UNKNOWN`。
 

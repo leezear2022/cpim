@@ -7,6 +7,15 @@ g++ -std=c++17 -I fpga_cpim/hls fpga_cpim/hls/testbench_hls.cpp fpga_cpim/hls/*.
 ./hls_tb
 ```
 
+只输出 pressure / capacity rows：
+
+```bash
+./hls_tb \
+  --pressure-only \
+  --tiles=1,2,4 \
+  --capacity-sweep=64,128,256,512,1024
+```
+
 约束：
 
 - core 文件不使用 STL 容器。
@@ -52,10 +61,18 @@ testbench 覆盖：
 `hls_tb` 会输出可脚本采样的 pressure rows：
 
 ```text
-hls_pressure graph=random vars=128 domain=128 density=0.10 partitions=4 tiles=1 constraints=793 status=OK events=1586 epochs=1586 tile_steps=1586 queue_peak_total=592 queue_peak_partition=273 local_events=973 cross_events=613 deleted_values=16129 router_overflow=0
-hls_pressure graph=random vars=128 domain=128 density=0.10 partitions=4 tiles=2 constraints=793 status=OK events=1586 epochs=793 tile_steps=1586 queue_peak_total=592 queue_peak_partition=273 local_events=973 cross_events=613 deleted_values=16129 router_overflow=0
-hls_pressure graph=random vars=128 domain=128 density=0.10 partitions=4 tiles=4 constraints=793 status=OK events=1586 epochs=397 tile_steps=1586 queue_peak_total=592 queue_peak_partition=273 local_events=973 cross_events=613 deleted_values=16129 router_overflow=0
+hls_pressure graph=random vars=128 domain=128 density=0.10 partitions=4 tiles=1 capacity=1024 constraints=793 status=OK events=1586 epochs=1586 tile_steps=1586 queue_peak_total=592 queue_peak_partition=273 local_events=973 cross_events=613 deleted_values=16129 router_overflow=0
+hls_pressure graph=random vars=128 domain=128 density=0.10 partitions=4 tiles=2 capacity=1024 constraints=793 status=OK events=1586 epochs=793 tile_steps=1586 queue_peak_total=592 queue_peak_partition=273 local_events=973 cross_events=613 deleted_values=16129 router_overflow=0
+hls_pressure graph=random vars=128 domain=128 density=0.10 partitions=4 tiles=4 capacity=1024 constraints=793 status=OK events=1586 epochs=397 tile_steps=1586 queue_peak_total=592 queue_peak_partition=273 local_events=973 cross_events=613 deleted_values=16129 router_overflow=0
 ```
 
 其中 `events` 是实际消费的 dirty events，`epochs` 是 tile 调度轮数，
 `queue_peak_total` / `queue_peak_partition` 是 per-partition queue 峰值。
+
+转换为 JSONL / CSV：
+
+```bash
+./hls_tb --pressure-only > /tmp/hls.out
+fpga_cpim/scripts/parse_hls_trace.py --input /tmp/hls.out --format jsonl
+fpga_cpim/scripts/parse_hls_trace.py --input /tmp/hls.out --format csv --kind capacity
+```

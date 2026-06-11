@@ -1,5 +1,6 @@
 #include <cassert>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 
@@ -14,6 +15,17 @@ constexpr std::size_t kBitSupWords =
 constexpr uint16_t kPressureVars = 128;
 constexpr uint16_t kPressureDomain = 128;
 constexpr uint16_t kPressurePartitions = 4;
+constexpr uint16_t kMaxCliValues = 16;
+
+struct TestbenchOptions {
+  bool pressure_only = false;
+  bool show_help = false;
+  bool expect_capacity_threshold = true;
+  uint16_t tiles[kMaxCliValues] = {1, 2, 4};
+  uint16_t tile_count = 3;
+  uint16_t capacities[kMaxCliValues] = {64, 128, 256, 512, 1024};
+  uint16_t capacity_count = 5;
+};
 
 void reset_inputs(word_t bit_sup[kBitSupWords],
                   ConstraintHls constraints[MAX_CONSTRAINTS],
@@ -92,6 +104,70 @@ const char* status_name(Status status) {
       return "UNKNOWN";
   }
   return "UNKNOWN";
+}
+
+bool starts_with(const char* text, const char* prefix) {
+  return std::strncmp(text, prefix, std::strlen(prefix)) == 0;
+}
+
+uint16_t parse_u16(const char* text) {
+  const unsigned long value = std::strtoul(text, nullptr, 10);
+  if (value > 65535ul) {
+    return 65535u;
+  }
+  return static_cast<uint16_t>(value);
+}
+
+uint16_t parse_u16_list(const char* text, uint16_t values[kMaxCliValues]) {
+  uint16_t count = 0;
+  const char* cur = text;
+  while (*cur != '\0' && count < kMaxCliValues) {
+    values[count++] = parse_u16(cur);
+    while (*cur != '\0' && *cur != ',') {
+      ++cur;
+    }
+    if (*cur == ',') {
+      ++cur;
+    }
+  }
+  return count;
+}
+
+TestbenchOptions parse_args(int argc, char** argv) {
+  TestbenchOptions opt;
+  for (int i = 1; i < argc; ++i) {
+    const char* arg = argv[i];
+    if (std::strcmp(arg, "--pressure-only") == 0) {
+      opt.pressure_only = true;
+    } else if (std::strcmp(arg, "--help") == 0) {
+      opt.show_help = true;
+    } else if (starts_with(arg, "--tiles=")) {
+      opt.tile_count = parse_u16_list(arg + std::strlen("--tiles="), opt.tiles);
+    } else if (std::strcmp(arg, "--tiles") == 0 && i + 1 < argc) {
+      opt.tile_count = parse_u16_list(argv[++i], opt.tiles);
+    } else if (starts_with(arg, "--capacity-sweep=")) {
+      const char* value = arg + std::strlen("--capacity-sweep=");
+      opt.expect_capacity_threshold = false;
+      opt.capacity_count =
+          std::strcmp(value, "none") == 0 ? 0 : parse_u16_list(value, opt.capacities);
+    } else if (std::strcmp(arg, "--capacity-sweep") == 0 && i + 1 < argc) {
+      const char* value = argv[++i];
+      opt.expect_capacity_threshold = false;
+      opt.capacity_count =
+          std::strcmp(value, "none") == 0 ? 0 : parse_u16_list(value, opt.capacities);
+    }
+  }
+  if (opt.tile_count == 0) {
+    opt.tiles[0] = 1;
+    opt.tile_count = 1;
+  }
+  return opt;
+}
+
+void print_help() {
+  std::cout
+      << "hls_tb [--pressure-only] [--tiles=1,2,4] "
+      << "[--capacity-sweep=64,128,256,512,1024|none]\n";
 }
 
 void run_equality_ok() {
@@ -289,6 +365,7 @@ uint16_t build_density_010_pressure_case(
 }
 
 ResultHls run_density_010_pressure_case(uint16_t revise_tiles,
+                                        uint16_t queue_capacity,
                                         uint16_t* constraints_built) {
   word_t bit_sup[kBitSupWords] = {};
   ConstraintHls constraints[MAX_CONSTRAINTS] = {};
@@ -305,7 +382,7 @@ ResultHls run_density_010_pressure_case(uint16_t revise_tiles,
   ControlHls control = make_control(kPressureVars, cid, kPressureDomain);
   control.num_partitions = kPressurePartitions;
   control.num_revise_tiles = revise_tiles;
-  control.partition_queue_capacity = MAX_PARTITION_QUEUE;
+  control.partition_queue_capacity = queue_capacity;
   control.max_events = 300000;
   control.max_revise = 300000;
   control.max_epochs = 300000;
@@ -315,15 +392,17 @@ ResultHls run_density_010_pressure_case(uint16_t revise_tiles,
   return results[0];
 }
 
-void print_pressure_row(uint16_t revise_tiles, uint16_t constraints,
-                        const ResultHls& result) {
-  std::cout << "hls_pressure"
+void print_trace_row(const char* prefix, uint16_t revise_tiles,
+                     uint16_t queue_capacity, uint16_t constraints,
+                     const ResultHls& result) {
+  std::cout << prefix
             << " graph=random"
             << " vars=" << kPressureVars
             << " domain=" << kPressureDomain
             << " density=0.10"
             << " partitions=" << kPressurePartitions
             << " tiles=" << revise_tiles
+            << " capacity=" << queue_capacity
             << " constraints=" << constraints
             << " status=" << status_name(result.status)
             << " events=" << result.events
@@ -338,35 +417,77 @@ void print_pressure_row(uint16_t revise_tiles, uint16_t constraints,
             << "\n";
 }
 
-void run_density_010_pressure_smoke() {
-  uint16_t cid_1 = 0;
-  uint16_t cid_2 = 0;
-  uint16_t cid_4 = 0;
-  const ResultHls one_tile = run_density_010_pressure_case(1, &cid_1);
-  const ResultHls two_tiles = run_density_010_pressure_case(2, &cid_2);
-  const ResultHls four_tiles = run_density_010_pressure_case(4, &cid_4);
+void run_density_010_pressure_smoke(const TestbenchOptions& opt) {
+  ResultHls previous;
+  uint16_t previous_constraints = 0;
+  uint16_t previous_tiles = 0;
+  bool have_previous = false;
+  for (uint16_t i = 0; i < kMaxCliValues; ++i) {
+    if (i >= opt.tile_count) {
+      break;
+    }
+    uint16_t constraints = 0;
+    const ResultHls result =
+        run_density_010_pressure_case(opt.tiles[i], MAX_PARTITION_QUEUE,
+                                      &constraints);
+    print_trace_row("hls_pressure", opt.tiles[i], MAX_PARTITION_QUEUE,
+                    constraints, result);
 
-  print_pressure_row(1, cid_1, one_tile);
-  print_pressure_row(2, cid_2, two_tiles);
-  print_pressure_row(4, cid_4, four_tiles);
+    assert(constraints >= 750);
+    assert(constraints <= 850);
+    assert(result.status == OK);
+    assert(result.deleted_values > 0);
+    assert(result.events > 0);
+    assert(result.cross_events > 0);
+    assert(result.queue_peak_total > 0);
+    assert(result.queue_peak_partition < MAX_PARTITION_QUEUE);
+    if (have_previous) {
+      assert(constraints == previous_constraints);
+      assert(result.deleted_values == previous.deleted_values);
+      assert(result.events == previous.events);
+      if (opt.tiles[i] >= previous_tiles) {
+        assert(result.epochs <= previous.epochs);
+      }
+    }
+    previous = result;
+    previous_constraints = constraints;
+    previous_tiles = opt.tiles[i];
+    have_previous = true;
+  }
+}
 
-  assert(cid_1 == cid_2);
-  assert(cid_2 == cid_4);
-  assert(cid_1 >= 750);
-  assert(cid_1 <= 850);
-  assert(one_tile.status == OK);
-  assert(two_tiles.status == OK);
-  assert(four_tiles.status == OK);
-  assert(one_tile.deleted_values > 0);
-  assert(one_tile.deleted_values == two_tiles.deleted_values);
-  assert(two_tiles.deleted_values == four_tiles.deleted_values);
-  assert(one_tile.events == two_tiles.events);
-  assert(two_tiles.events == four_tiles.events);
-  assert(one_tile.cross_events > 0);
-  assert(one_tile.queue_peak_total > 0);
-  assert(one_tile.queue_peak_partition < MAX_PARTITION_QUEUE);
-  assert(two_tiles.epochs <= one_tile.epochs);
-  assert(four_tiles.epochs <= two_tiles.epochs);
+void run_capacity_sweep(const TestbenchOptions& opt) {
+  if (opt.capacity_count == 0) {
+    return;
+  }
+  const uint16_t revise_tiles = opt.tiles[opt.tile_count - 1u];
+  bool saw_unknown = false;
+  bool saw_ok = false;
+  for (uint16_t i = 0; i < kMaxCliValues; ++i) {
+    if (i >= opt.capacity_count) {
+      break;
+    }
+    uint16_t constraints = 0;
+    const ResultHls result =
+        run_density_010_pressure_case(revise_tiles, opt.capacities[i],
+                                      &constraints);
+    print_trace_row("hls_capacity", revise_tiles, opt.capacities[i],
+                    constraints, result);
+    assert(constraints >= 750);
+    assert(constraints <= 850);
+    if (result.status == UNKNOWN) {
+      saw_unknown = true;
+      assert(result.router_overflow == 1);
+    }
+    if (result.status == OK) {
+      saw_ok = true;
+      assert(result.router_overflow == 0);
+    }
+  }
+  if (opt.expect_capacity_threshold) {
+    assert(saw_unknown);
+    assert(saw_ok);
+  }
 }
 
 }  // namespace
@@ -374,13 +495,23 @@ void run_density_010_pressure_smoke() {
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((weak))
 #endif
-int main() {
-  run_equality_ok();
-  run_less_than_dwo();
-  run_budget_unknown();
-  run_multi_tile_partition_smoke();
-  run_partition_queue_overflow_unknown();
-  run_density_010_pressure_smoke();
-  std::cout << "hls_tb ok\n";
+int main(int argc, char** argv) {
+  const TestbenchOptions opt = parse_args(argc, argv);
+  if (opt.show_help) {
+    print_help();
+    return 0;
+  }
+  if (!opt.pressure_only) {
+    run_equality_ok();
+    run_less_than_dwo();
+    run_budget_unknown();
+    run_multi_tile_partition_smoke();
+    run_partition_queue_overflow_unknown();
+  }
+  run_density_010_pressure_smoke(opt);
+  run_capacity_sweep(opt);
+  if (!opt.pressure_only) {
+    std::cout << "hls_tb ok\n";
+  }
   return 0;
 }

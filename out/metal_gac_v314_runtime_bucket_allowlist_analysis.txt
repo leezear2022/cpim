@@ -1,0 +1,203 @@
+
+== out/metal_gac_v35_tier2_baseline.csv ==
+rows=383 ok=380 error=3 timeout=0 missing=0 ok_instances=76 error_instances=3
+solve_ms avg=0.781 p50=0.253 p95=5.109 p99=5.937 max=9.395
+elapsed_ms avg=0.798 p50=0.261 p95=5.210 p99=6.045
+cpu_solve_ms avg=0.021424 p50=0.008126 p95=0.078090 p99=0.372190
+metal_cpu_solve_ratio avg=215.27x p50=30.69x p95=524.36x p99=5828.72x metal_faster=0/380
+verified=true
+
+[errors]
+  unsupported_non_binary_extension: 3
+
+[error families]
+  rand-8-20-5: total=3 unsupported_non_binary_extension=3
+
+[error samples]
+  unsupported_non_binary_extension: [Benchmark] Device layout build failed: INVALID_ARGUMENT: Metal v1 supports only binary extension constraints; cid=0
+
+[mode summary]
+mode rows instances avg p50 p95 p99 setup prepare reset dispatch kernel encode wait non_kernel kernel_share dispatch_share reset_share encode_share non_kernel_share dispatch_count cpu_solve metal_cpu_ratio metal_faster frontier_density verified runners variants bitsup effective reset policy selected bucket owner queue handoff local_budget replay_budget dirty_min_degree worklist_rounds worklist_pushes worklist_push_per_round cta_local_rounds cta_pushes cta_cross cta_overflow cta_q_overflow cta_budget_spill cta_seed_overflow host_rounds cta_replay_rounds cta_replay_drain cta_replay_spill bulk_proposed bulk_actual bulk_changed_words bulk_frontier_push bulk_rounds dirty_vars dirty_scans dirty_hits cross_push_avoided dirty_fallback_push owner_map_ms owner_balance owner_weight_balance owner_local owner_cross seed_nonempty seed_empty seed_max_load seed_balance
+shared+flags 380 76 0.781 0.253 5.109 5.937 0.000 0.000 0.000 0.781 0.085 0.000 0.000 0.000 0.11 1.00 0.00 0.00 0.00 3.27 0.021 30.69 0/380 0.830 true prepared flags+scalar+pair pair flags+scalar+pair cpu none 0 - - - - - - - 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 3.27 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.000 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00
+
+[metal vs cpu]
+ratio < 1.0 means Metal is faster than CPU for GAC solve time.
+shared+flags rows=380 instances=76 metal_faster=0/380 ratio_avg=215.27x ratio_p50=30.69x ratio_p95=524.36x ratio_p99=5828.72x metal_p50=0.253 cpu_p50=0.008126
+  worst 9085.84x input=tests/data/bench/test.xml metal_ms=1.508 cpu_ms=0.000166 path=shared+flags+scalar+pair+cpu->flags+scalar+pair
+  worst 7727.68x input=tests/data/bench/test.xml metal_ms=0.649 cpu_ms=0.000084 path=shared+flags+scalar+pair+cpu->flags+scalar+pair
+  worst 7039.66x input=tests/data/bench/queens-4_ext.xml metal_ms=0.584 cpu_ms=0.000083 path=shared+flags+scalar+pair+cpu->flags+scalar+pair
+  worst 6276.60x input=tests/data/bench/test.xml metal_ms=0.521 cpu_ms=0.000083 path=shared+flags+scalar+pair+cpu->flags+scalar+pair
+  worst 5709.66x input=tests/data/bench/test.xml metal_ms=0.714 cpu_ms=0.000125 path=shared+flags+scalar+pair+cpu->flags+scalar+pair
+
+[recommended policy summary]
+best_mode_counts shared+flags=76
+[recommended buckets]
+  family=tests/data/bench/rand-2-23 cons=128-511 dom=17-32 bitw=<2 density=>=0.50: recommend=shared+flags shared+flags=10
+  family=tightness0.1 cons=>511 dom=<17 bitw=<2 density=>=0.50: recommend=shared+flags shared+flags=7
+  family=tightness0.5 cons=128-511 dom=17-32 bitw=<2 density=>=0.50: recommend=shared+flags shared+flags=6
+  family=composed-25-1-2 cons=128-511 dom=<17 bitw=<2 density=0.10-0.50: recommend=shared+flags shared+flags=5
+  family=tightness0.2 cons=128-511 dom=<17 bitw=<2 density=>=0.50: recommend=shared+flags shared+flags=5
+  family=tightness0.35 cons=128-511 dom=<17 bitw=<2 density=>=0.50: recommend=shared+flags shared+flags=5
+  family=tightness0.8 cons=<128 dom=>32 bitw=2-3 density=>=0.50: recommend=shared+flags shared+flags=5
+  family=tightness0.9 cons=<128 dom=>32 bitw=>3 density=>=0.50: recommend=shared+flags shared+flags=5
+  family=BH-4-4 cons=128-511 dom=<17 bitw=<2 density=0.10-0.50: recommend=shared+flags shared+flags=4
+  family=composed-25-1-2 cons=128-511 dom=<17 bitw=<2 density=>=0.50: recommend=shared+flags shared+flags=4
+
+[family summary]
+  BH-4-4: rows=20 avg=5.817 p95=7.181
+  driver: rows=25 avg=1.297 p95=2.550
+  composed-25-1-2: rows=45 avg=0.881 p95=2.140
+  tests/data/bench/test.xml: rows=5 avg=0.807 p95=1.349
+  langford: rows=20 avg=0.806 p95=1.174
+  graphs: rows=15 avg=0.629 p95=1.336
+  rand-2-24: rows=15 avg=0.439 p95=0.869
+  composed-25-10-20: rows=5 avg=0.386 p95=0.441
+  tightness0.9: rows=25 avg=0.357 p95=0.805
+  tightness0.5: rows=30 avg=0.345 p95=0.867
+
+[slowest]
+6.215ms shared+flags benchmarks/BH-4-4/BlackHole-4-4-e-0_ext.xml vars=64 cons=432 maxdom=16 bitw=1 iters=33 del=290 inc=false
+5.907ms shared+flags benchmarks/BH-4-4/BlackHole-4-4-e-1_ext.xml vars=64 cons=432 maxdom=16 bitw=1 iters=33 del=290 inc=false
+5.583ms shared+flags benchmarks/BH-4-4/BlackHole-4-4-e-3_ext.xml vars=64 cons=432 maxdom=16 bitw=1 iters=33 del=290 inc=false
+5.562ms shared+flags benchmarks/BH-4-4/BlackHole-4-4-e-2_ext.xml vars=64 cons=432 maxdom=16 bitw=1 iters=33 del=290 inc=false
+2.128ms shared+flags benchmarks/driver/driverlogw-01c-sat_ext.xml vars=71 cons=217 maxdom=4 bitw=1 iters=7 del=18 inc=false
+2.031ms shared+flags benchmarks/composed-25-1-2/composed-25-1-2-1_ext.xml vars=33 cons=224 maxdom=10 bitw=1 iters=4 del=14 inc=false
+1.817ms shared+flags benchmarks/driver/driverlogw-04c-sat_ext.xml vars=272 cons=3876 maxdom=11 bitw=1 iters=6 del=108 inc=false
+1.252ms shared+flags benchmarks/graphs/graphw-07_ext.xml vars=142 cons=1983 maxdom=44 bitw=2 iters=1 del=4984 inc=true
+1.098ms shared+flags benchmarks/driver/driverlogw-02c-sat_ext.xml vars=301 cons=4055 maxdom=8 bitw=1 iters=4 del=64 inc=false
+1.055ms shared+flags benchmarks/composed-25-1-2/composed-25-1-2-6_ext.xml vars=33 cons=224 maxdom=10 bitw=1 iters=3 del=9 inc=false
+
+== out/metal_gac_v314_runtime_bucket_allowlist_tier2.csv ==
+rows=383 ok=380 error=3 timeout=0 missing=0 ok_instances=76 error_instances=3
+solve_ms avg=0.605 p50=0.220 p95=2.256 p99=4.969 max=5.905
+elapsed_ms avg=0.618 p50=0.226 p95=2.298 p99=5.069
+cpu_solve_ms avg=0.021102 p50=0.008167 p95=0.074188 p99=0.361517
+metal_cpu_solve_ratio avg=227.27x p50=27.49x p95=433.55x p99=3760.22x metal_faster=0/380
+verified=true
+
+[errors]
+  unsupported_non_binary_extension: 3
+
+[error families]
+  rand-8-20-5: total=3 unsupported_non_binary_extension=3
+
+[error samples]
+  unsupported_non_binary_extension: [Benchmark] Device layout build failed: INVALID_ARGUMENT: Metal v1 supports only binary extension constraints; cid=0
+
+[mode summary]
+mode rows instances avg p50 p95 p99 setup prepare reset dispatch kernel encode wait non_kernel kernel_share dispatch_share reset_share encode_share non_kernel_share dispatch_count cpu_solve metal_cpu_ratio metal_faster frontier_density verified runners variants bitsup effective reset policy selected bucket owner queue handoff local_budget replay_budget dirty_min_degree worklist_rounds worklist_pushes worklist_push_per_round cta_local_rounds cta_pushes cta_cross cta_overflow cta_q_overflow cta_budget_spill cta_seed_overflow host_rounds cta_replay_rounds cta_replay_drain cta_replay_spill bulk_proposed bulk_actual bulk_changed_words bulk_frontier_push bulk_rounds dirty_vars dirty_scans dirty_hits cross_push_avoided dirty_fallback_push owner_map_ms owner_balance owner_weight_balance owner_local owner_cross seed_nonempty seed_empty seed_max_load seed_balance
+shared+flags 360 72 0.445 0.213 1.322 2.431 0.000 0.000 0.000 0.444 0.064 0.000 0.000 0.000 0.14 1.00 0.00 0.00 0.00 1.62 0.020 26.00 0/360 0.868 true prepared flags+scalar+pair pair flags+scalar+pair cpu bh_cta_allowlist 0 BH-4-4 cons=128-511 dom<17 bitw<2 - - - - - - 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 1.62 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.000 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00
+shared+cta_worklist 20 4 3.482 3.414 5.616 5.847 0.002 0.000 0.002 3.480 1.544 0.000 0.000 0.000 0.44 1.00 0.00 0.00 0.00 7.75 0.033 103.28 0/20 0.425 true prepared cta_worklist+word_parallel+directional directional cta_worklist+word_parallel+directional cpu bh_cta_allowlist 20 BH-4-4 cons=128-511 dom<17 bitw<2 vebo_weighted bounded_replay dirty_var_pull 16 8 8 7.75 985.85 127.21 227.25 473.50 18.00 0.00 0.00 0.00 0.00 7.75 2.00 1.00 0.00 0.00 0.00 0.00 0.00 0.00 52.30 1347.75 967.85 1810.10 18.00 0.059 1.26 1.25 473.50 18.00 151.25 96.75 17.00 11.64
+
+[metal vs cpu]
+ratio < 1.0 means Metal is faster than CPU for GAC solve time.
+shared+flags rows=360 instances=72 metal_faster=0/360 ratio_avg=234.10x ratio_p50=26.00x ratio_p95=455.23x ratio_p99=5296.53x metal_p50=0.213 cpu_p50=0.007708
+  worst 14899.80x input=tests/data/bench/test.xml metal_ms=1.252 cpu_ms=0.000084 path=shared+flags+scalar+pair+cpu+modulo+local_only+push_constraints+8+0+0->flags+scalar+pair
+  worst 13641.37x input=tests/data/bench/test.xml metal_ms=1.146 cpu_ms=0.000084 path=shared+flags+scalar+pair+cpu+modulo+local_only+push_constraints+8+0+0->flags+scalar+pair
+  worst 12279.79x input=tests/data/bench/test.xml metal_ms=0.516 cpu_ms=0.000042 path=shared+flags+scalar+pair+cpu+modulo+local_only+push_constraints+8+0+0->flags+scalar+pair
+  worst 9828.66x input=tests/data/bench/test.xml metal_ms=1.229 cpu_ms=0.000125 path=shared+flags+scalar+pair+cpu+modulo+local_only+push_constraints+8+0+0->flags+scalar+pair
+  worst 2147.08x input=tests/data/bench/queens-4_ext.xml metal_ms=0.178 cpu_ms=0.000083 path=shared+flags+scalar+pair+cpu+modulo+local_only+push_constraints+8+0+0->flags+scalar+pair
+shared+cta_worklist rows=20 instances=4 metal_faster=0/20 ratio_avg=104.27x ratio_p50=103.28x ratio_p95=167.39x ratio_p99=176.63x metal_p50=3.414 cpu_p50=0.032917
+  worst 178.93x input=benchmarks/BH-4-4/BlackHole-4-4-e-2_ext.xml metal_ms=5.905 cpu_ms=0.033000 path=shared+cta_worklist+word_parallel+directional+cpu+vebo_weighted+bounded_replay+dirty_var_pull+16+8+8->cta_worklist+word_parallel+directional
+  worst 166.79x input=benchmarks/BH-4-4/BlackHole-4-4-e-0_ext.xml metal_ms=5.601 cpu_ms=0.033583 path=shared+cta_worklist+word_parallel+directional+cpu+vebo_weighted+bounded_replay+dirty_var_pull+16+8+8->cta_worklist+word_parallel+directional
+  worst 154.32x input=benchmarks/BH-4-4/BlackHole-4-4-e-3_ext.xml metal_ms=4.958 cpu_ms=0.032125 path=shared+cta_worklist+word_parallel+directional+cpu+vebo_weighted+bounded_replay+dirty_var_pull+16+8+8->cta_worklist+word_parallel+directional
+  worst 150.29x input=benchmarks/BH-4-4/BlackHole-4-4-e-1_ext.xml metal_ms=5.016 cpu_ms=0.033375 path=shared+cta_worklist+word_parallel+directional+cpu+vebo_weighted+bounded_replay+dirty_var_pull+16+8+8->cta_worklist+word_parallel+directional
+  worst 146.50x input=benchmarks/BH-4-4/BlackHole-4-4-e-3_ext.xml metal_ms=4.731 cpu_ms=0.032292 path=shared+cta_worklist+word_parallel+directional+cpu+vebo_weighted+bounded_replay+dirty_var_pull+16+8+8->cta_worklist+word_parallel+directional
+
+[runtime policy summary]
+rows=380 policies=bh_cta_allowlist=380
+selected_rows=20 selected_inputs=4 not_selected_rows=360 reasons=family_mismatch=360, bh_cta_allowlist_match=20
+selected_buckets BH-4-4 cons=128-511 dom<17 bitw<2=20
+
+[recommended policy summary]
+best_mode_counts shared+flags=72, shared+cta_worklist=4
+[recommended buckets]
+  family=tests/data/bench/rand-2-23 cons=128-511 dom=17-32 bitw=<2 density=>=0.50: recommend=shared+flags shared+flags=10
+  family=tightness0.1 cons=>511 dom=<17 bitw=<2 density=>=0.50: recommend=shared+flags shared+flags=7
+  family=tightness0.5 cons=128-511 dom=17-32 bitw=<2 density=>=0.50: recommend=shared+flags shared+flags=6
+  family=composed-25-1-2 cons=128-511 dom=<17 bitw=<2 density=0.10-0.50: recommend=shared+flags shared+flags=5
+  family=tightness0.2 cons=128-511 dom=<17 bitw=<2 density=>=0.50: recommend=shared+flags shared+flags=5
+  family=tightness0.35 cons=128-511 dom=<17 bitw=<2 density=>=0.50: recommend=shared+flags shared+flags=5
+  family=tightness0.8 cons=<128 dom=>32 bitw=2-3 density=>=0.50: recommend=shared+flags shared+flags=5
+  family=tightness0.9 cons=<128 dom=>32 bitw=>3 density=>=0.50: recommend=shared+flags shared+flags=5
+  family=BH-4-4 cons=128-511 dom=<17 bitw=<2 density=0.10-0.50: recommend=shared+cta_worklist shared+cta_worklist=4
+  family=composed-25-1-2 cons=128-511 dom=<17 bitw=<2 density=>=0.50: recommend=shared+flags shared+flags=4
+
+[family summary]
+  driver: rows=25 avg=1.554 p95=3.507
+  tests/data/bench/test.xml: rows=5 avg=0.945 p95=1.247
+  langford: rows=20 avg=0.771 p95=1.516
+  graphs: rows=15 avg=0.747 p95=1.642
+  composed-25-1-2: rows=45 avg=0.584 p95=1.157
+  composed-25-10-20: rows=5 avg=0.504 p95=0.873
+  tightness0.1: rows=35 avg=0.398 p95=0.788
+  tests/data/bench/rand-2-23: rows=50 avg=0.263 p95=0.769
+  rand-2-24: rows=15 avg=0.232 p95=0.407
+  tightness0.35: rows=25 avg=0.232 p95=0.581
+
+[slowest]
+3.836ms shared+cta_worklist benchmarks/BH-4-4/BlackHole-4-4-e-2_ext.xml vars=64 cons=432 maxdom=16 bitw=1 iters=8 del=290 inc=false
+3.796ms shared+cta_worklist benchmarks/BH-4-4/BlackHole-4-4-e-1_ext.xml vars=64 cons=432 maxdom=16 bitw=1 iters=8 del=290 inc=false
+3.312ms shared+cta_worklist benchmarks/BH-4-4/BlackHole-4-4-e-3_ext.xml vars=64 cons=432 maxdom=16 bitw=1 iters=7 del=290 inc=false
+2.983ms shared+cta_worklist benchmarks/BH-4-4/BlackHole-4-4-e-0_ext.xml vars=64 cons=432 maxdom=16 bitw=1 iters=8 del=290 inc=false
+2.573ms shared+flags benchmarks/driver/driverlogw-01c-sat_ext.xml vars=71 cons=217 maxdom=4 bitw=1 iters=7 del=18 inc=false
+2.271ms shared+flags benchmarks/driver/driverlogw-04c-sat_ext.xml vars=272 cons=3876 maxdom=11 bitw=1 iters=6 del=108 inc=false
+1.316ms shared+flags benchmarks/graphs/graphw-07_ext.xml vars=142 cons=1983 maxdom=44 bitw=2 iters=1 del=4977 inc=true
+1.140ms shared+flags benchmarks/composed-25-1-2/composed-25-1-2-1_ext.xml vars=33 cons=224 maxdom=10 bitw=1 iters=5 del=14 inc=false
+1.059ms shared+flags benchmarks/driver/driverlogw-02c-sat_ext.xml vars=301 cons=4055 maxdom=8 bitw=1 iters=4 del=64 inc=false
+0.981ms shared+flags benchmarks/driver/driverlogw-09-sat_ext.xml vars=650 cons=17447 maxdom=12 bitw=1 iters=3 del=162 inc=false
+
+== <combined> ==
+rows=766 ok=760 error=6 timeout=0 missing=0 ok_instances=76 error_instances=3
+solve_ms avg=0.693 p50=0.238 p95=2.720 p99=5.710 max=9.395
+elapsed_ms avg=0.708 p50=0.245 p95=2.762 p99=5.821
+cpu_solve_ms avg=0.021263 p50=0.008126 p95=0.075946 p99=0.366986
+metal_cpu_solve_ratio avg=221.27x p50=29.12x p95=520.53x p99=5942.11x metal_faster=0/760
+verified=true
+
+[metal vs cpu]
+ratio < 1.0 means Metal is faster than CPU for GAC solve time.
+shared+flags rows=740 instances=76 metal_faster=0/740 ratio_avg=224.43x ratio_p50=28.43x ratio_p95=524.36x ratio_p99=6055.50x metal_p50=0.233 cpu_p50=0.007813
+  worst 14899.80x input=tests/data/bench/test.xml metal_ms=1.252 cpu_ms=0.000084 path=shared+flags+scalar+pair+cpu+modulo+local_only+push_constraints+8+0+0->flags+scalar+pair
+  worst 13641.37x input=tests/data/bench/test.xml metal_ms=1.146 cpu_ms=0.000084 path=shared+flags+scalar+pair+cpu+modulo+local_only+push_constraints+8+0+0->flags+scalar+pair
+  worst 12279.79x input=tests/data/bench/test.xml metal_ms=0.516 cpu_ms=0.000042 path=shared+flags+scalar+pair+cpu+modulo+local_only+push_constraints+8+0+0->flags+scalar+pair
+  worst 9828.66x input=tests/data/bench/test.xml metal_ms=1.229 cpu_ms=0.000125 path=shared+flags+scalar+pair+cpu+modulo+local_only+push_constraints+8+0+0->flags+scalar+pair
+  worst 9085.84x input=tests/data/bench/test.xml metal_ms=1.508 cpu_ms=0.000166 path=shared+flags+scalar+pair+cpu->flags+scalar+pair
+shared+cta_worklist rows=20 instances=4 metal_faster=0/20 ratio_avg=104.27x ratio_p50=103.28x ratio_p95=167.39x ratio_p99=176.63x metal_p50=3.414 cpu_p50=0.032917
+  worst 178.93x input=benchmarks/BH-4-4/BlackHole-4-4-e-2_ext.xml metal_ms=5.905 cpu_ms=0.033000 path=shared+cta_worklist+word_parallel+directional+cpu+vebo_weighted+bounded_replay+dirty_var_pull+16+8+8->cta_worklist+word_parallel+directional
+  worst 166.79x input=benchmarks/BH-4-4/BlackHole-4-4-e-0_ext.xml metal_ms=5.601 cpu_ms=0.033583 path=shared+cta_worklist+word_parallel+directional+cpu+vebo_weighted+bounded_replay+dirty_var_pull+16+8+8->cta_worklist+word_parallel+directional
+  worst 154.32x input=benchmarks/BH-4-4/BlackHole-4-4-e-3_ext.xml metal_ms=4.958 cpu_ms=0.032125 path=shared+cta_worklist+word_parallel+directional+cpu+vebo_weighted+bounded_replay+dirty_var_pull+16+8+8->cta_worklist+word_parallel+directional
+  worst 150.29x input=benchmarks/BH-4-4/BlackHole-4-4-e-1_ext.xml metal_ms=5.016 cpu_ms=0.033375 path=shared+cta_worklist+word_parallel+directional+cpu+vebo_weighted+bounded_replay+dirty_var_pull+16+8+8->cta_worklist+word_parallel+directional
+  worst 146.50x input=benchmarks/BH-4-4/BlackHole-4-4-e-3_ext.xml metal_ms=4.731 cpu_ms=0.032292 path=shared+cta_worklist+word_parallel+directional+cpu+vebo_weighted+bounded_replay+dirty_var_pull+16+8+8->cta_worklist+word_parallel+directional
+
+[cta worklist gate owner_mode=vebo_weighted queue_mode=bounded_replay handoff_mode=dirty_var_pull local_budget=16 replay_budget=8 dirty_min_degree=8]
+cta_vs_shared+flags compared=4 p50=0.62x p95=0.68x p99=0.69x pass_p95=true
+dirty_pull_stats dirty_vars_p50=53.00 scan_p50=1360.00 hit_p50=981.00 cross_push_avoided_p50=1795.00 fallback_push_p50=18.00
+host_round_ratio_vs_baseline p50=0.24x p95=0.24x reduced_p50=true
+cta_stats overflow_p95=0.00 overflow_max=0.00 overflow_rows_gt0=0 queue_overflow_p95=0.00 seed_overflow_p95=0.00 budget_spill_p95=0.00 queue_overflow_rows_gt0=0 seed_overflow_rows_gt0=0 queue_push_p50=476.00 cross_push_p50=18.00
+seed_stats nonempty_avg=151.25 empty_avg=96.75 max_load_p95=17.00 balance_p95_avg=11.64
+replay_stats rounds_p50=2.00 drain_p95=1.00 spill_p95=0.00
+owner_stats map_build_ms_avg=0.059 balance_p95_avg=1.26 weight_balance_p95_avg=1.25 owner_local_p50=476.00 owner_cross_p50=18.00
+metal_cpu_ratio cta_p50=103.28x cta_p95=167.39x baseline_p50=160.08x baseline_p95=203.48x improved=true
+decision=report_only reason=worklist_p95_regression
+
+[runtime policy summary]
+rows=380 policies=bh_cta_allowlist=380
+selected_rows=20 selected_inputs=4 not_selected_rows=360 reasons=family_mismatch=360, bh_cta_allowlist_match=20
+selected_buckets BH-4-4 cons=128-511 dom<17 bitw<2=20
+selected_vs_shared+flags compared=4 p50=0.62x p95=0.68x better=4/4 regressions_gt_threshold=0
+decision=eligible reason=none
+
+[recommended policy summary]
+best_mode_counts shared+flags=72, shared+cta_worklist=4
+[recommended buckets]
+  family=tests/data/bench/rand-2-23 cons=128-511 dom=17-32 bitw=<2 density=>=0.50: recommend=shared+flags shared+flags=10
+  family=tightness0.1 cons=>511 dom=<17 bitw=<2 density=>=0.50: recommend=shared+flags shared+flags=7
+  family=tightness0.5 cons=128-511 dom=17-32 bitw=<2 density=>=0.50: recommend=shared+flags shared+flags=6
+  family=composed-25-1-2 cons=128-511 dom=<17 bitw=<2 density=0.10-0.50: recommend=shared+flags shared+flags=5
+  family=tightness0.2 cons=128-511 dom=<17 bitw=<2 density=>=0.50: recommend=shared+flags shared+flags=5
+  family=tightness0.35 cons=128-511 dom=<17 bitw=<2 density=>=0.50: recommend=shared+flags shared+flags=5
+  family=tightness0.8 cons=<128 dom=>32 bitw=2-3 density=>=0.50: recommend=shared+flags shared+flags=5
+  family=tightness0.9 cons=<128 dom=>32 bitw=>3 density=>=0.50: recommend=shared+flags shared+flags=5
+  family=BH-4-4 cons=128-511 dom=<17 bitw=<2 density=0.10-0.50: recommend=shared+cta_worklist shared+cta_worklist=4
+  family=composed-25-1-2 cons=128-511 dom=<17 bitw=<2 density=>=0.50: recommend=shared+flags shared+flags=4

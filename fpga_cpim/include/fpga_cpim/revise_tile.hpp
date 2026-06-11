@@ -25,6 +25,10 @@ struct ReviseOutput {
   bool dwo = false;
   bool overflow = false;
   uint64_t support_words_touched = 0;
+  uint64_t support_latency_cycles = 0;
+  uint64_t support_bank_conflicts = 0;
+  uint64_t support_max_bank_accesses = 0;
+  std::vector<uint64_t> support_bank_accesses;
 };
 
 class ReviseTile {

@@ -70,6 +70,9 @@ UNKNOWN must never remove a value.
 
 - queue occupancy p50/p95/max。
 - fanout p50/p95/max。
+- support oracle latency cycles。
+- support oracle bank conflicts。
+- support oracle max bank accesses。
 - greedy variable partition。
 - local/cross partition event ratio。
 - high-degree hub count。
@@ -84,7 +87,23 @@ fpga_cpim/scripts/run_phase_b_sweep.py \
   --vars 32 \
   --domain 32 \
   --graphs chain,grid,random,hub \
-  --partitions 4
+  --partitions 4 \
+  --support-banks 4
+```
+
+大一点的 bank 压力 sweep：
+
+```bash
+fpga_cpim/scripts/run_phase_b_sweep.py \
+  --binary build/fpga_cpim/fpga_cpim_sim \
+  --graphs chain,grid,random,hub \
+  --seeds 1 \
+  --vars 128 \
+  --domains 64,128 \
+  --density 0.05 \
+  --support-banks 2 \
+  --support-base-latency 1 \
+  --support-conflict-penalty 3
 ```
 
 ## 和 SAT-FPGA BCP 的关系

@@ -22,6 +22,12 @@ struct ReviseTileConfig {
   uint32_t max_words_per_revise = 1u << 24;
 };
 
+struct SupportOracleConfig {
+  uint32_t num_banks = 4;
+  uint32_t base_latency_cycles = 1;
+  uint32_t conflict_penalty_cycles = 1;
+};
+
 }  // namespace fpga_cpim
 
 #endif  // FPGA_CPIM_SIM_CONFIG_HPP_

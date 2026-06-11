@@ -26,6 +26,7 @@ struct EngineConfig {
   uint32_t nsac_radius = 0;
   RouterConfig router;
   ReviseTileConfig revise_tile;
+  SupportOracleConfig support_oracle;
 };
 
 class PropagationEngine {

@@ -1,5 +1,6 @@
 #include "fpga_cpim/revise_tile.hpp"
 
+#include <algorithm>
 #include <cassert>
 
 namespace fpga_cpim {
@@ -33,6 +34,7 @@ ReviseOutput ReviseTile::ProcessDirection(
   out.world = ev.world;
   out.target_var = target_var;
   out.delete_mask = DomainMask(target_size);
+  out.support_bank_accesses.assign(oracle_.BankCount(), 0);
 
   uint32_t values_seen = 0;
   uint64_t words_seen = 0;
@@ -49,6 +51,16 @@ ReviseOutput ReviseTile::ProcessDirection(
         SupportQuery{ev.cid, dir_bit, value, ev.world}, world_domains);
     words_seen += support.words_touched;
     out.support_words_touched += support.words_touched;
+    out.support_latency_cycles += support.latency_cycles;
+    out.support_bank_conflicts += support.bank_conflicts;
+    if (out.support_bank_accesses.size() < support.bank_accesses.size()) {
+      out.support_bank_accesses.resize(support.bank_accesses.size(), 0);
+    }
+    for (uint32_t bank = 0; bank < support.bank_accesses.size(); ++bank) {
+      out.support_bank_accesses[bank] += support.bank_accesses[bank];
+      out.support_max_bank_accesses =
+          std::max(out.support_max_bank_accesses, out.support_bank_accesses[bank]);
+    }
     if (words_seen > cfg_.max_words_per_revise) {
       out.overflow = true;
       return out;

@@ -33,6 +33,9 @@ struct WorldResult {
   uint64_t revise_calls = 0;
   uint64_t events = 0;
   uint64_t support_words_touched = 0;
+  uint64_t support_latency_cycles = 0;
+  uint64_t support_bank_conflicts = 0;
+  uint64_t support_max_bank_accesses = 0;
   uint64_t epochs = 0;
   uint64_t deleted_values = 0;
   double queue_occupancy_p50 = 0.0;

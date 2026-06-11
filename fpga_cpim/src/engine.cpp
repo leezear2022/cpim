@@ -50,7 +50,7 @@ WorldResult PropagationEngine::RunAC(
     return result;
   }
 
-  SupportOracle oracle(model_);
+  SupportOracle oracle(model_, cfg_.support_oracle);
   ReviseTile tile(model_, oracle, cfg_.revise_tile);
   while (!router.Empty()) {
     ++result.epochs;
@@ -83,9 +83,16 @@ WorldResult PropagationEngine::RunAC(
       std::vector<ReviseOutput> outputs = tile.Process(*ev, owner.WorldDomains(0));
       bool overflow = false;
       uint64_t words = 0;
+      uint64_t latency = 0;
+      uint64_t conflicts = 0;
+      uint64_t max_bank_accesses = 0;
       for (const ReviseOutput& output : outputs) {
         overflow = overflow || output.overflow;
         words += output.support_words_touched;
+        latency += output.support_latency_cycles;
+        conflicts += output.support_bank_conflicts;
+        max_bank_accesses =
+            std::max(max_bank_accesses, output.support_max_bank_accesses);
       }
       if (overflow) {
         result.status = WorldStatus::kUNKNOWN;
@@ -93,6 +100,10 @@ WorldResult PropagationEngine::RunAC(
         return result;
       }
       result.support_words_touched += words;
+      result.support_latency_cycles += latency;
+      result.support_bank_conflicts += conflicts;
+      result.support_max_bank_accesses =
+          std::max(result.support_max_bank_accesses, max_bank_accesses);
       if (result.support_words_touched > cfg_.max_support_words_per_probe) {
         result.status = WorldStatus::kUNKNOWN;
         AttachRouterStats(router, &result);
@@ -152,7 +163,7 @@ WorldResult PropagationEngine::RunProbe(
     return result;
   }
 
-  SupportOracle oracle(model_);
+  SupportOracle oracle(model_, cfg_.support_oracle);
   ReviseTile tile(model_, oracle, cfg_.revise_tile);
 
   while (!router.Empty()) {
@@ -192,9 +203,17 @@ WorldResult PropagationEngine::RunProbe(
       std::vector<ReviseOutput> outputs = tile.Process(*ev, owner.WorldDomains(0));
       bool overflow = false;
       uint64_t new_support_words = 0;
+      uint64_t new_support_latency = 0;
+      uint64_t new_support_conflicts = 0;
+      uint64_t new_support_max_bank_accesses = 0;
       for (const ReviseOutput& output : outputs) {
         overflow = overflow || output.overflow;
         new_support_words += output.support_words_touched;
+        new_support_latency += output.support_latency_cycles;
+        new_support_conflicts += output.support_bank_conflicts;
+        new_support_max_bank_accesses =
+            std::max(new_support_max_bank_accesses,
+                     output.support_max_bank_accesses);
       }
       if (overflow) {
         result.status = WorldStatus::kUNKNOWN;
@@ -202,6 +221,11 @@ WorldResult PropagationEngine::RunProbe(
         return result;
       }
       result.support_words_touched += new_support_words;
+      result.support_latency_cycles += new_support_latency;
+      result.support_bank_conflicts += new_support_conflicts;
+      result.support_max_bank_accesses =
+          std::max(result.support_max_bank_accesses,
+                   new_support_max_bank_accesses);
       if (result.support_words_touched > cfg_.max_support_words_per_probe) {
         result.status = WorldStatus::kUNKNOWN;
         AttachRouterStats(router, &result);

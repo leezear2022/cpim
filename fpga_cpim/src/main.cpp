@@ -29,6 +29,7 @@ struct CliOptions {
   uint64_t max_support_words = 1000000;
   uint32_t nsac_radius = 1;
   PartitionConfig partition;
+  SupportOracleConfig support_oracle;
   std::string json_path;
 };
 
@@ -80,6 +81,18 @@ CliOptions ParseArgs(int argc, char** argv) {
     } else if (arg == "--max-support-words" ||
                arg.rfind("--max-support-words=", 0) == 0) {
       opt.max_support_words = std::stoull(GetArgValue(argc, argv, &i));
+    } else if (arg == "--support-banks" ||
+               arg.rfind("--support-banks=", 0) == 0) {
+      opt.support_oracle.num_banks =
+          static_cast<uint32_t>(std::stoul(GetArgValue(argc, argv, &i)));
+    } else if (arg == "--support-base-latency" ||
+               arg.rfind("--support-base-latency=", 0) == 0) {
+      opt.support_oracle.base_latency_cycles =
+          static_cast<uint32_t>(std::stoul(GetArgValue(argc, argv, &i)));
+    } else if (arg == "--support-conflict-penalty" ||
+               arg.rfind("--support-conflict-penalty=", 0) == 0) {
+      opt.support_oracle.conflict_penalty_cycles =
+          static_cast<uint32_t>(std::stoul(GetArgValue(argc, argv, &i)));
     } else if (arg == "--nsac-radius" || arg.rfind("--nsac-radius=", 0) == 0) {
       opt.nsac_radius = static_cast<uint32_t>(std::stoul(GetArgValue(argc, argv, &i)));
     } else if (arg == "--partitions" || arg.rfind("--partitions=", 0) == 0) {
@@ -98,9 +111,13 @@ CliOptions ParseArgs(int argc, char** argv) {
     } else if (arg == "--help") {
       std::cout
           << "fpga_cpim_sim --instance synthetic --vars 32 --domain 32 "
-          << "--density 0.2 --mode ac|sacq|qsac|nsacq --worlds 4 --json out.json\n";
+          << "--density 0.2 --mode ac|sacq|qsac|nsacq --worlds 4 "
+          << "--partitions 4 --support-banks 4 --json out.json\n";
       std::exit(0);
     }
+  }
+  if (opt.support_oracle.num_banks == 0) {
+    opt.support_oracle.num_banks = 1;
   }
   if (opt.instance.rfind("synthetic:", 0) == 0) {
     opt.synthetic.graph = opt.instance.substr(std::string("synthetic:").size());
@@ -197,6 +214,9 @@ void WriteJson(const CliOptions& opt, const Model& model,
   uint64_t events = 0;
   uint64_t revise = 0;
   uint64_t support_words = 0;
+  uint64_t support_latency = 0;
+  uint64_t support_bank_conflicts = 0;
+  uint64_t support_max_bank_accesses = 0;
   uint64_t deleted = 0;
   uint64_t router_enqueued = 0;
   uint64_t router_deduped = 0;
@@ -211,6 +231,10 @@ void WriteJson(const CliOptions& opt, const Model& model,
     events += result.events;
     revise += result.revise_calls;
     support_words += result.support_words_touched;
+    support_latency += result.support_latency_cycles;
+    support_bank_conflicts += result.support_bank_conflicts;
+    support_max_bank_accesses =
+        std::max(support_max_bank_accesses, result.support_max_bank_accesses);
     deleted += result.status == WorldStatus::kDWO ? 1 : 0;
     router_enqueued += result.router_events_enqueued;
     router_deduped += result.router_events_deduped;
@@ -227,7 +251,12 @@ void WriteJson(const CliOptions& opt, const Model& model,
       << "\",\"worlds\":" << opt.worlds << ",\"max_events\":"
       << opt.max_events << ",\"max_revise\":" << opt.max_revise
       << ",\"max_epochs\":" << opt.max_epochs
-      << ",\"partitions\":" << opt.partition.num_partitions << "},\n";
+      << ",\"partitions\":" << opt.partition.num_partitions
+      << ",\"support_banks\":" << opt.support_oracle.num_banks
+      << ",\"support_base_latency\":"
+      << opt.support_oracle.base_latency_cycles
+      << ",\"support_conflict_penalty\":"
+      << opt.support_oracle.conflict_penalty_cycles << "},\n";
   *os << "  \"model\": {\"num_vars\":" << model.num_vars
       << ",\"num_constraints\":" << model.num_constraints
       << ",\"max_domain_size\":" << model.max_domain_size
@@ -244,6 +273,9 @@ void WriteJson(const CliOptions& opt, const Model& model,
   *os << "  \"telemetry\": {\"events\":" << events
       << ",\"revise_calls\":" << revise
       << ",\"support_words_touched\":" << support_words
+      << ",\"support_latency_cycles\":" << support_latency
+      << ",\"support_bank_conflicts\":" << support_bank_conflicts
+      << ",\"support_max_bank_accesses\":" << support_max_bank_accesses
       << ",\"epochs_p50\":" << Percentile(epoch_samples, 50)
       << ",\"epochs_p95\":" << Percentile(epoch_samples, 95)
       << ",\"queue_occupancy_p50\":" << PercentileDouble(queue_p50_samples, 50)
@@ -312,6 +344,7 @@ int main(int argc, char** argv) {
     cfg.max_revise_calls_per_probe = opt.max_revise;
     cfg.max_epochs_per_probe = opt.max_epochs;
     cfg.max_support_words_per_probe = opt.max_support_words;
+    cfg.support_oracle = opt.support_oracle;
     PropagationEngine engine(model, cfg);
     WorldResult result = engine.RunAC(base_domains, AllConstraints(model));
     results.push_back(result);
@@ -325,6 +358,7 @@ int main(int argc, char** argv) {
     cfg.max_support_words_per_probe = opt.max_support_words;
     cfg.nsac_enabled = opt.mode == "nsacq";
     cfg.nsac_radius = opt.mode == "nsacq" ? opt.nsac_radius : 0;
+    cfg.support_oracle = opt.support_oracle;
     PropagationEngine engine(model, cfg);
     results = engine.RunProbeBatch(base_domains, AllProbes(model, base_domains));
     for (const WorldResult& result : results) {

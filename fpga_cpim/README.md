@@ -144,6 +144,7 @@ fpga_cpim/scripts/run_phase_b_sweep.py \
 
 HLS-friendly core 已支持：
 
+- 编译时 profile：`stress128`、`z7020_small`、`z7020_probe2`。
 - 输入 `var_partition` / `constraint_partition`。
 - per-partition 环形 event queue。
 - round-robin 多 revise tile 调度。
@@ -225,6 +226,17 @@ z7020_probe2:
   OWNER_TILES=1
   QUEUE_DEPTH=512
 ```
+
+本地 HLS profile smoke 已注册到 `ctest`：
+
+```text
+hls_tb              -> stress128
+hls_tb_z7020_small  -> z7020_small
+hls_tb_z7020_probe2 -> z7020_probe2
+```
+
+`run_hls.tcl` 默认使用 `z7020_small`，可通过环境变量
+`PROFILE=z7020_probe2` 或 `PROFILE=stress128` 切换。
 
 ## 和 SAT-FPGA BCP 的关系
 

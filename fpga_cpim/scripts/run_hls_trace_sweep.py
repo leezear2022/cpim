@@ -24,19 +24,37 @@ def resolve_path(repo_root, path):
     return repo_root / candidate
 
 
-def compile_hls(repo_root, binary, cxx):
+def profile_macro(profile):
+    macros = {
+        "stress128": "FPGA_CPIM_HLS_PROFILE_STRESS128",
+        "z7020_small": "FPGA_CPIM_HLS_PROFILE_Z7020_SMALL",
+        "z7020_probe2": "FPGA_CPIM_HLS_PROFILE_Z7020_PROBE2",
+    }
+    if profile not in macros:
+        raise ValueError(f"unknown profile: {profile}")
+    return macros[profile]
+
+
+def compile_hls(repo_root, binary, cxx, profile):
     hls_dir = repo_root / "fpga_cpim" / "hls"
     sources = sorted(str(path) for path in hls_dir.glob("*.cpp"))
     binary.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [cxx, "-std=c++17", "-I", str(hls_dir)] + sources + ["-o", str(binary)]
+    cmd = [
+        cxx,
+        "-std=c++17",
+        "-I",
+        str(hls_dir),
+        f"-DFPGA_CPIM_HLS_PROFILE={profile_macro(profile)}",
+    ] + sources + ["-o", str(binary)]
     subprocess.run(cmd, cwd=repo_root, check=True)
     return cmd
 
 
-def run_hls(binary, tiles, capacities, fixtures):
+def run_hls(binary, tiles, capacities, fixtures, profile):
     cmd = [
         str(binary),
         "--pressure-only",
+        f"--profile={profile}",
         f"--tiles={tiles}",
         f"--capacity-sweep={capacities}",
         f"--fixtures={fixtures}",
@@ -64,12 +82,13 @@ def write_jsonl(path, rows):
 
 def print_summary(rows):
     print(
-        "kind tiles capacity status events epochs queuePeakTotal "
+        "kind profile tiles capacity status events epochs queuePeakTotal "
         "queuePeakPart semanticMin chosenDepth routerOverflow"
     )
     for row in rows:
         print(
             row["kind"],
+            row["profile"],
             row["tiles"],
             row["capacity"],
             row["status"],
@@ -84,10 +103,20 @@ def print_summary(rows):
 
 
 def print_capacity_threshold(rows):
-    graphs = sorted({row.get("graph", "") for row in rows if row["kind"] == "capacity"})
-    for graph in graphs:
+    keys = sorted(
+        {
+            (row.get("profile", ""), row.get("graph", ""))
+            for row in rows
+            if row["kind"] == "capacity"
+        }
+    )
+    for profile, graph in keys:
         graph_rows = [
-            row for row in rows if row["kind"] == "capacity" and row.get("graph") == graph
+            row
+            for row in rows
+            if row["kind"] == "capacity"
+            and row.get("profile") == profile
+            and row.get("graph") == graph
         ]
         unknown_caps = [
             row["capacity"] for row in graph_rows if row["status"] == "UNKNOWN"
@@ -96,18 +125,21 @@ def print_capacity_threshold(rows):
         if unknown_caps and ok_caps:
             print(
                 "capacity_threshold "
-                f"graph={graph} max_unknown={max(unknown_caps)} min_ok={min(ok_caps)}"
+                f"profile={profile} graph={graph} "
+                f"max_unknown={max(unknown_caps)} min_ok={min(ok_caps)}"
             )
         elif ok_caps:
             print(
                 "capacity_threshold "
-                f"graph={graph} semantic_min<=min_tested_capacity "
+                f"profile={profile} graph={graph} "
+                "semantic_min<=min_tested_capacity "
                 f"min_tested_capacity={min(ok_caps)}"
             )
         elif unknown_caps:
             print(
                 "capacity_threshold "
-                f"graph={graph} all_unknown max_unknown={max(unknown_caps)}"
+                f"profile={profile} graph={graph} "
+                f"all_unknown max_unknown={max(unknown_caps)}"
             )
 
 
@@ -117,26 +149,36 @@ def main():
     )
     parser.add_argument("--repo-root", default=str(default_repo_root()))
     parser.add_argument("--cxx", default=default_cxx())
-    parser.add_argument("--binary", default="build/fpga_cpim/hls_tb_trace")
+    parser.add_argument(
+        "--binary",
+        default=None,
+        help="compiled testbench path; defaults to a profile-specific path",
+    )
     parser.add_argument("--tiles", default="1,2,4")
     parser.add_argument("--capacity-sweep", default="272,273,274,320,384")
     parser.add_argument("--fixtures", default="chain,random,hub")
+    parser.add_argument(
+        "--profile",
+        choices=["stress128", "z7020_small", "z7020_probe2"],
+        default="stress128",
+    )
     parser.add_argument("--jsonl", default="build/fpga_cpim/hls_trace_sweep.jsonl")
     parser.add_argument("--raw", default="build/fpga_cpim/hls_trace_sweep.out")
     parser.add_argument("--no-build", action="store_true")
     args = parser.parse_args()
 
     repo_root = Path(args.repo_root).resolve()
-    binary = resolve_path(repo_root, args.binary)
+    binary_name = args.binary or f"build/fpga_cpim/hls_tb_trace_{args.profile}"
+    binary = resolve_path(repo_root, binary_name)
     jsonl = resolve_path(repo_root, args.jsonl)
     raw = resolve_path(repo_root, args.raw)
 
     if not args.no_build:
-        compile_cmd = compile_hls(repo_root, binary, args.cxx)
+        compile_cmd = compile_hls(repo_root, binary, args.cxx, args.profile)
         print("compile:", " ".join(compile_cmd))
 
     run_cmd, stdout, stderr = run_hls(
-        binary, args.tiles, args.capacity_sweep, args.fixtures
+        binary, args.tiles, args.capacity_sweep, args.fixtures, args.profile
     )
     print("run:", " ".join(run_cmd))
     if stderr:

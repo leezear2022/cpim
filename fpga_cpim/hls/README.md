@@ -21,9 +21,60 @@ g++ -std=c++17 -I fpga_cpim/hls fpga_cpim/hls/testbench_hls.cpp fpga_cpim/hls/*.
 
 - core 文件不使用 STL 容器。
 - 固定最大参数。
+- HLS 数组大小由编译时 profile 固定，不靠运行时参数改变资源规模。
 - 静态数组。
 - 溢出或预算命中返回 `UNKNOWN`。
 - Phase C.2 支持多 revise tile 调度和 per-partition event queue。
+
+## Compile-time Profiles
+
+`cpim_hls_types.hpp` 支持三个编译时 profile：
+
+```text
+stress128:
+  MAX_VARS=256
+  MAX_CONSTRAINTS=1024
+  MAX_DOMAIN=128
+  MAX_WORDS=4
+  MAX_WORLDS=4
+  MAX_PARTITION_QUEUE=1024
+  MAX_REVISE_TILES=4
+
+z7020_small:
+  MAX_VARS=128
+  MAX_CONSTRAINTS=512
+  MAX_DOMAIN=32
+  MAX_WORDS=1
+  MAX_WORLDS=1
+  MAX_PARTITION_QUEUE=512
+  MAX_REVISE_TILES=1
+
+z7020_probe2:
+  MAX_VARS=128
+  MAX_CONSTRAINTS=256
+  MAX_DOMAIN=32
+  MAX_WORDS=1
+  MAX_WORLDS=2
+  MAX_PARTITION_QUEUE=512
+  MAX_REVISE_TILES=1
+```
+
+本地编译示例：
+
+```bash
+g++ -std=c++17 -I fpga_cpim/hls \
+  -DFPGA_CPIM_HLS_PROFILE=FPGA_CPIM_HLS_PROFILE_Z7020_SMALL \
+  fpga_cpim/hls/testbench_hls.cpp fpga_cpim/hls/*.cpp \
+  -o hls_tb_z7020_small
+./hls_tb_z7020_small --profile=z7020_small --tiles=1 \
+  --capacity-sweep=512 --fixtures=chain,random,hub
+```
+
+CMake 回归会同时构建并运行：
+
+- `hls_tb`：默认 `stress128`。
+- `hls_tb_z7020_small`。
+- `hls_tb_z7020_probe2`。
 
 ## Phase C.2 接口
 
@@ -86,6 +137,15 @@ fpga_cpim/scripts/run_hls_trace_sweep.py \
   --capacity-sweep=272,273,274,320,384
 ```
 
+指定 7Z020 小 profile：
+
+```bash
+fpga_cpim/scripts/run_hls_trace_sweep.py \
+  --profile=z7020_small \
+  --tiles=1 \
+  --capacity-sweep=256,384,512
+```
+
 当前 `random/vars=128/domain=128/density=0.10` fixture 下，
 per-partition queue capacity 门槛为 `273`：`272` overflow 返回
 `UNKNOWN`，`273` 起恢复 `OK`。
@@ -118,6 +178,13 @@ python3 fpga_cpim/hls/parse_hls_reports.py \
 `run_hls.tcl` 默认跑 `z7020_small` / `xc7z020clg400-1`，执行
 `csim_design` 和 `csynth_design`。设置 `RUN_COSIM=1` 时追加
 `cosim_design`。
+
+切换 profile：
+
+```bash
+PROFILE=z7020_probe2 vitis_hls -f fpga_cpim/hls/run_hls.tcl
+PROFILE=stress128 vitis_hls -f fpga_cpim/hls/run_hls.tcl
+```
 
 无 Vitis 环境时，parser 仍输出稳定 JSON，并把 `tool_status` /
 `csynth` 标记为 `tool_missing`，不阻塞 C++ simulator 和本地 `g++`

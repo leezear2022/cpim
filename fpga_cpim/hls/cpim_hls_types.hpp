@@ -5,6 +5,39 @@
 
 namespace fpga_cpim_hls {
 
+#define FPGA_CPIM_HLS_PROFILE_STRESS128 0
+#define FPGA_CPIM_HLS_PROFILE_Z7020_SMALL 1
+#define FPGA_CPIM_HLS_PROFILE_Z7020_PROBE2 2
+
+#ifndef FPGA_CPIM_HLS_PROFILE
+#define FPGA_CPIM_HLS_PROFILE FPGA_CPIM_HLS_PROFILE_STRESS128
+#endif
+
+#if FPGA_CPIM_HLS_PROFILE == FPGA_CPIM_HLS_PROFILE_Z7020_SMALL
+constexpr int MAX_VARS = 128;
+constexpr int MAX_CONSTRAINTS = 512;
+constexpr int MAX_DOMAIN = 32;
+constexpr int MAX_WORDS = 1;
+constexpr int MAX_WORLDS = 1;
+constexpr int MAX_QUEUE = 1024;
+constexpr int MAX_PARTITIONS = 4;
+constexpr int MAX_PARTITION_QUEUE = 512;
+constexpr int MAX_REVISE_TILES = 1;
+constexpr const char* HLS_PROFILE_NAME = "z7020_small";
+constexpr bool HLS_PROFILE_IS_STRESS128 = false;
+#elif FPGA_CPIM_HLS_PROFILE == FPGA_CPIM_HLS_PROFILE_Z7020_PROBE2
+constexpr int MAX_VARS = 128;
+constexpr int MAX_CONSTRAINTS = 256;
+constexpr int MAX_DOMAIN = 32;
+constexpr int MAX_WORDS = 1;
+constexpr int MAX_WORLDS = 2;
+constexpr int MAX_QUEUE = 1024;
+constexpr int MAX_PARTITIONS = 4;
+constexpr int MAX_PARTITION_QUEUE = 512;
+constexpr int MAX_REVISE_TILES = 1;
+constexpr const char* HLS_PROFILE_NAME = "z7020_probe2";
+constexpr bool HLS_PROFILE_IS_STRESS128 = false;
+#elif FPGA_CPIM_HLS_PROFILE == FPGA_CPIM_HLS_PROFILE_STRESS128
 constexpr int MAX_VARS = 256;
 constexpr int MAX_CONSTRAINTS = 1024;
 constexpr int MAX_DOMAIN = 128;
@@ -14,6 +47,11 @@ constexpr int MAX_QUEUE = 4096;
 constexpr int MAX_PARTITIONS = 8;
 constexpr int MAX_PARTITION_QUEUE = 1024;
 constexpr int MAX_REVISE_TILES = 4;
+constexpr const char* HLS_PROFILE_NAME = "stress128";
+constexpr bool HLS_PROFILE_IS_STRESS128 = true;
+#else
+#error "Unsupported FPGA_CPIM_HLS_PROFILE"
+#endif
 
 using word_t = uint32_t;
 

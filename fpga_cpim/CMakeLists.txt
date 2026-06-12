@@ -72,14 +72,36 @@ if(BUILD_TESTING)
   add_fpga_cpim_test(test_partition)
   add_fpga_cpim_test(test_node_command)
 
-  add_executable(hls_tb
+  set(FPGA_CPIM_HLS_SOURCES
     hls/testbench_hls.cpp
     hls/cpim_top_hls.cpp
     hls/event_router_hls.cpp
     hls/revise_tile_hls.cpp
     hls/variable_owner_hls.cpp
   )
-  target_include_directories(hls_tb PRIVATE hls)
-  target_compile_options(hls_tb PRIVATE -Wall -Wextra -Wpedantic)
+
+  function(add_hls_tb_profile name profile_macro)
+    add_executable(${name} ${FPGA_CPIM_HLS_SOURCES})
+    target_include_directories(${name} PRIVATE hls)
+    target_compile_definitions(${name} PRIVATE
+      FPGA_CPIM_HLS_PROFILE=${profile_macro})
+    target_compile_options(${name} PRIVATE -Wall -Wextra -Wpedantic)
+  endfunction()
+
+  add_hls_tb_profile(hls_tb FPGA_CPIM_HLS_PROFILE_STRESS128)
   add_test(NAME hls_tb COMMAND hls_tb)
+
+  add_hls_tb_profile(hls_tb_z7020_small
+                     FPGA_CPIM_HLS_PROFILE_Z7020_SMALL)
+  add_test(NAME hls_tb_z7020_small
+           COMMAND hls_tb_z7020_small --profile=z7020_small
+                   --tiles=1 --capacity-sweep=512
+                   --fixtures=chain,random,hub)
+
+  add_hls_tb_profile(hls_tb_z7020_probe2
+                     FPGA_CPIM_HLS_PROFILE_Z7020_PROBE2)
+  add_test(NAME hls_tb_z7020_probe2
+           COMMAND hls_tb_z7020_probe2 --profile=z7020_probe2
+                   --tiles=1 --capacity-sweep=512
+                   --fixtures=chain,random,hub)
 endif()

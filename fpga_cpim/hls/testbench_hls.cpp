@@ -12,9 +12,9 @@ namespace {
 
 constexpr std::size_t kBitSupWords =
     MAX_CONSTRAINTS * MAX_DOMAIN * MAX_WORDS * 2;
-constexpr uint16_t kPressureVars = 128;
-constexpr uint16_t kPressureDomain = 128;
-constexpr uint16_t kPressurePartitions = 4;
+constexpr uint16_t kPressureVars = MAX_VARS >= 128 ? 128 : MAX_VARS;
+constexpr uint16_t kPressureDomain = MAX_DOMAIN >= 128 ? 128 : MAX_DOMAIN;
+constexpr uint16_t kPressurePartitions = MAX_PARTITIONS >= 4 ? 4 : MAX_PARTITIONS;
 constexpr uint16_t kMaxCliValues = 16;
 
 enum FixtureKind {
@@ -26,7 +26,8 @@ enum FixtureKind {
 struct TestbenchOptions {
   bool pressure_only = false;
   bool show_help = false;
-  bool expect_capacity_threshold = true;
+  bool expect_capacity_threshold = HLS_PROFILE_IS_STRESS128;
+  const char* expected_profile = nullptr;
   uint16_t tiles[kMaxCliValues] = {1, 2, 4};
   uint16_t tile_count = 3;
   uint16_t capacities[kMaxCliValues] = {64, 128, 256, 512, 1024};
@@ -118,6 +119,10 @@ bool starts_with(const char* text, const char* prefix) {
   return std::strncmp(text, prefix, std::strlen(prefix)) == 0;
 }
 
+bool profile_matches(const char* expected) {
+  return expected == nullptr || std::strcmp(expected, HLS_PROFILE_NAME) == 0;
+}
+
 uint16_t parse_u16(const char* text) {
   const unsigned long value = std::strtoul(text, nullptr, 10);
   if (value > 65535ul) {
@@ -198,6 +203,10 @@ TestbenchOptions parse_args(int argc, char** argv) {
       opt.pressure_only = true;
     } else if (std::strcmp(arg, "--help") == 0) {
       opt.show_help = true;
+    } else if (starts_with(arg, "--profile=")) {
+      opt.expected_profile = arg + std::strlen("--profile=");
+    } else if (std::strcmp(arg, "--profile") == 0 && i + 1 < argc) {
+      opt.expected_profile = argv[++i];
     } else if (starts_with(arg, "--tiles=")) {
       opt.tile_count = parse_u16_list(arg + std::strlen("--tiles="), opt.tiles);
     } else if (std::strcmp(arg, "--tiles") == 0 && i + 1 < argc) {
@@ -234,7 +243,8 @@ void print_help() {
   std::cout
       << "hls_tb [--pressure-only] [--tiles=1,2,4] "
       << "[--capacity-sweep=64,128,256,512,1024|none] "
-      << "[--fixtures=chain,random,hub]\n";
+      << "[--fixtures=chain,random,hub] "
+      << "[--profile=" << HLS_PROFILE_NAME << "]\n";
 }
 
 void run_equality_ok() {
@@ -348,7 +358,11 @@ void run_multi_tile_partition_smoke() {
 
   assert(results[0].status == OK);
   assert(results[0].events >= 3);
-  assert(results[0].epochs < results[0].events);
+  if (MAX_REVISE_TILES > 1) {
+    assert(results[0].epochs < results[0].events);
+  } else {
+    assert(results[0].epochs <= results[0].events);
+  }
   assert(results[0].cross_events >= 3);
   assert(results[0].queue_peak_total >= 3);
   assert(results[0].queue_peak_partition == 1);
@@ -492,6 +506,7 @@ void print_trace_row(const char* prefix, FixtureKind fixture,
                      uint16_t queue_capacity, uint16_t constraints,
                      const ResultHls& result) {
   std::cout << prefix
+            << " profile=" << HLS_PROFILE_NAME
             << " graph=" << fixture_name(fixture)
             << " vars=" << kPressureVars
             << " domain=" << kPressureDomain
@@ -535,8 +550,12 @@ void run_density_010_pressure_smoke(const TestbenchOptions& opt) {
                       constraints, result);
 
       if (fixture == kFixtureRandom) {
-        assert(constraints >= 750);
-        assert(constraints <= 850);
+        if (HLS_PROFILE_IS_STRESS128) {
+          assert(constraints >= 750);
+          assert(constraints <= 850);
+        } else {
+          assert(constraints == MAX_CONSTRAINTS);
+        }
       } else {
         assert(constraints == 127);
       }
@@ -587,8 +606,12 @@ void run_capacity_sweep(const TestbenchOptions& opt) {
       print_trace_row("hls_capacity", fixture, revise_tiles, opt.capacities[i],
                       constraints, result);
       if (fixture == kFixtureRandom) {
-        assert(constraints >= 750);
-        assert(constraints <= 850);
+        if (HLS_PROFILE_IS_STRESS128) {
+          assert(constraints >= 750);
+          assert(constraints <= 850);
+        } else {
+          assert(constraints == MAX_CONSTRAINTS);
+        }
       } else {
         assert(constraints == 127);
       }
@@ -618,6 +641,11 @@ int main(int argc, char** argv) {
   if (opt.show_help) {
     print_help();
     return 0;
+  }
+  if (!profile_matches(opt.expected_profile)) {
+    std::cerr << "profile mismatch: binary=" << HLS_PROFILE_NAME
+              << " requested=" << opt.expected_profile << "\n";
+    return 2;
   }
   if (!opt.pressure_only) {
     run_equality_ok();

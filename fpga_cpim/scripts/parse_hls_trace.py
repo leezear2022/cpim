@@ -8,6 +8,7 @@ import sys
 
 FIELDS = [
     "kind",
+    "profile",
     "graph",
     "vars",
     "domain",
@@ -97,6 +98,7 @@ def next_power_of_two(value):
 
 def fixture_key(row):
     return (
+        row.get("profile", ""),
         row.get("graph", ""),
         row.get("vars", 0),
         row.get("domain", 0),

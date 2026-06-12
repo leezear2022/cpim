@@ -2,6 +2,7 @@
 
 PROFILES = {
     "z7020_small": {
+        "HLS_PROFILE_MACRO": "FPGA_CPIM_HLS_PROFILE_Z7020_SMALL",
         "MAX_VARS": 128,
         "MAX_CONSTRAINTS": 512,
         "MAX_DOMAIN": 32,
@@ -12,6 +13,7 @@ PROFILES = {
         "QUEUE_DEPTH": 512,
     },
     "z7020_probe2": {
+        "HLS_PROFILE_MACRO": "FPGA_CPIM_HLS_PROFILE_Z7020_PROBE2",
         "MAX_VARS": 128,
         "MAX_CONSTRAINTS": 256,
         "MAX_DOMAIN": 32,

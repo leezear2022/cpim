@@ -2,6 +2,42 @@
 
 ## 2026-06-12
 
+### FPGA CPIM：P6 HLS 编译时 profile / z7020_small smoke
+
+**目标**：把 `z7020_small` 从文档 sizing profile 落成 HLS 编译时数组上限，
+避免用 `domain=128` stress fixture 的资源规模指导 7Z020 第一版。
+
+**核心改动**：
+- `cpim_hls_types.hpp` 新增 `FPGA_CPIM_HLS_PROFILE_*` 编译时 profile：
+  `stress128`、`z7020_small`、`z7020_probe2`。
+- `z7020_small` 固定为 `MAX_VARS=128`、`MAX_CONSTRAINTS=512`、
+  `MAX_DOMAIN=32`、`MAX_WORDS=1`、`MAX_WORLDS=1`、
+  `MAX_PARTITION_QUEUE=512`、`MAX_REVISE_TILES=1`。
+- CMake 新增 `hls_tb_z7020_small` 和 `hls_tb_z7020_probe2`，注册到
+  `ctest`。
+- HLS trace rows 新增 `profile=<name>` 字段；sizing 分组按 profile 区分。
+- `run_hls_trace_sweep.py` 新增 `--profile`，默认 binary 路径按 profile
+  分开，避免并行 sweep 互相覆盖。
+- `run_hls.tcl` 默认 `PROFILE=z7020_small`，可用环境变量切换到
+  `z7020_probe2` 或 `stress128`。
+- 新增记录：
+  `docs/planning/FPGA_CPIM_PHASE_P6_HLS_PROFILES.md`。
+
+**验证**：
+- `cmake --build build/fpga_cpim -j`
+- `ctest --test-dir build/fpga_cpim --output-on-failure`
+- `fpga_cpim/scripts/run_hls_trace_sweep.py --jsonl build/fpga_cpim/hls_trace_p6_stress128.jsonl --raw build/fpga_cpim/hls_trace_p6_stress128.out`
+- `fpga_cpim/scripts/run_hls_trace_sweep.py --profile=z7020_small --tiles=1 --capacity-sweep=256,384,512 --jsonl build/fpga_cpim/hls_trace_p6_z7020_small.jsonl --raw build/fpga_cpim/hls_trace_p6_z7020_small.out`
+- `python3 -m py_compile fpga_cpim/scripts/*.py fpga_cpim/hls/*.py`
+- `git diff --check`
+- `dol lint --soft`
+
+**结果摘要**：
+- `ctest` 从 13 个测试扩到 15 个测试，新增两个 HLS profile smoke。
+- `stress128/random` 仍保持 `capacity=272 UNKNOWN`、`capacity=273 OK`。
+- `z7020_small/random` 在 `capacity=256/384/512` 下均 OK，
+  `queue_peak_partition=91`、`chosen_depth=128`。
+
 ### FPGA CPIM：语义闭环 / NodeCommand / 7Z020 HLS 报告闭环
 
 **目标**：从继续扩展 synthetic sweep 转向闭环验证：`VariableOwner`

@@ -2,6 +2,37 @@
 
 ## 2026-06-12
 
+### FPGA CPIM：HLS Phase C.5 sweep 自动化 / capacity 门槛
+
+**目标**：自动编译/运行 HLS testbench 并产出 JSONL，细扫
+`capacity=272/273/274/320/384`，把 per-partition queue overflow 门槛钉准。
+
+**核心改动**：
+- 新增 `fpga_cpim/scripts/run_hls_trace_sweep.py`。
+- 默认编译到 `build/fpga_cpim/hls_tb_trace`。
+- 默认运行 `--pressure-only --tiles=1,2,4
+  --capacity-sweep=272,273,274,320,384`。
+- 复用 `parse_hls_trace.py` 输出 JSONL。
+- 终端输出 `capacity_threshold max_unknown=<n> min_ok=<n>`。
+- 新增记录：
+  `docs/planning/FPGA_CPIM_PHASE_C5_HLS_SWEEP_AUTOMATION.md`。
+
+**验证**：
+- `fpga_cpim/scripts/run_hls_trace_sweep.py --jsonl build/fpga_cpim/hls_trace_c5.jsonl --raw build/fpga_cpim/hls_trace_c5.out`
+- `cmake --build build/fpga_cpim -j`
+- `ctest --test-dir build/fpga_cpim --output-on-failure`
+- `python3 -m py_compile fpga_cpim/scripts/*.py`
+- `git diff --check`
+- `dol lint --soft`
+
+**结果摘要**：
+- `capacity=272`：`UNKNOWN`，`router_overflow=1`。
+- `capacity=273/274/320/384`：`OK`。
+- 当前 fixture 的精确门槛为 `273`，与
+  `queue_peak_partition=273` 对齐。
+- `capacity=273` 恢复完整 work：`events=1586`、
+  `deleted_values=16129`。
+
 ### FPGA CPIM：HLS Phase C.4 CLI / trace 转换 / capacity sweep
 
 **目标**：给 HLS testbench 增加 `--pressure-only`、`--tiles` 和

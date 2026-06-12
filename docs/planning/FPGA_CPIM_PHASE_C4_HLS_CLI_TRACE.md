@@ -88,9 +88,10 @@ ctest --test-dir build/fpga_cpim --output-on-failure
   - `512/1024`: `OK`，`router_overflow=0`
 - `UNKNOWN` case 仍不对外宣称可删除；这里只是 testbench 内部统计已做过的局部工作。
 
-## 下一步
+## 后续
 
-建议进入 Phase C.5：
+Phase C.5 已完成，见
+[FPGA_CPIM_PHASE_C5_HLS_SWEEP_AUTOMATION.md](FPGA_CPIM_PHASE_C5_HLS_SWEEP_AUTOMATION.md)：
 
 - 将 `parse_hls_trace.py` 接入一个小 sweep 脚本，自动编译/运行/产出 JSONL。
 - 增加 `capacity=272/273/274/320/384` 的细粒度 sweep，定位刚好不 overflow 的容量。

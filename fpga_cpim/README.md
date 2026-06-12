@@ -145,6 +145,8 @@ HLS-friendly core 已支持：
 - `1/2/4` revise tile 对照的稳定 `hls_pressure` 输出。
 - `--pressure-only`、`--tiles`、`--capacity-sweep` 参数与
   `parse_hls_trace.py` JSONL/CSV 转换。
+- `run_hls_trace_sweep.py` 自动编译/运行/产出 JSONL；当前 pressure fixture
+  的 per-partition queue capacity 门槛为 `273`。
 
 预算超限和 per-partition queue overflow 仍返回 `UNKNOWN`。
 

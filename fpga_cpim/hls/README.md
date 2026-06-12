@@ -76,3 +76,14 @@ hls_pressure graph=random vars=128 domain=128 density=0.10 partitions=4 tiles=4 
 fpga_cpim/scripts/parse_hls_trace.py --input /tmp/hls.out --format jsonl
 fpga_cpim/scripts/parse_hls_trace.py --input /tmp/hls.out --format csv --kind capacity
 ```
+
+自动编译 / 运行 / JSONL：
+
+```bash
+fpga_cpim/scripts/run_hls_trace_sweep.py \
+  --capacity-sweep=272,273,274,320,384
+```
+
+当前 `random/vars=128/domain=128/density=0.10` fixture 下，
+per-partition queue capacity 门槛为 `273`：`272` overflow 返回
+`UNKNOWN`，`273` 起恢复 `OK`。

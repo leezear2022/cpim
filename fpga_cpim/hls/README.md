@@ -13,7 +13,8 @@ g++ -std=c++17 -I fpga_cpim/hls fpga_cpim/hls/testbench_hls.cpp fpga_cpim/hls/*.
 ./hls_tb \
   --pressure-only \
   --tiles=1,2,4 \
-  --capacity-sweep=64,128,256,512,1024
+  --capacity-sweep=64,128,256,512,1024 \
+  --fixtures=chain,random,hub
 ```
 
 约束：
@@ -55,6 +56,7 @@ testbench 覆盖：
 - per-partition queue overflow UNKNOWN。
 - 多 revise tile round-robin 调度。
 - `vars=128/domain=128/density≈0.10` pressure smoke。
+- `chain/random/hub` 最小 fixture pressure/capacity sweep。
 
 ## Phase C.3 输出
 
@@ -87,3 +89,48 @@ fpga_cpim/scripts/run_hls_trace_sweep.py \
 当前 `random/vars=128/domain=128/density=0.10` fixture 下，
 per-partition queue capacity 门槛为 `273`：`272` overflow 返回
 `UNKNOWN`，`273` 起恢复 `OK`。
+
+JSONL sizing 字段会随每条 row 输出：
+
+```json
+{
+  "queue_peak_partition": 273,
+  "semantic_min_capacity": 273,
+  "recommended_depth_1p25": 342,
+  "recommended_depth_pow2": 512,
+  "chosen_depth": 512,
+  "chosen_depth_overhead": 1.875
+}
+```
+
+## Vitis HLS Report Loop
+
+有 Vitis 环境时：
+
+```bash
+vitis_hls -f fpga_cpim/hls/run_hls.tcl
+python3 fpga_cpim/hls/parse_hls_reports.py \
+  --project fpga_cpim_hls \
+  --solution z7020_small \
+  --output build/fpga_cpim/hls_report_summary.json
+```
+
+`run_hls.tcl` 默认跑 `z7020_small` / `xc7z020clg400-1`，执行
+`csim_design` 和 `csynth_design`。设置 `RUN_COSIM=1` 时追加
+`cosim_design`。
+
+无 Vitis 环境时，parser 仍输出稳定 JSON，并把 `tool_status` /
+`csynth` 标记为 `tool_missing`，不阻塞 C++ simulator 和本地 `g++`
+testbench。
+
+工具栈层次：
+
+- Level 0：`fpga_cpim_sim` 语义模拟。
+- Level 1：本地 `g++ hls_tb`。
+- Level 2：Vitis HLS `csim/csynth`。
+- Level 3：Vitis HLS `cosim`、dataflow/deadlock 检查。
+- Level 4a：Verilator + C++ wrapper，快速 RTL regression。
+- Level 4b：cocotb + Verilator/xsim，随机 backpressure / ready-valid /
+  AXI-like stream 测试。
+- Level 5：Vivado xsim，Xilinx IP / block design / post-synth。
+- Level 6：7Z020 板上 ARM + PL。

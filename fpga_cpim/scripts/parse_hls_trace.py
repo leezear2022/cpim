@@ -2,6 +2,7 @@
 import argparse
 import csv
 import json
+import math
 import sys
 
 
@@ -25,6 +26,11 @@ FIELDS = [
     "cross_events",
     "deleted_values",
     "router_overflow",
+    "semantic_min_capacity",
+    "recommended_depth_1p25",
+    "recommended_depth_pow2",
+    "chosen_depth",
+    "chosen_depth_overhead",
 ]
 
 INT_FIELDS = {
@@ -43,6 +49,10 @@ INT_FIELDS = {
     "cross_events",
     "deleted_values",
     "router_overflow",
+    "semantic_min_capacity",
+    "recommended_depth_1p25",
+    "recommended_depth_pow2",
+    "chosen_depth",
 }
 
 
@@ -79,6 +89,49 @@ def read_rows(stream, kind):
     return rows
 
 
+def next_power_of_two(value):
+    if value <= 1:
+        return 1
+    return 1 << (value - 1).bit_length()
+
+
+def fixture_key(row):
+    return (
+        row.get("graph", ""),
+        row.get("vars", 0),
+        row.get("domain", 0),
+        row.get("density", 0.0),
+        row.get("partitions", 0),
+        row.get("constraints", 0),
+    )
+
+
+def enrich_sizing(rows):
+    groups = {}
+    for row in rows:
+        groups.setdefault(fixture_key(row), []).append(row)
+
+    for group_rows in groups.values():
+        ok_peaks = [
+            row.get("queue_peak_partition", 0)
+            for row in group_rows
+            if row.get("status") == "OK"
+        ]
+        all_peaks = [row.get("queue_peak_partition", 0) for row in group_rows]
+        semantic_min = max(ok_peaks or all_peaks or [0])
+        recommended_1p25 = int(math.ceil(semantic_min * 1.25))
+        recommended_pow2 = next_power_of_two(semantic_min)
+        chosen_depth = max(recommended_1p25, recommended_pow2)
+        overhead = round(chosen_depth / semantic_min, 3) if semantic_min else 0.0
+        for row in group_rows:
+            row["semantic_min_capacity"] = semantic_min
+            row["recommended_depth_1p25"] = recommended_1p25
+            row["recommended_depth_pow2"] = recommended_pow2
+            row["chosen_depth"] = chosen_depth
+            row["chosen_depth_overhead"] = overhead
+    return rows
+
+
 def write_jsonl(rows, stream):
     for row in rows:
         stream.write(json.dumps(row, sort_keys=True) + "\n")
@@ -108,6 +161,7 @@ def main():
     else:
         with open(args.input, "r", encoding="utf-8") as stream:
             rows = read_rows(stream, args.kind)
+    rows = enrich_sizing(rows)
 
     if args.output == "-":
         output = sys.stdout

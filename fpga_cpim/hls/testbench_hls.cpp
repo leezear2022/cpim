@@ -17,6 +17,12 @@ constexpr uint16_t kPressureDomain = 128;
 constexpr uint16_t kPressurePartitions = 4;
 constexpr uint16_t kMaxCliValues = 16;
 
+enum FixtureKind {
+  kFixtureRandom,
+  kFixtureChain,
+  kFixtureHub
+};
+
 struct TestbenchOptions {
   bool pressure_only = false;
   bool show_help = false;
@@ -25,6 +31,8 @@ struct TestbenchOptions {
   uint16_t tile_count = 3;
   uint16_t capacities[kMaxCliValues] = {64, 128, 256, 512, 1024};
   uint16_t capacity_count = 5;
+  FixtureKind fixtures[kMaxCliValues] = {kFixtureRandom};
+  uint16_t fixture_count = 1;
 };
 
 void reset_inputs(word_t bit_sup[kBitSupWords],
@@ -133,6 +141,55 @@ uint16_t parse_u16_list(const char* text, uint16_t values[kMaxCliValues]) {
   return count;
 }
 
+bool parse_fixture(const char* begin, const char* end, FixtureKind* fixture) {
+  const std::size_t len = static_cast<std::size_t>(end - begin);
+  if (len == 6 && std::strncmp(begin, "random", len) == 0) {
+    *fixture = kFixtureRandom;
+    return true;
+  }
+  if (len == 5 && std::strncmp(begin, "chain", len) == 0) {
+    *fixture = kFixtureChain;
+    return true;
+  }
+  if (len == 3 && std::strncmp(begin, "hub", len) == 0) {
+    *fixture = kFixtureHub;
+    return true;
+  }
+  return false;
+}
+
+uint16_t parse_fixture_list(const char* text,
+                            FixtureKind fixtures[kMaxCliValues]) {
+  uint16_t count = 0;
+  const char* cur = text;
+  while (*cur != '\0' && count < kMaxCliValues) {
+    const char* begin = cur;
+    while (*cur != '\0' && *cur != ',') {
+      ++cur;
+    }
+    FixtureKind fixture = kFixtureRandom;
+    if (parse_fixture(begin, cur, &fixture)) {
+      fixtures[count++] = fixture;
+    }
+    if (*cur == ',') {
+      ++cur;
+    }
+  }
+  return count;
+}
+
+const char* fixture_name(FixtureKind fixture) {
+  switch (fixture) {
+    case kFixtureRandom:
+      return "random";
+    case kFixtureChain:
+      return "chain";
+    case kFixtureHub:
+      return "hub";
+  }
+  return "random";
+}
+
 TestbenchOptions parse_args(int argc, char** argv) {
   TestbenchOptions opt;
   for (int i = 1; i < argc; ++i) {
@@ -150,6 +207,11 @@ TestbenchOptions parse_args(int argc, char** argv) {
       opt.expect_capacity_threshold = false;
       opt.capacity_count =
           std::strcmp(value, "none") == 0 ? 0 : parse_u16_list(value, opt.capacities);
+    } else if (starts_with(arg, "--fixtures=")) {
+      opt.fixture_count =
+          parse_fixture_list(arg + std::strlen("--fixtures="), opt.fixtures);
+    } else if (std::strcmp(arg, "--fixtures") == 0 && i + 1 < argc) {
+      opt.fixture_count = parse_fixture_list(argv[++i], opt.fixtures);
     } else if (std::strcmp(arg, "--capacity-sweep") == 0 && i + 1 < argc) {
       const char* value = argv[++i];
       opt.expect_capacity_threshold = false;
@@ -161,13 +223,18 @@ TestbenchOptions parse_args(int argc, char** argv) {
     opt.tiles[0] = 1;
     opt.tile_count = 1;
   }
+  if (opt.fixture_count == 0) {
+    opt.fixtures[0] = kFixtureRandom;
+    opt.fixture_count = 1;
+  }
   return opt;
 }
 
 void print_help() {
   std::cout
       << "hls_tb [--pressure-only] [--tiles=1,2,4] "
-      << "[--capacity-sweep=64,128,256,512,1024|none]\n";
+      << "[--capacity-sweep=64,128,256,512,1024|none] "
+      << "[--fixtures=chain,random,hub]\n";
 }
 
 void run_equality_ok() {
@@ -321,7 +388,28 @@ void run_partition_queue_overflow_unknown() {
   assert(results[0].router_overflow == 1);
 }
 
-uint16_t build_density_010_pressure_case(
+void add_pressure_constraint(word_t bit_sup[kBitSupWords],
+                             ConstraintHls constraints[MAX_CONSTRAINTS],
+                             uint16_t constraint_partition[MAX_CONSTRAINTS],
+                             const uint16_t var_partition[MAX_VARS],
+                             uint16_t partition_load[MAX_PARTITIONS],
+                             uint16_t* cid, uint16_t x, uint16_t y,
+                             uint32_t* offset) {
+  if (*cid >= MAX_CONSTRAINTS) {
+    return;
+  }
+  add_equality_constraint(bit_sup, constraints, *cid, x, y, kPressureDomain,
+                          offset);
+  const uint16_t px = var_partition[x];
+  const uint16_t py = var_partition[y];
+  const uint16_t owner = partition_load[px] <= partition_load[py] ? px : py;
+  constraint_partition[*cid] = owner;
+  ++partition_load[owner];
+  ++(*cid);
+}
+
+uint16_t build_pressure_case(
+    FixtureKind fixture,
     word_t bit_sup[kBitSupWords],
     ConstraintHls constraints[MAX_CONSTRAINTS],
     SubscriptionHls subscriptions[MAX_VARS],
@@ -340,22 +428,28 @@ uint16_t build_density_010_pressure_case(
 
   uint16_t cid = 0;
   uint32_t offset = 0;
-  for (uint16_t x = 0; x < kPressureVars; ++x) {
-    for (uint16_t y = static_cast<uint16_t>(x + 1u); y < kPressureVars; ++y) {
-      if (((x * 53u + y * 97u + 11u) % 10u) != 0) {
-        continue;
-      }
-      if (cid >= MAX_CONSTRAINTS) {
-        break;
-      }
-      add_equality_constraint(bit_sup, constraints, cid, x, y, kPressureDomain,
+  if (fixture == kFixtureChain) {
+    for (uint16_t x = 0; x + 1u < kPressureVars; ++x) {
+      add_pressure_constraint(bit_sup, constraints, constraint_partition,
+                              var_partition, partition_load, &cid, x,
+                              static_cast<uint16_t>(x + 1u), &offset);
+    }
+  } else if (fixture == kFixtureHub) {
+    for (uint16_t y = 1; y < kPressureVars; ++y) {
+      add_pressure_constraint(bit_sup, constraints, constraint_partition,
+                              var_partition, partition_load, &cid, 0, y,
                               &offset);
-      const uint16_t px = var_partition[x];
-      const uint16_t py = var_partition[y];
-      const uint16_t owner = partition_load[px] <= partition_load[py] ? px : py;
-      constraint_partition[cid] = owner;
-      ++partition_load[owner];
-      ++cid;
+    }
+  } else {
+    for (uint16_t x = 0; x < kPressureVars; ++x) {
+      for (uint16_t y = static_cast<uint16_t>(x + 1u); y < kPressureVars; ++y) {
+        if (((x * 53u + y * 97u + 11u) % 10u) != 0) {
+          continue;
+        }
+        add_pressure_constraint(bit_sup, constraints, constraint_partition,
+                                var_partition, partition_load, &cid, x, y,
+                                &offset);
+      }
     }
   }
 
@@ -364,9 +458,9 @@ uint16_t build_density_010_pressure_case(
   return cid;
 }
 
-ResultHls run_density_010_pressure_case(uint16_t revise_tiles,
-                                        uint16_t queue_capacity,
-                                        uint16_t* constraints_built) {
+ResultHls run_pressure_case(FixtureKind fixture, uint16_t revise_tiles,
+                            uint16_t queue_capacity,
+                            uint16_t* constraints_built) {
   word_t bit_sup[kBitSupWords] = {};
   ConstraintHls constraints[MAX_CONSTRAINTS] = {};
   SubscriptionHls subscriptions[MAX_VARS] = {};
@@ -375,7 +469,8 @@ ResultHls run_density_010_pressure_case(uint16_t revise_tiles,
   uint16_t constraint_partition[MAX_CONSTRAINTS] = {};
   ProbeTaskHls tasks[MAX_WORLDS] = {};
   ResultHls results[MAX_WORLDS] = {};
-  const uint16_t cid = build_density_010_pressure_case(
+  const uint16_t cid = build_pressure_case(
+      fixture,
       bit_sup, constraints, subscriptions, domain_size, var_partition,
       constraint_partition, tasks, results);
 
@@ -392,11 +487,12 @@ ResultHls run_density_010_pressure_case(uint16_t revise_tiles,
   return results[0];
 }
 
-void print_trace_row(const char* prefix, uint16_t revise_tiles,
+void print_trace_row(const char* prefix, FixtureKind fixture,
+                     uint16_t revise_tiles,
                      uint16_t queue_capacity, uint16_t constraints,
                      const ResultHls& result) {
   std::cout << prefix
-            << " graph=random"
+            << " graph=" << fixture_name(fixture)
             << " vars=" << kPressureVars
             << " domain=" << kPressureDomain
             << " density=0.10"
@@ -418,41 +514,53 @@ void print_trace_row(const char* prefix, uint16_t revise_tiles,
 }
 
 void run_density_010_pressure_smoke(const TestbenchOptions& opt) {
-  ResultHls previous;
-  uint16_t previous_constraints = 0;
-  uint16_t previous_tiles = 0;
-  bool have_previous = false;
-  for (uint16_t i = 0; i < kMaxCliValues; ++i) {
-    if (i >= opt.tile_count) {
+  for (uint16_t fixture_index = 0; fixture_index < kMaxCliValues; ++fixture_index) {
+    if (fixture_index >= opt.fixture_count) {
       break;
     }
-    uint16_t constraints = 0;
-    const ResultHls result =
-        run_density_010_pressure_case(opt.tiles[i], MAX_PARTITION_QUEUE,
-                                      &constraints);
-    print_trace_row("hls_pressure", opt.tiles[i], MAX_PARTITION_QUEUE,
-                    constraints, result);
-
-    assert(constraints >= 750);
-    assert(constraints <= 850);
-    assert(result.status == OK);
-    assert(result.deleted_values > 0);
-    assert(result.events > 0);
-    assert(result.cross_events > 0);
-    assert(result.queue_peak_total > 0);
-    assert(result.queue_peak_partition < MAX_PARTITION_QUEUE);
-    if (have_previous) {
-      assert(constraints == previous_constraints);
-      assert(result.deleted_values == previous.deleted_values);
-      assert(result.events == previous.events);
-      if (opt.tiles[i] >= previous_tiles) {
-        assert(result.epochs <= previous.epochs);
+    const FixtureKind fixture = opt.fixtures[fixture_index];
+    ResultHls previous;
+    uint16_t previous_constraints = 0;
+    uint16_t previous_tiles = 0;
+    bool have_previous = false;
+    for (uint16_t i = 0; i < kMaxCliValues; ++i) {
+      if (i >= opt.tile_count) {
+        break;
       }
+      uint16_t constraints = 0;
+      const ResultHls result =
+          run_pressure_case(fixture, opt.tiles[i], MAX_PARTITION_QUEUE,
+                            &constraints);
+      print_trace_row("hls_pressure", fixture, opt.tiles[i], MAX_PARTITION_QUEUE,
+                      constraints, result);
+
+      if (fixture == kFixtureRandom) {
+        assert(constraints >= 750);
+        assert(constraints <= 850);
+      } else {
+        assert(constraints == 127);
+      }
+      assert(result.status == OK);
+      assert(result.deleted_values > 0);
+      assert(result.events > 0);
+      assert(result.queue_peak_total > 0);
+      assert(result.queue_peak_partition < MAX_PARTITION_QUEUE);
+      if (fixture != kFixtureChain) {
+        assert(result.cross_events > 0);
+      }
+      if (have_previous) {
+        assert(constraints == previous_constraints);
+        assert(result.deleted_values == previous.deleted_values);
+        assert(result.events == previous.events);
+        if (opt.tiles[i] >= previous_tiles) {
+          assert(result.epochs <= previous.epochs);
+        }
+      }
+      previous = result;
+      previous_constraints = constraints;
+      previous_tiles = opt.tiles[i];
+      have_previous = true;
     }
-    previous = result;
-    previous_constraints = constraints;
-    previous_tiles = opt.tiles[i];
-    have_previous = true;
   }
 }
 
@@ -463,25 +571,35 @@ void run_capacity_sweep(const TestbenchOptions& opt) {
   const uint16_t revise_tiles = opt.tiles[opt.tile_count - 1u];
   bool saw_unknown = false;
   bool saw_ok = false;
-  for (uint16_t i = 0; i < kMaxCliValues; ++i) {
-    if (i >= opt.capacity_count) {
+  for (uint16_t fixture_index = 0; fixture_index < kMaxCliValues; ++fixture_index) {
+    if (fixture_index >= opt.fixture_count) {
       break;
     }
-    uint16_t constraints = 0;
-    const ResultHls result =
-        run_density_010_pressure_case(revise_tiles, opt.capacities[i],
-                                      &constraints);
-    print_trace_row("hls_capacity", revise_tiles, opt.capacities[i],
-                    constraints, result);
-    assert(constraints >= 750);
-    assert(constraints <= 850);
-    if (result.status == UNKNOWN) {
-      saw_unknown = true;
-      assert(result.router_overflow == 1);
-    }
-    if (result.status == OK) {
-      saw_ok = true;
-      assert(result.router_overflow == 0);
+    const FixtureKind fixture = opt.fixtures[fixture_index];
+    for (uint16_t i = 0; i < kMaxCliValues; ++i) {
+      if (i >= opt.capacity_count) {
+        break;
+      }
+      uint16_t constraints = 0;
+      const ResultHls result =
+          run_pressure_case(fixture, revise_tiles, opt.capacities[i],
+                            &constraints);
+      print_trace_row("hls_capacity", fixture, revise_tiles, opt.capacities[i],
+                      constraints, result);
+      if (fixture == kFixtureRandom) {
+        assert(constraints >= 750);
+        assert(constraints <= 850);
+      } else {
+        assert(constraints == 127);
+      }
+      if (result.status == UNKNOWN) {
+        saw_unknown = true;
+        assert(result.router_overflow == 1);
+      }
+      if (result.status == OK) {
+        saw_ok = true;
+        assert(result.router_overflow == 0);
+      }
     }
   }
   if (opt.expect_capacity_threshold) {

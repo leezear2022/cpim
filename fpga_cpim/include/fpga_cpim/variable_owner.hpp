@@ -9,6 +9,14 @@
 
 namespace fpga_cpim {
 
+constexpr Cid kInvalidCid = UINT32_MAX;
+
+enum class OwnerVarState {
+  kIdle,
+  kProcessing,
+  kRerunPending
+};
+
 struct OwnerApplyResult {
   WorldId world = 0;
   VarId var = 0;
@@ -24,6 +32,16 @@ class VariableOwner {
 
   OwnerApplyResult ApplyDeletion(WorldId world, VarId var,
                                  const DomainMask& delete_mask);
+  OwnerApplyResult ApplyDeletionBatch(
+      WorldId world, VarId var, const std::vector<DomainMask>& delete_masks);
+
+  std::vector<Cid> FanoutForDelta(VarId var, const DomainMask& delta,
+                                  Cid skip_cid = kInvalidCid) const;
+
+  void BeginProcessing(WorldId world, VarId var);
+  bool NoteRerunRequest(WorldId world, VarId var);
+  bool EndProcessing(WorldId world, VarId var);
+  OwnerVarState State(WorldId world, VarId var) const;
 
   const DomainMask& Domain(WorldId world, VarId var) const;
   std::vector<DomainMask>& MutableWorldDomains(WorldId world);
@@ -33,6 +51,7 @@ class VariableOwner {
  private:
   const Model& model_;
   std::vector<std::vector<DomainMask>> domains_;
+  std::vector<std::vector<OwnerVarState>> states_;
 };
 
 }  // namespace fpga_cpim

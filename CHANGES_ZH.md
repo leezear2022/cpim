@@ -2,6 +2,53 @@
 
 ## 2026-06-12
 
+### FPGA CPIM：语义闭环 / NodeCommand / 7Z020 HLS 报告闭环
+
+**目标**：从继续扩展 synthetic sweep 转向闭环验证：`VariableOwner`
+多源删除语义、`NodeCommand` 搜索节点闭环、真实 benchmark profile、
+fixture-specific queue sizing、Vitis HLS report parser 和 7Z020 小 profile。
+
+**核心改动**：
+- `VariableOwner` 新增批量删除合并、DWO race 稳定语义、fanout 查询和
+  `PROCESSING -> RERUN_PENDING` 状态。
+- 新增 `NodeCommand` / `NodeResult`，支持 root AC、branch AC、
+  ACThenNSACQ、confirmed deletion、unknown probe count 和 incomplete
+  reason mask。
+- `parse_hls_trace.py` 为 pressure/capacity rows 增加
+  `semantic_min_capacity`、`recommended_depth_1p25`、
+  `recommended_depth_pow2`、`chosen_depth`、`chosen_depth_overhead`。
+- HLS testbench 新增 `--fixtures=chain,random,hub`，不再只看单一 random
+  pressure fixture。
+- 新增 `fpga_cpim/scripts/hardware_profiles.py` 和
+  `profile_benchmarks.py`，对仓库真实 XCSP benchmark 输出 profile JSONL
+  与 `z7020_small` / `z7020_probe2` fit 判断。
+- 新增 `fpga_cpim/hls/run_hls.tcl` 和 `parse_hls_reports.py`，有 Vitis 时
+  抽取 csim/csynth/cosim、latency、II、LUT/FF/BRAM/DSP、estimated Fmax；
+  无 Vitis 时输出 `tool_missing`。
+- 更新 `fpga_cpim/README.md`、`fpga_cpim/hls/README.md` 和
+  `docs/planning/FPGA_CPIM_NEXT_STAGE_CLOSURE.md`。
+
+**验证**：
+- `cmake --build build/fpga_cpim -j`
+- `ctest --test-dir build/fpga_cpim --output-on-failure`
+- `python3 -m py_compile fpga_cpim/scripts/*.py fpga_cpim/hls/*.py`
+- `python3 fpga_cpim/scripts/profile_benchmarks.py --output build/fpga_cpim/benchmark_profiles.jsonl`
+- `fpga_cpim/scripts/run_hls_trace_sweep.py --jsonl build/fpga_cpim/hls_trace_next.jsonl --raw build/fpga_cpim/hls_trace_next.out`
+- `python3 fpga_cpim/hls/parse_hls_reports.py --output build/fpga_cpim/hls_report_summary.json`
+- `git diff --check`
+- `dol lint --soft`
+
+**结果摘要**：
+- `random/vars=128/domain=128/density=0.10` 仍为
+  `capacity=272 UNKNOWN`、`capacity=273 OK`。
+- random fixture sizing：`semantic_min=273`、`1.25x=342`、`pow2=512`、
+  `chosen_depth=512`、`overhead=1.875`。
+- `chain` / `hub` 在当前 capacity range 内全部 OK，报告
+  `semantic_min <= min_tested_capacity`。
+- 真实 benchmark profile 5 条均产出 JSONL；`haystacks-11` 因
+  `constraints=615` 不 fit `z7020_small`。
+- 本机 Vitis 缺失时 HLS report summary 稳定输出 `tool_missing`。
+
 ### FPGA CPIM：HLS Phase C.5 sweep 自动化 / capacity 门槛
 
 **目标**：自动编译/运行 HLS testbench 并产出 JSONL，细扫

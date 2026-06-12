@@ -33,12 +33,13 @@ def compile_hls(repo_root, binary, cxx):
     return cmd
 
 
-def run_hls(binary, tiles, capacities):
+def run_hls(binary, tiles, capacities, fixtures):
     cmd = [
         str(binary),
         "--pressure-only",
         f"--tiles={tiles}",
         f"--capacity-sweep={capacities}",
+        f"--fixtures={fixtures}",
     ]
     result = subprocess.run(
         cmd,
@@ -64,7 +65,7 @@ def write_jsonl(path, rows):
 def print_summary(rows):
     print(
         "kind tiles capacity status events epochs queuePeakTotal "
-        "queuePeakPart routerOverflow"
+        "queuePeakPart semanticMin chosenDepth routerOverflow"
     )
     for row in rows:
         print(
@@ -76,27 +77,38 @@ def print_summary(rows):
             row["epochs"],
             row["queue_peak_total"],
             row["queue_peak_partition"],
+            row["semantic_min_capacity"],
+            row["chosen_depth"],
             row["router_overflow"],
         )
 
 
 def print_capacity_threshold(rows):
-    unknown_caps = [
-        row["capacity"]
-        for row in rows
-        if row["kind"] == "capacity" and row["status"] == "UNKNOWN"
-    ]
-    ok_caps = [
-        row["capacity"]
-        for row in rows
-        if row["kind"] == "capacity" and row["status"] == "OK"
-    ]
-    if not unknown_caps or not ok_caps:
-        return
-    print(
-        "capacity_threshold "
-        f"max_unknown={max(unknown_caps)} min_ok={min(ok_caps)}"
-    )
+    graphs = sorted({row.get("graph", "") for row in rows if row["kind"] == "capacity"})
+    for graph in graphs:
+        graph_rows = [
+            row for row in rows if row["kind"] == "capacity" and row.get("graph") == graph
+        ]
+        unknown_caps = [
+            row["capacity"] for row in graph_rows if row["status"] == "UNKNOWN"
+        ]
+        ok_caps = [row["capacity"] for row in graph_rows if row["status"] == "OK"]
+        if unknown_caps and ok_caps:
+            print(
+                "capacity_threshold "
+                f"graph={graph} max_unknown={max(unknown_caps)} min_ok={min(ok_caps)}"
+            )
+        elif ok_caps:
+            print(
+                "capacity_threshold "
+                f"graph={graph} semantic_min<=min_tested_capacity "
+                f"min_tested_capacity={min(ok_caps)}"
+            )
+        elif unknown_caps:
+            print(
+                "capacity_threshold "
+                f"graph={graph} all_unknown max_unknown={max(unknown_caps)}"
+            )
 
 
 def main():
@@ -108,6 +120,7 @@ def main():
     parser.add_argument("--binary", default="build/fpga_cpim/hls_tb_trace")
     parser.add_argument("--tiles", default="1,2,4")
     parser.add_argument("--capacity-sweep", default="272,273,274,320,384")
+    parser.add_argument("--fixtures", default="chain,random,hub")
     parser.add_argument("--jsonl", default="build/fpga_cpim/hls_trace_sweep.jsonl")
     parser.add_argument("--raw", default="build/fpga_cpim/hls_trace_sweep.out")
     parser.add_argument("--no-build", action="store_true")
@@ -122,12 +135,16 @@ def main():
         compile_cmd = compile_hls(repo_root, binary, args.cxx)
         print("compile:", " ".join(compile_cmd))
 
-    run_cmd, stdout, stderr = run_hls(binary, args.tiles, args.capacity_sweep)
+    run_cmd, stdout, stderr = run_hls(
+        binary, args.tiles, args.capacity_sweep, args.fixtures
+    )
     print("run:", " ".join(run_cmd))
     if stderr:
         sys.stderr.write(stderr)
 
-    rows = parse_hls_trace.read_rows(io.StringIO(stdout), "all")
+    rows = parse_hls_trace.enrich_sizing(
+        parse_hls_trace.read_rows(io.StringIO(stdout), "all")
+    )
     write_text(raw, stdout)
     write_jsonl(jsonl, rows)
     print_summary(rows)

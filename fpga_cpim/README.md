@@ -69,6 +69,13 @@ UNKNOWN must never remove a value.
 
 这与现有 CPIM SACGPU 的 `kUNKNOWN` 语义一致：预算超限、未收敛、队列满、局部 buffer 满或 revise/support 限额命中时，probe 对外不产生 deletion。
 
+全局安全不变量：
+
+```text
+UNKNOWN / AliveIncomplete / overflow / budget hit 不允许产生未验证删除。
+所有 confirmed_deletions 必须能被 Golden AC/NSACQ 在同模式下复现。
+```
+
 ## NSACQ 语义
 
 第一版只实现 `nsac_radius=1`。对 focal variable `i`，允许传播的约束是 `{i} ∪ neighbors(i)` 诱导子图内的 binary constraints。该 mask 只过滤 event enqueue，不改 `bitSup & other_domain` 的单约束支持检查。
@@ -147,8 +154,77 @@ HLS-friendly core 已支持：
   `parse_hls_trace.py` JSONL/CSV 转换。
 - `run_hls_trace_sweep.py` 自动编译/运行/产出 JSONL；当前 pressure fixture
   的 per-partition queue capacity 门槛为 `273`。
+- `chain/random/hub` 三类最小 fixture，分别覆盖低 fanout、普通压力和高
+  fanout 极端。
+- JSONL sizing 字段：`semantic_min_capacity`、
+  `recommended_depth_1p25`、`recommended_depth_pow2`、`chosen_depth`、
+  `chosen_depth_overhead`。
 
 预算超限和 per-partition queue overflow 仍返回 `UNKNOWN`。
+
+当前 random fixture 的 sizing rule：
+
+```text
+fixture=random/vars=128/domain=128/density=0.10
+semantic_min_capacity = 273
+recommended_depth_1p25 = ceil(273 * 1.25) = 342
+recommended_depth_pow2 = 512
+chosen_depth = 512
+chosen_depth_overhead = 1.875
+```
+
+## NodeCommand 闭环
+
+`NodeCommand` 是搜索节点下发到 FPGA 原型的第一版模拟接口，当前支持：
+
+- root AC。
+- branch assignment 后 AC cascade。
+- AC 后按 `kAllVars` / `kFocalVar` / `kNeighborhoodOfFocal` 启动 NSACQ probes。
+- `UNKNOWN` probe 只增加 `unknown_probe_count` 和 incomplete reason，不产生
+  deletion。
+- confirmed singleton DWO deletion 必须再由 Golden probe 复现，才进入
+  `confirmed_deletions`。
+
+`kRunBranchProbes` 只保留接口空间，当前明确返回 `AliveIncomplete`。
+
+## 真实 Benchmark Profile
+
+真实 benchmark 第一阶段只做 profile，不接完整 XCSP propagation：
+
+```bash
+python3 fpga_cpim/scripts/profile_benchmarks.py \
+  --output build/fpga_cpim/benchmark_profiles.jsonl
+```
+
+输出字段包括 `vars`、`max_domain`、`constraints`、`binary_ratio`、
+`avg_fanout`、`max_fanout`、`estimated_bitSup_bytes` 和
+`z7020_profile_fit`。
+
+## 7Z020 Profiles
+
+第一硬件落点固定为小 profile，`domain=128` 只作为 stress fixture。
+
+```text
+z7020_small:
+  MAX_VARS=128
+  MAX_CONSTRAINTS=512
+  MAX_DOMAIN=32
+  MAX_WORDS=1
+  MAX_WORLDS=1
+  REVISION_TILES=1
+  OWNER_TILES=1
+  QUEUE_DEPTH=512
+
+z7020_probe2:
+  MAX_VARS=128
+  MAX_CONSTRAINTS=256
+  MAX_DOMAIN=32
+  MAX_WORDS=1
+  MAX_WORLDS=2
+  REVISION_TILES=1
+  OWNER_TILES=1
+  QUEUE_DEPTH=512
+```
 
 ## 和 SAT-FPGA BCP 的关系
 

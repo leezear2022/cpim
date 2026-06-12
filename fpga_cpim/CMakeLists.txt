@@ -13,6 +13,7 @@ set(FPGA_CPIM_HEADERS
   include/fpga_cpim/event_router.hpp
   include/fpga_cpim/golden.hpp
   include/fpga_cpim/model.hpp
+  include/fpga_cpim/node_command.hpp
   include/fpga_cpim/partition.hpp
   include/fpga_cpim/revise_tile.hpp
   include/fpga_cpim/sim_config.hpp
@@ -30,6 +31,7 @@ set(FPGA_CPIM_SOURCES
   src/event_router.cpp
   src/golden.cpp
   src/model.cpp
+  src/node_command.cpp
   src/partition.cpp
   src/revise_tile.cpp
   src/sim_stats.cpp
@@ -68,6 +70,7 @@ if(BUILD_TESTING)
   add_fpga_cpim_test(test_engine_nsacq)
   add_fpga_cpim_test(test_overflow_unknown)
   add_fpga_cpim_test(test_partition)
+  add_fpga_cpim_test(test_node_command)
 
   add_executable(hls_tb
     hls/testbench_hls.cpp
